@@ -1,0 +1,8 @@
+[package]
+name = "ruzt-hal-aarch64"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ruzt-hal = { path = "../ruzt-hal" }
+spin = { version = "0.9.8", default-features = false, features = ["once", "mutex", "spin_mutex"] }

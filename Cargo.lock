@@ -48,6 +48,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "boot-aarch64"
+version = "0.1.0"
+
+[[package]]
 name = "boot-x86_64"
 version = "0.1.0"
 dependencies = [
@@ -430,6 +434,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruzt-hal-aarch64"
+version = "0.1.0"
+dependencies = [
+ "ruzt-hal",
+ "spin",
+]
+
+[[package]]
 name = "ruzt-hal-x86_64"
 version = "0.1.0"
 dependencies = [
@@ -447,6 +459,7 @@ dependencies = [
  "bootloader_api",
  "linked_list_allocator",
  "ruzt-hal",
+ "ruzt-hal-aarch64",
  "ruzt-hal-x86_64",
  "spin",
  "uart_16550",
