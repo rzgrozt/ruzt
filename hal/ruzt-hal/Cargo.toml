@@ -1,0 +1,10 @@
+[package]
+name = "ruzt-hal"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bitflags = { version = "2", default-features = false }
+
+[features]
+# No features. This crate is unconditionally no_std and pure traits.
