@@ -1,0 +1,24 @@
+[package]
+name = "ruzt-kernel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+volatile = "0.4.6"
+spin = { version = "0.9.8", default-features = false, features = ["lazy", "mutex", "once", "spin_mutex"] }
+x86_64 = "0.15.4"
+uart_16550 = "0.3.2"
+bootloader_api = "0.11.15"
+linked_list_allocator = "0.10.6"
+ruzt-hal = { path = "../../hal/ruzt-hal", optional = true }
+ruzt-hal-x86_64 = { path = "../../hal/ruzt-hal-x86_64", optional = true }
+
+[features]
+default = ["arch-x86_64"]
+arch-x86_64 = ["ruzt-hal", "ruzt-hal-x86_64"]
+arch-aarch64 = ["ruzt-hal"]
+
+[[bin]]
+name = "ruzt-kernel"
+path = "src/main.rs"
+
