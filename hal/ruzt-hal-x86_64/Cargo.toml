@@ -1,0 +1,14 @@
+[package]
+name = "ruzt-hal-x86_64"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ruzt-hal = { path = "../ruzt-hal" }
+bootloader_api = "0.11.15"
+x86_64 = "0.15.4"
+uart_16550 = "0.3.2"
+spin = { version = "0.9.8", default-features = false, features = ["once", "mutex", "spin_mutex"] }
+
+[features]
+default = []
