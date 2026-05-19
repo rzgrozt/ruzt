@@ -1,0 +1,9 @@
+[workspace]
+members = ["kernel/ruzt-kernel", "boot/boot-x86_64", "hal/ruzt-hal", "hal/ruzt-hal-x86_64"]
+resolver = "2"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

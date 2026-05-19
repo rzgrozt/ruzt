@@ -1,0 +1,20 @@
+/target/
+*.img
+*.iso
+*.elf
+*.bin
+*.o
+*.a
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+# OS
+.DS_Store
+Thumbs.db
+# Reference PDFs (not source)
+Operating_Systems_From_0_to_1.pdf
+rust_book.pdf
+talk.pdf

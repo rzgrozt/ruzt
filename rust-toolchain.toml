@@ -1,0 +1,6 @@
+[toolchain]
+# NOTE: nightly-2026-04-15 was requested but is not available.
+# Using the latest nightly channel instead.
+channel = "nightly"
+components = ["rust-src", "llvm-tools-preview", "rustfmt", "clippy"]
+targets = ["x86_64-unknown-none", "aarch64-unknown-none-softfloat"]

@@ -1,0 +1,5 @@
+[unstable]
+bindeps = true
+
+[target.x86_64-ruzt-kernel]
+runner = "bootimage runner"
