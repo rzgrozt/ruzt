@@ -2,8 +2,11 @@
 
 extern crate alloc;
 
+#[cfg(not(test))]
 use core::alloc::Layout;
 use linked_list_allocator::LockedHeap;
+#[cfg(not(test))]
+use ruzt_hal::cpu::CpuOps;
 use ruzt_hal::mem::{Mapper, PageFlags, VirtAddr};
 
 /// Virtual start address of the kernel heap.
@@ -39,7 +42,7 @@ fn alloc_error(layout: Layout) -> ! {
         layout.align()
     );
     loop {
-        x86_64::instructions::hlt();
+        ruzt_hal_x86_64::cpu::X86_64Cpu::cpu_idle();
     }
 }
 

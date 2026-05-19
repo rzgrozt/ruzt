@@ -78,6 +78,27 @@ fn test_kernel_boots() {
         "Missing 'thread B ticking' in serial output.\nOutput:\n{}",
         stdout
     );
+    assert!(
+        stdout.contains("keyboard_echo task started"),
+        "Missing 'keyboard_echo task started' in serial output.\nOutput:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("Timer monotonic ns:"),
+        "Missing 'Timer monotonic ns:' in serial output.\nOutput:\n{}",
+        stdout
+    );
+    let timer_line = stdout
+        .lines()
+        .find(|l| l.starts_with("Timer monotonic ns: "))
+        .expect("Timer monotonic ns line not found");
+    let ns_str = timer_line.strip_prefix("Timer monotonic ns: ").unwrap();
+    let ns: u64 = ns_str.trim().parse().expect("Failed to parse timer ns value");
+    assert!(
+        ns > 0,
+        "Timer monotonic ns should be > 0, got {}",
+        ns
+    );
 
     let exit_code = output.status.code().unwrap_or(1);
     // isa-debug-exit maps: exit_code = (value << 1) | 1

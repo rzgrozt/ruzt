@@ -14,8 +14,10 @@ pub mod vga;
 pub mod exceptions;
 pub mod mm;
 pub mod sched;
+pub mod keyboard;
 
 use ruzt_hal::boot::BootInfo;
+use ruzt_hal::cpu::CpuOps;
 
 /// Kernel main entry point.
 ///
@@ -73,15 +75,11 @@ pub fn main(boot_info: &'static mut BootInfo) -> ! {
     sched::spawn(thread_b);
     serial_println!("Threads spawned.");
 
-    exceptions::init_idt();
-    serial_println!("IDT loaded.");
-
-    serial_println!("Firing int3 breakpoint...");
-    x86_64::instructions::interrupts::int3();
-    serial_println!("Breakpoint returned cleanly.");
+    sched::spawn(keyboard_echo);
+    serial_println!("keyboard_echo task started");
 
     serial_println!("Enabling interrupts...");
-    x86_64::instructions::interrupts::enable();
+    ruzt_hal_x86_64::cpu::X86_64Cpu::enable_interrupts();
 
     serial_println!("Hello, world from ring 0. Entering idle loop.");
 
@@ -91,25 +89,37 @@ pub fn main(boot_info: &'static mut BootInfo) -> ! {
 fn idle_loop() -> ! {
     loop {
         if crate::sched::should_switch() {
-            x86_64::instructions::interrupts::disable();
+            let _guard = ruzt_hal_x86_64::cpu::X86_64Cpu::disable_interrupts();
             crate::sched::yield_thread();
-            x86_64::instructions::interrupts::enable();
         }
-        x86_64::instructions::hlt();
+        ruzt_hal_x86_64::cpu::X86_64Cpu::cpu_idle();
     }
 }
 
-#[allow(unsafe_code)]
 fn thread_a() -> ! {
-    x86_64::instructions::interrupts::enable();
+    ruzt_hal_x86_64::cpu::X86_64Cpu::enable_interrupts();
     for _ in 0..3 {
         serial_println!("thread A ticking");
         for _ in 0..10_000_000 {
-            unsafe { core::arch::asm!("nop"); }
+            core::hint::spin_loop();
             if crate::sched::should_switch() {
-                x86_64::instructions::interrupts::disable();
+                let _guard = ruzt_hal_x86_64::cpu::X86_64Cpu::disable_interrupts();
                 crate::sched::yield_thread();
-                x86_64::instructions::interrupts::enable();
+            }
+        }
+    }
+    idle_loop();
+}
+
+fn thread_b() -> ! {
+    ruzt_hal_x86_64::cpu::X86_64Cpu::enable_interrupts();
+    for _ in 0..3 {
+        serial_println!("thread B ticking");
+        for _ in 0..10_000_000 {
+            core::hint::spin_loop();
+            if crate::sched::should_switch() {
+                let _guard = ruzt_hal_x86_64::cpu::X86_64Cpu::disable_interrupts();
+                crate::sched::yield_thread();
             }
         }
     }
@@ -117,18 +127,21 @@ fn thread_a() -> ! {
 }
 
 #[allow(unsafe_code)]
-fn thread_b() -> ! {
-    x86_64::instructions::interrupts::enable();
-    for _ in 0..3 {
-        serial_println!("thread B ticking");
-        for _ in 0..10_000_000 {
-            unsafe { core::arch::asm!("nop"); }
-            if crate::sched::should_switch() {
-                x86_64::instructions::interrupts::disable();
-                crate::sched::yield_thread();
-                x86_64::instructions::interrupts::enable();
+fn keyboard_echo() -> ! {
+    ruzt_hal_x86_64::cpu::X86_64Cpu::enable_interrupts();
+    serial_println!("keyboard_echo task running");
+    loop {
+        if let Some(scancode) = crate::keyboard::try_read() {
+            if let Some(c) = crate::keyboard::scancode_to_ascii(scancode) {
+                serial_print!("{}", c);
             }
         }
+        if crate::sched::should_switch() {
+            let _guard = ruzt_hal_x86_64::cpu::X86_64Cpu::disable_interrupts();
+            crate::sched::yield_thread();
+        }
+        for _ in 0..1_000_000 {
+            unsafe { core::arch::asm!("nop"); }
+        }
     }
-    idle_loop();
 }

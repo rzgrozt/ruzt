@@ -11,7 +11,7 @@ const ICW1_INIT: u8 = 0x11;
 const ICW4_8086: u8 = 0x01;
 
 /// Remap the PIC so IRQ0–7 map to vectors 32–39 and IRQ8–15 map to vectors 40–47,
-/// then mask all interrupts except IRQ0 (timer).
+/// then mask all interrupts except IRQ0 (timer) and IRQ1 (keyboard).
 ///
 /// # Safety
 /// Must be called exactly once during early boot, before interrupts are enabled.
@@ -34,7 +34,7 @@ pub unsafe fn init() {
         PortWriteOnly::new(MASTER_DATA).write(0xFFu8);
         PortWriteOnly::new(SLAVE_DATA).write(0xFFu8);
 
-        PortWriteOnly::new(MASTER_DATA).write(0xFEu8);
+        PortWriteOnly::new(MASTER_DATA).write(0xFCu8);
     }
 }
 
