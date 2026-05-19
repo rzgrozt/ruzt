@@ -13,11 +13,12 @@ linked_list_allocator = "0.10.6"
 ruzt-hal = { path = "../../hal/ruzt-hal", optional = true }
 ruzt-hal-x86_64 = { path = "../../hal/ruzt-hal-x86_64", optional = true }
 ruzt-hal-aarch64 = { path = "../../hal/ruzt-hal-aarch64", optional = true }
+ruzt-cap = { path = "../../crates/ruzt-cap", optional = true }
 
 [features]
 default = ["arch-x86_64"]
-arch-x86_64 = ["ruzt-hal", "ruzt-hal-x86_64"]
-arch-aarch64 = ["ruzt-hal", "ruzt-hal-aarch64"]
+arch-x86_64 = ["ruzt-hal", "ruzt-hal-x86_64", "ruzt-cap"]
+arch-aarch64 = ["ruzt-hal", "ruzt-hal-aarch64", "ruzt-cap"]
 
 [[bin]]
 name = "ruzt-kernel"

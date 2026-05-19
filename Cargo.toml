@@ -1,11 +1,12 @@
 [workspace]
 members = [
     "kernel/ruzt-kernel",
-    "boot/boot-x86_64",
     "boot/boot-aarch64",
     "hal/ruzt-hal",
     "hal/ruzt-hal-x86_64",
     "hal/ruzt-hal-aarch64",
+    "crates/ruzt-abi",
+    "crates/ruzt-cap",
 ]
 resolver = "2"
 
