@@ -1,0 +1,9 @@
+[package]
+name = "rootsrv"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ruzt-runtime = { path = "../../crates/ruzt-runtime" }
+ruzt-abi = { path = "../../crates/ruzt-abi" }
+ruzt-ipc = { path = "../../crates/ruzt-ipc" }

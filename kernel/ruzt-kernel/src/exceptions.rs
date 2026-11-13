@@ -12,7 +12,9 @@ static IDT: Once<InterruptDescriptorTable> = Once::new();
 /// One-time flag so the timer handler only prints its tick value once.
 static TIMER_TICK_PRINTED: Once<()> = Once::new();
 
-/// Initialises the global IDT with breakpoint, double-fault, page-fault, timer, and keyboard handlers.
+/// Initialises the global IDT with breakpoint, double-fault, page-fault, timer,
+/// keyboard, and syscall handlers.
+#[allow(unsafe_code)]
 pub fn init_idt() {
     let idt = IDT.call_once(|| {
         let mut idt = InterruptDescriptorTable::new();
@@ -21,9 +23,49 @@ pub fn init_idt() {
         idt.page_fault.set_handler_fn(page_fault_handler);
         idt[32].set_handler_fn(timer_handler);
         idt[33].set_handler_fn(keyboard_handler);
+        unsafe {
+            idt[0x80].set_handler_addr(x86_64::VirtAddr::new(syscall_handler as *const () as usize as u64));
+        }
         idt
     });
     idt.load();
+}
+
+#[allow(unsafe_code)]
+extern "C" fn syscall_handler_debug() {
+    crate::serial_println!("syscall_handler: entered!");
+}
+
+#[unsafe(naked)]
+extern "C" fn syscall_handler() {
+    core::arch::naked_asm!(
+        "push r15",
+        "push r9",
+        "push r8",
+        "push r10",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push rax",
+        "push r11",
+        "mov r11, rsp",
+        "add r11, 8",
+        "mov rdi, r11",
+        "call {syscall_dispatch}",
+        "mov r15, rax",
+        "pop r11",
+        "pop rax",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop r10",
+        "pop r8",
+        "pop r9",
+        "mov rax, r15",
+        "pop r15",
+        "iretq",
+        syscall_dispatch = sym crate::syscall::syscall_dispatch,
+    );
 }
 
 extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {

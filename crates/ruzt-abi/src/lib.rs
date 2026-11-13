@@ -27,8 +27,44 @@ pub enum SyscallNumber {
     _Reply = 1,
     /// Reserved for future use: yield the remaining time slice.
     _Yield = 2,
-    /// Reserved for future use: write one character to the debug console.
-    _DebugPutChar = 3,
+    /// Write one character to the debug console.
+    DebugPutChar = 3,
+    /// Syscall number not recognised.
+    NotImplemented = 4,
+}
+
+impl From<u64> for SyscallNumber {
+    fn from(value: u64) -> Self {
+        match value {
+            0 => Self::Invoke,
+            1 => Self::_Reply,
+            2 => Self::_Yield,
+            3 => Self::DebugPutChar,
+            _ => Self::NotImplemented,
+        }
+    }
+}
+
+/// Capability operation codes carried by the [`SyscallNumber::Invoke`] wire ABI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u64)]
+pub enum CapOp {
+    /// Send an IPC message through an endpoint.
+    Send = 0,
+    /// Receive an IPC message through an endpoint.
+    Recv = 1,
+    /// Signal a notification object.
+    Signal = 2,
+    /// Wait on a notification object.
+    Wait = 3,
+    /// Delete a capability.
+    Delete = 4,
+    /// Retype an untyped capability into a kernel object.
+    Retype = 5,
+    /// Mint a derived capability.
+    Mint = 6,
+    /// Move a capability between slots.
+    Move = 7,
 }
 
 /// Rights that can be attached to a capability.
@@ -115,6 +151,8 @@ pub struct IpcMessage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct SyscallArgs {
+    /// Syscall number (`rax` on x86_64).
+    pub number: u64,
     /// First argument (`rdi` on x86_64).
     pub arg0: u64,
     /// Second argument (`rsi` on x86_64).
@@ -156,6 +194,26 @@ impl ErrorCode {
     pub const fn as_u64(self) -> u64 {
         self as u64
     }
+
+    /// Decode a syscall's `u64` register return into its success or error result.
+    ///
+    /// # Errors
+    ///
+    /// Returns the corresponding error for codes 1 through 7. Unknown values
+    /// are reported as [`ErrorCode::NotImplemented`].
+    pub const fn from_u64(value: u64) -> Result<(), ErrorCode> {
+        match value {
+            0 => Ok(()),
+            1 => Err(Self::InvalidCap),
+            2 => Err(Self::CapRightsViolation),
+            3 => Err(Self::NoMemory),
+            4 => Err(Self::BadMessage),
+            5 => Err(Self::NotFound),
+            6 => Err(Self::WouldBlock),
+            7 => Err(Self::NotImplemented),
+            _ => Err(Self::NotImplemented),
+        }
+    }
 }
 
 // Compile-time size checks for ABI stability.
@@ -164,7 +222,7 @@ const _: () = assert!(core::mem::size_of::<CapTransferSlot>() == 24);
 // The layout follows the spec exactly; reducing size would require
 // shrinking fields (e.g. cptr/badge from u64 to u32).
 const _: () = assert!(core::mem::size_of::<IpcMessage>() == 168);
-const _: () = assert!(core::mem::size_of::<SyscallArgs>() == 48);
+const _: () = assert!(core::mem::size_of::<SyscallArgs>() == 56);
 
 #[cfg(test)]
 mod tests {
@@ -210,6 +268,21 @@ mod tests {
     }
 
     #[test]
+    fn cap_op_wire_codes_are_stable() {
+        // Given: every user-visible capability operation.
+        // When: each operation is represented on the syscall wire.
+        // Then: its discriminant matches the kernel's operation decoder.
+        assert_eq!(CapOp::Send as u64, 0);
+        assert_eq!(CapOp::Recv as u64, 1);
+        assert_eq!(CapOp::Signal as u64, 2);
+        assert_eq!(CapOp::Wait as u64, 3);
+        assert_eq!(CapOp::Delete as u64, 4);
+        assert_eq!(CapOp::Retype as u64, 5);
+        assert_eq!(CapOp::Mint as u64, 6);
+        assert_eq!(CapOp::Move as u64, 7);
+    }
+
+    #[test]
     fn error_code_round_trip() {
         assert_eq!(ErrorCode::Ok.as_u64(), 0);
         assert_eq!(ErrorCode::InvalidCap.as_u64(), 1);
@@ -219,6 +292,35 @@ mod tests {
         assert_eq!(ErrorCode::NotFound.as_u64(), 5);
         assert_eq!(ErrorCode::WouldBlock.as_u64(), 6);
         assert_eq!(ErrorCode::NotImplemented.as_u64(), 7);
+    }
+
+    #[test]
+    fn error_code_from_u64_decodes_known_results() {
+        // Given: every defined syscall return value.
+        // When: each value is decoded at the user-space boundary.
+        // Then: zero succeeds and each non-zero value preserves its error.
+        assert_eq!(ErrorCode::from_u64(0), Ok(()));
+        assert_eq!(ErrorCode::from_u64(1), Err(ErrorCode::InvalidCap));
+        assert_eq!(
+            ErrorCode::from_u64(2),
+            Err(ErrorCode::CapRightsViolation)
+        );
+        assert_eq!(ErrorCode::from_u64(3), Err(ErrorCode::NoMemory));
+        assert_eq!(ErrorCode::from_u64(4), Err(ErrorCode::BadMessage));
+        assert_eq!(ErrorCode::from_u64(5), Err(ErrorCode::NotFound));
+        assert_eq!(ErrorCode::from_u64(6), Err(ErrorCode::WouldBlock));
+        assert_eq!(ErrorCode::from_u64(7), Err(ErrorCode::NotImplemented));
+    }
+
+    #[test]
+    fn error_code_from_u64_rejects_unknown_value() {
+        // Given: a value outside the defined syscall return range.
+        // When: the value is decoded at the user-space boundary.
+        // Then: it is reported as an unsupported operation.
+        assert_eq!(
+            ErrorCode::from_u64(u64::MAX),
+            Err(ErrorCode::NotImplemented)
+        );
     }
 
     #[test]

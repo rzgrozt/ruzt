@@ -25,8 +25,9 @@ impl CpuOps for X86_64Cpu {
     type Guard = X86_64InterruptGuard;
 
     fn cpu_id() -> u32 {
-        // CPUID leaf 1 is valid on all x86_64 CPUs.
-        let cpuid = core::arch::x86_64::__cpuid(1);
+        // SAFETY: [Category 13 - Library contract] CPUID leaf 1 is defined on
+        // every x86_64 CPU, so executing this intrinsic has a valid leaf.
+        let cpuid = unsafe { core::arch::x86_64::__cpuid(1) };
         // APIC ID is in EBX[31:24].
         (cpuid.ebx >> 24) as u32
     }

@@ -2,11 +2,15 @@
 members = [
     "kernel/ruzt-kernel",
     "boot/boot-aarch64",
+    "boot/boot-x86_64",
     "hal/ruzt-hal",
     "hal/ruzt-hal-x86_64",
     "hal/ruzt-hal-aarch64",
     "crates/ruzt-abi",
     "crates/ruzt-cap",
+    "crates/ruzt-runtime",
+    "crates/ruzt-ipc",
+    "servers/rootsrv",
 ]
 resolver = "2"
 

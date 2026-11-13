@@ -7,6 +7,27 @@ fn test_kernel_boots() {
         .join("..")
         .join("..");
 
+    // The kernel embeds rootsrv with include_bytes!, so the user binary must
+    // exist before the kernel is compiled.
+    let rootsrv_dir = workspace_root.join("servers").join("rootsrv");
+    let status = Command::new("cargo")
+        .args(["build", "--target", "../../x86_64-ruzt-user.json"])
+        .current_dir(&rootsrv_dir)
+        .status()
+        .expect("Failed to build rootsrv");
+    assert!(status.success(), "rootsrv build failed");
+
+    let rootsrv_binary = workspace_root
+        .join("target")
+        .join("x86_64-ruzt-user")
+        .join("debug")
+        .join("rootsrv");
+    assert!(
+        rootsrv_binary.exists(),
+        "rootsrv binary not found at {:?}",
+        rootsrv_binary
+    );
+
     let kernel_dir = workspace_root.join("kernel").join("ruzt-kernel");
     let status = Command::new("cargo")
         .args(["build"])
@@ -58,29 +79,38 @@ fn test_kernel_boots() {
         eprintln!("DEBUG: QEMU stdout:\n{}", stdout);
     }
 
+    for marker in [
+        "Ruzt booting...",
+        "cap object table initialised.",
+        "syscall entry initialised.",
+        "GDT+TSS initialised.",
+        "IDT loaded.",
+        "EXCEPTION: BREAKPOINT",
+        "PIC initialised.",
+        "PIT timer initialised.",
+        "Scheduler initialised.",
+    ] {
+        assert!(
+            stdout.contains(marker),
+            "Missing '{}' in serial output.\nOutput:\n{}",
+            marker,
+            stdout
+        );
+    }
+
     assert!(
-        stdout.contains("Ruzt booting..."),
-        "Missing 'Ruzt booting...' in serial output.\nOutput:\n{}",
+        stdout.contains("rootsrv process created, entering user mode..."),
+        "Missing rootsrv launch marker.\nOutput:\n{}",
         stdout
     );
     assert!(
-        stdout.contains("EXCEPTION: BREAKPOINT"),
-        "Missing 'EXCEPTION: BREAKPOINT' in serial output.\nOutput:\n{}",
+        stdout.contains("Hello from ring 3, rootsrv alive."),
+        "Missing ring-3 hello.\nOutput:\n{}",
         stdout
     );
     assert!(
-        stdout.contains("thread A ticking"),
-        "Missing 'thread A ticking' in serial output.\nOutput:\n{}",
-        stdout
-    );
-    assert!(
-        stdout.contains("thread B ticking"),
-        "Missing 'thread B ticking' in serial output.\nOutput:\n{}",
-        stdout
-    );
-    assert!(
-        stdout.contains("keyboard_echo task started"),
-        "Missing 'keyboard_echo task started' in serial output.\nOutput:\n{}",
+        stdout.contains("........"),
+        "Missing heartbeat dots (>= 8 consecutive).\nOutput:\n{}",
         stdout
     );
     assert!(
@@ -92,7 +122,9 @@ fn test_kernel_boots() {
         .lines()
         .find(|l| l.starts_with("Timer monotonic ns: "))
         .expect("Timer monotonic ns line not found");
-    let ns_str = timer_line.strip_prefix("Timer monotonic ns: ").unwrap();
+    let ns_str = timer_line
+        .strip_prefix("Timer monotonic ns: ")
+        .expect("Timer line prefix changed");
     let ns: u64 = ns_str.trim().parse().expect("Failed to parse timer ns value");
     assert!(
         ns > 0,

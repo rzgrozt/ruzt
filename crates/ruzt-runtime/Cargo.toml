@@ -1,0 +1,8 @@
+[package]
+name = "ruzt-runtime"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ruzt-abi = { path = "../ruzt-abi" }
+linked_list_allocator = "0.10.6"

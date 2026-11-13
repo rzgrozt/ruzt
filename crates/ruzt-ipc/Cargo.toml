@@ -1,0 +1,8 @@
+[package]
+name = "ruzt-ipc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ruzt-abi = { path = "../ruzt-abi" }
+ruzt-runtime = { path = "../ruzt-runtime" }
