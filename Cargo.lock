@@ -347,6 +347,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 
 [[package]]
+name = "noto-sans-mono-bitmap"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f102c477fd4ec864c149803bf606ecc23bc9329602ec0f99073a728abf454abc"
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -487,6 +493,7 @@ version = "0.1.0"
 dependencies = [
  "bootloader_api",
  "linked_list_allocator",
+ "noto-sans-mono-bitmap",
  "ruzt-abi",
  "ruzt-cap",
  "ruzt-hal",

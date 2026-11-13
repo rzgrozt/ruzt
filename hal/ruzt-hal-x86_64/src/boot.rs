@@ -83,6 +83,7 @@ pub unsafe fn normalize(raw: &'static mut bootloader_api::BootInfo) -> &'static 
             width: info.width as u32,
             height: info.height as u32,
             stride: info.stride as u32,
+            bytes_per_pixel: info.bytes_per_pixel,
             pixel_format: convert_pixel_format(info.pixel_format),
         }
     });

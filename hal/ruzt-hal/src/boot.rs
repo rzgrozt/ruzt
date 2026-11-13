@@ -26,14 +26,16 @@ pub enum PixelFormat {
 /// The linear framebuffer provided by the bootloader.
 // SOURCE: Design Report §6 — "paint a brand-mark to the framebuffer"
 pub struct Framebuffer {
-    /// Raw pixel data. Length = stride * height bytes.
+    /// Raw pixel data.
     pub buffer: &'static mut [u8],
     /// Width in pixels.
     pub width: u32,
     /// Height in pixels.
     pub height: u32,
-    /// Bytes per row (may be larger than width * bytes_per_pixel due to padding).
+    /// Pixels per row, including padding.
     pub stride: u32,
+    /// Number of bytes occupied by each pixel.
+    pub bytes_per_pixel: usize,
     /// Pixel color channel layout.
     pub pixel_format: PixelFormat,
 }

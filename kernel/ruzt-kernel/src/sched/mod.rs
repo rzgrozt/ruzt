@@ -2,7 +2,7 @@
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 use crate::cap::object::KObjectId;
 
@@ -51,9 +51,6 @@ static SCHEDULER: Mutex<Option<Scheduler>> = Mutex::new(None);
 /// Set by the timer ISR when a tick has occurred.
 static NEED_SWITCH: AtomicBool = AtomicBool::new(false);
 
-/// Ticks remaining before QEMU test shutdown.
-static TEST_TICKS: AtomicU64 = AtomicU64::new(300);
-
 /// Set by the timer ISR to request a context switch.
 pub fn request_switch() {
     NEED_SWITCH.store(true, Ordering::Relaxed);
@@ -62,11 +59,6 @@ pub fn request_switch() {
 /// Check whether the timer ISR has requested a context switch.
 pub fn should_switch() -> bool {
     NEED_SWITCH.swap(false, Ordering::Relaxed)
-}
-
-/// Decrement the test tick counter and return `true` if QEMU should shut down.
-pub fn test_tick() -> bool {
-    TEST_TICKS.fetch_sub(1, Ordering::Relaxed) == 1
 }
 
 /// Initialise the scheduler, registering the current execution context as the

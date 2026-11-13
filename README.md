@@ -34,6 +34,17 @@ cargo test --locked -p boot-x86_64 --test boot_test -- --nocapture
 
 The test builds the kernel in a fresh temporary directory, creates a BIOS disk image, and checks that QEMU prints the breakpoint and return messages in order before exiting successfully.
 
+## Graphical boot
+
+Run these commands from the repository root with QEMU's GTK display backend installed.
+
+```sh
+(cd kernel/ruzt-kernel && cargo build --locked)
+cargo run --locked -p boot-x86_64
+```
+
+QEMU opens a window for the boot screen and streams serial diagnostics to the terminal. The screen marks each milestone as the kernel reaches it and stays visible until you close QEMU.
+
 ## Design
 
 Read [Project Philosophy](PHILOSOPHY.md) for the project's principles and the [Technical Design Report](Ruzt_Technical_Design_Report.md) for the architecture, roadmap, and proposed licensing model.

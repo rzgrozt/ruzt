@@ -10,6 +10,7 @@
 
 extern crate alloc;
 
+mod boot_screen;
 pub mod serial;
 pub mod vga;
 pub mod exceptions;
@@ -34,6 +35,13 @@ use ruzt_hal::cpu::CpuOps;
 pub fn main(boot_info: &'static mut BootInfo) -> ! {
     serial::SERIAL1.lock().init();
 
+    let mut screen = boot_info.framebuffer.take().and_then(boot_screen::BootScreen::new);
+    let mut advance_screen = || {
+        if let Some(screen) = &mut screen {
+            screen.advance();
+        }
+    };
+
     mm::frame::init(boot_info);
 
     let offset = boot_info
@@ -48,9 +56,11 @@ pub fn main(boot_info: &'static mut BootInfo) -> ! {
     }
 
     mm::heap::init();
+    advance_screen();
 
     cap::object::init();
     serial_println!("cap object table initialised.");
+    advance_screen();
 
     syscall::init();
     serial_println!("syscall entry initialised.");
@@ -63,6 +73,7 @@ pub fn main(boot_info: &'static mut BootInfo) -> ! {
     serial_println!("Firing int3 breakpoint...");
     x86_64::instructions::interrupts::int3();
     serial_println!("Breakpoint returned cleanly.");
+    advance_screen();
 
     if cfg!(feature = "qemu-smoke-test") {
         ruzt_hal_x86_64::cpu::qemu_shutdown();
@@ -86,6 +97,7 @@ pub fn main(boot_info: &'static mut BootInfo) -> ! {
 
     sched::init();
     serial_println!("Scheduler initialised.");
+    advance_screen();
 
     sched::spawn(thread_a);
     sched::spawn(thread_b);
@@ -100,6 +112,7 @@ pub fn main(boot_info: &'static mut BootInfo) -> ! {
     sched::spawn(ipc_test_receiver);
     serial_println!("IPC self-test threads spawned");
 
+    boot_screen::wait_for_timer(screen);
     serial_println!("Enabling interrupts...");
     ruzt_hal_x86_64::cpu::X86_64Cpu::enable_interrupts();
 

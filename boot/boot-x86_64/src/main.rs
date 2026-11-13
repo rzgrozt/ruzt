@@ -27,10 +27,11 @@ fn main() {
         .args([
             "-drive",
             &format!("format=raw,file={}", disk_image.display()),
+            "-display",
+            "gtk",
+            "-no-reboot",
             "-serial",
             "stdio",
-            "-device",
-            "isa-debug-exit,iobase=0xf4,iosize=0x04",
         ])
         .status()
         .expect("Failed to run QEMU");

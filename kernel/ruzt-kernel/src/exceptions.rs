@@ -98,14 +98,12 @@ extern "x86-interrupt" fn page_fault_handler(
 extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
     ruzt_hal_x86_64::time::increment_tick();
     TIMER_TICK_PRINTED.call_once(|| {
+        crate::boot_screen::timer_started();
         serial_println!(
             "Timer monotonic ns: {}",
             ruzt_hal_x86_64::time::X86_64Timer::now_monotonic_ns()
         );
     });
-    if crate::sched::test_tick() {
-        ruzt_hal_x86_64::cpu::qemu_shutdown();
-    }
     crate::sched::request_switch();
     ruzt_hal_x86_64::pic::send_eoi(0);
 }

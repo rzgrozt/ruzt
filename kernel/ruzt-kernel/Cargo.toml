@@ -15,6 +15,7 @@ ruzt-hal-x86_64 = { path = "../../hal/ruzt-hal-x86_64", optional = true }
 ruzt-hal-aarch64 = { path = "../../hal/ruzt-hal-aarch64", optional = true }
 ruzt-cap = { path = "../../crates/ruzt-cap" }
 ruzt-abi = { path = "../../crates/ruzt-abi" }
+noto-sans-mono-bitmap = { version = "0.3.2", default-features = false, features = ["regular", "bold", "size_16", "size_20", "size_32", "unicode-basic-latin"] }
 
 [features]
 default = ["arch-x86_64"]
