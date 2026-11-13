@@ -6,19 +6,6 @@ fn main() {
         .join("..")
         .join("..");
 
-    let rootsrv_binary = workspace_root
-        .join("target")
-        .join("x86_64-ruzt-user")
-        .join("debug")
-        .join("rootsrv");
-
-    if !rootsrv_binary.exists() {
-        eprintln!("rootsrv binary not found. Build it first with:");
-        eprintln!("  cd servers/rootsrv");
-        eprintln!("  cargo build --target ../../x86_64-ruzt-user.json");
-        std::process::exit(1);
-    }
-
     let kernel_binary = workspace_root
         .join("target")
         .join("x86_64-unknown-none")

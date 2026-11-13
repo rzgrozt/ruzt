@@ -291,7 +291,7 @@ Pin everything. Reproducibility starts at the toolchain.
 ```toml
 # rust-toolchain.toml
 [toolchain]
-channel = "nightly-2026-04-15"   # pin a specific date; bump deliberately via RFC
+channel = "nightly-2026-04-16"   # pin a specific date; bump deliberately via RFC
 components = ["rust-src", "llvm-tools-preview", "rustfmt", "clippy"]
 targets = [
   "x86_64-unknown-none",

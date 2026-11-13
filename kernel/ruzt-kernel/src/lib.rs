@@ -64,6 +64,10 @@ pub fn main(boot_info: &'static mut BootInfo) -> ! {
     x86_64::instructions::interrupts::int3();
     serial_println!("Breakpoint returned cleanly.");
 
+    if cfg!(feature = "qemu-smoke-test") {
+        ruzt_hal_x86_64::cpu::qemu_shutdown();
+    }
+
     mm::heap::smoke_test();
 
     #[allow(unsafe_code)]

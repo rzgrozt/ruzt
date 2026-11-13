@@ -18,6 +18,7 @@ ruzt-abi = { path = "../../crates/ruzt-abi" }
 
 [features]
 default = ["arch-x86_64"]
+qemu-smoke-test = []
 arch-x86_64 = ["ruzt-hal", "ruzt-hal-x86_64"]
 arch-aarch64 = ["ruzt-hal", "ruzt-hal-aarch64"]
 

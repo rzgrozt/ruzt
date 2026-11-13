@@ -6,7 +6,7 @@ Ruzt is an experimental, privacy-first operating system built around a Rust micr
 
 The x86_64 kernel contains early boot code, serial diagnostics, interrupt handling, memory management, and a scheduler. Capability, IPC, and ELF-loading code is in development. Launching the first user-space process, `rootsrv`, from kernel startup is pending. The AArch64 boot path is a stub.
 
-The next milestone is a reproducible x86_64 boot in QEMU with serial output that confirms the kernel handled a breakpoint and continued running.
+The x86_64 QEMU smoke test checks that the kernel handles a breakpoint and resumes execution. The next milestone is launching `rootsrv` in ring 3.
 
 ## Repository layout
 
@@ -26,13 +26,13 @@ From the repository root, run the host tests for the ABI, capability types, and 
 cargo test --locked -p ruzt-abi -p ruzt-cap -p ruzt-hal
 ```
 
-The full boot test requires the Rust nightly components listed in [`rust-toolchain.toml`](rust-toolchain.toml) and `qemu-system-x86_64` on your path.
+Run the kernel-only boot smoke test with the pinned Rust nightly and components in [`rust-toolchain.toml`](rust-toolchain.toml). It requires `qemu-system-x86_64` and `timeout` on your path.
 
 ```sh
 cargo test --locked -p boot-x86_64 --test boot_test -- --nocapture
 ```
 
-The boot test is currently blocked by toolchain compatibility issues in the x86_64 and bootloader dependencies and the custom user-space target. It also checks for the pending ring-3 `rootsrv` launch.
+The test builds the kernel in a fresh temporary directory, creates a BIOS disk image, and checks that QEMU prints the breakpoint and return messages in order before exiting successfully.
 
 ## Design
 
