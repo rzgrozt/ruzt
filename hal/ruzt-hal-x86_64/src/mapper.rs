@@ -129,15 +129,9 @@ impl X86_64Mapper {
         // guarantees every allocated frame is covered by the physmap.
         unsafe { zero_frame(root) };
 
-        let (active_root, _) = Cr3::read();
-        let source_address = physical_memory_offset() + active_root.start_address().as_u64();
-        let source_pointer = source_address.as_ptr::<PageTable>();
+        let source = self.inner.level_4_table();
         let destination_pointer = frame_pointer(root).cast::<PageTable>();
 
-        // SAFETY: [Categories 3/6/11 - Dangling, alignment, provenance]
-        // `init` guarantees the physmap covers the active root frame, and
-        // `Cr3::read` guarantees that frame's 4 KiB alignment and validity.
-        let source = unsafe { &*source_pointer };
         // SAFETY: [Categories 1/3/6/11 - Aliasing, dangling, alignment,
         // provenance] The allocator contract makes `root` fresh and distinct
         // from the active root; `zero_frame` initialized all 4096 mapped bytes.

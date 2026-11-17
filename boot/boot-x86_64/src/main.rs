@@ -18,8 +18,16 @@ fn main() {
         std::process::exit(1);
     }
 
+    let rootsrv = kernel_binary.with_file_name("rootsrv");
+    if !rootsrv.exists() {
+        eprintln!("rootsrv binary not found. Build it first with:");
+        eprintln!("  cd servers/rootsrv && cargo build --locked --target x86_64-unknown-none");
+        std::process::exit(1);
+    }
+
     let disk_image = PathBuf::from("/tmp/ruzt-boot.img");
     bootloader::BiosBoot::new(&kernel_binary)
+        .set_ramdisk(&rootsrv)
         .create_disk_image(&disk_image)
         .expect("Failed to create disk image");
 

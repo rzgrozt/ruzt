@@ -21,13 +21,30 @@ pub fn init() {
 /// Called from the interrupt handler with the register state of the caller.
 /// Returns the value to be written back into `rax`.
 #[inline(never)]
-#[no_mangle]
-pub extern "C" fn syscall_dispatch(args: &SyscallArgs) -> u64 {
+pub(crate) extern "C" fn syscall_dispatch(args: &SyscallArgs, caller_cs: u64) -> u64 {
+    let from_user = caller_cs & 3 == 3;
     match SyscallNumber::from(args.number) {
+        // The shared kernel CSpace serves only the internal IPC self-test.
+        SyscallNumber::Invoke if from_user => ErrorCode::InvalidCap.as_u64(),
         SyscallNumber::Invoke => invoke::invoke(args),
         SyscallNumber::DebugPutChar => {
             let byte = args.arg0 as u8;
+            static ROOTSRV_STARTED: spin::Once<()> = spin::Once::new();
+            if from_user {
+                ROOTSRV_STARTED.call_once(crate::boot_screen::rootsrv_started);
+            }
             crate::serial::SERIAL1.lock().send(byte);
+            #[cfg(feature = "qemu-rootsrv-test")]
+            if from_user {
+                static GREETING_LINE_SENT: spin::Once<()> = spin::Once::new();
+                if byte == b'\n' {
+                    GREETING_LINE_SENT.call_once(|| {});
+                }
+                // A heartbeat after the greeting proves the earlier calls returned.
+                if byte == b'.' && GREETING_LINE_SENT.is_completed() {
+                    ruzt_hal_x86_64::cpu::qemu_shutdown();
+                }
+            }
             ErrorCode::Ok.as_u64()
         }
         SyscallNumber::NotImplemented | SyscallNumber::_Reply | SyscallNumber::_Yield => {
@@ -51,19 +68,24 @@ mod tests {
             arg4: 0,
             arg5: 0,
         };
-        let ret = syscall_dispatch(&args);
+        let ret = syscall_dispatch(&args, 0);
         assert_eq!(ret, ErrorCode::NotImplemented.as_u64());
     }
 
     #[test]
-    fn user_entry_state_round_trips_when_process_sets_initial_context() {
-        // Given: a validated initial user machine state.
-        // When: process creation publishes the three entry registers.
-        set_user_entry(0x400000, 0x8000fff8, 0x12345000);
-        let entry = user_entry();
-        // Then: ring-3 handoff observes the exact values together.
-        assert_eq!(entry.rip, 0x400000);
-        assert_eq!(entry.rsp, 0x8000fff8);
-        assert_eq!(entry.cr3, 0x12345000);
+    fn user_invoke_cannot_access_kernel_cspace() {
+        let args = SyscallArgs {
+            number: SyscallNumber::Invoke as u64,
+            arg0: 0,
+            arg1: 0,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        };
+        assert_eq!(
+            syscall_dispatch(&args, 0x1b),
+            ErrorCode::InvalidCap.as_u64()
+        );
     }
 }

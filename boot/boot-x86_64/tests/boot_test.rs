@@ -3,9 +3,53 @@ use std::process::Command;
 
 #[test]
 fn test_kernel_boots() {
-    let kernel_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernel/ruzt-kernel");
+    let serial = run_boot("qemu-smoke-test", false);
+    assert_markers(
+        &serial,
+        &[
+            "Ruzt booting...",
+            "EXCEPTION: BREAKPOINT",
+            "Breakpoint returned cleanly.",
+        ],
+    );
+}
+
+#[test]
+fn test_rootsrv_boots_in_ring_three() {
+    let serial = run_boot("qemu-rootsrv-test", true);
+    assert_markers(
+        &serial,
+        &[
+            "Breakpoint returned cleanly.",
+            "rootsrv process created, entering user mode...",
+            "Hello from ring 3, rootsrv alive.",
+            ".",
+        ],
+    );
+}
+
+fn run_boot(kernel_feature: &str, with_rootsrv: bool) -> String {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let kernel_dir = workspace.join("kernel/ruzt-kernel");
     let temp = tempfile::tempdir().expect("Failed to create boot test directory");
     let build_dir = temp.path().join("target");
+    let debug_dir = build_dir.join("x86_64-unknown-none/debug");
+
+    if with_rootsrv {
+        let status = Command::new(env!("CARGO"))
+            .args([
+                "build",
+                "--locked",
+                "--target",
+                "x86_64-unknown-none",
+                "--target-dir",
+            ])
+            .arg(&build_dir)
+            .current_dir(workspace.join("servers/rootsrv"))
+            .status()
+            .expect("Failed to build rootsrv");
+        assert!(status.success(), "rootsrv build failed: {status}");
+    }
 
     let status = Command::new(env!("CARGO"))
         .args([
@@ -14,7 +58,7 @@ fn test_kernel_boots() {
             "--bin",
             "ruzt-kernel",
             "--features",
-            "qemu-smoke-test",
+            kernel_feature,
             "--target-dir",
         ])
         .arg(&build_dir)
@@ -23,10 +67,12 @@ fn test_kernel_boots() {
         .expect("Failed to build kernel");
     assert!(status.success(), "Kernel build failed: {status}");
 
-    let kernel = build_dir.join("x86_64-unknown-none/debug/ruzt-kernel");
     let disk_image = temp.path().join("ruzt-test.img");
-    bootloader::BiosBoot::new(&kernel)
-        .create_disk_image(&disk_image)
+    let mut boot = bootloader::BiosBoot::new(&debug_dir.join("ruzt-kernel"));
+    if with_rootsrv {
+        boot.set_ramdisk(&debug_dir.join("rootsrv"));
+    }
+    boot.create_disk_image(&disk_image)
         .expect("Failed to create disk image");
 
     let output = Command::new("timeout")
@@ -56,12 +102,12 @@ fn test_kernel_boots() {
         output.status
     );
 
+    serial.into_owned()
+}
+
+fn assert_markers(serial: &str, markers: &[&str]) {
     let mut lines = serial.lines();
-    for marker in [
-        "Ruzt booting...",
-        "EXCEPTION: BREAKPOINT",
-        "Breakpoint returned cleanly.",
-    ] {
+    for marker in markers {
         assert!(
             lines.any(|line| line.starts_with(marker)),
             "Missing or out-of-order serial marker {marker:?}:\n{serial}"

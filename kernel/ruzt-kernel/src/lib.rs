@@ -62,12 +62,15 @@ pub fn main(boot_info: &'static mut BootInfo) -> ! {
     serial_println!("cap object table initialised.");
     advance_screen();
 
-    syscall::init();
-    serial_println!("syscall entry initialised.");
+    #[allow(unsafe_code)]
+    // SAFETY: Single boot CPU, before interrupts and IDT initialization.
+    unsafe { ruzt_hal_x86_64::gdt::init() };
+    serial_println!("GDT+TSS initialised.");
 
     serial_println!("Ruzt booting...");
 
     exceptions::init_idt();
+    syscall::init();
     serial_println!("IDT loaded.");
 
     serial_println!("Firing int3 breakpoint...");
@@ -99,6 +102,12 @@ pub fn main(boot_info: &'static mut BootInfo) -> ! {
     serial_println!("Scheduler initialised.");
     advance_screen();
 
+    if let Some(image) = boot_info.initrd {
+        boot_screen::attach(screen);
+        process::launch(image);
+    }
+    assert!(!cfg!(feature = "qemu-rootsrv-test"), "rootsrv is missing from the boot image");
+
     sched::spawn(thread_a);
     sched::spawn(thread_b);
     serial_println!("Threads spawned.");
@@ -112,7 +121,7 @@ pub fn main(boot_info: &'static mut BootInfo) -> ! {
     sched::spawn(ipc_test_receiver);
     serial_println!("IPC self-test threads spawned");
 
-    boot_screen::wait_for_timer(screen);
+    boot_screen::attach(screen);
     serial_println!("Enabling interrupts...");
     ruzt_hal_x86_64::cpu::X86_64Cpu::enable_interrupts();
 

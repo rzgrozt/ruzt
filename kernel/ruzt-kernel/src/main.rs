@@ -8,6 +8,8 @@ use ruzt_hal::cpu::CpuOps;
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut c = BootloaderConfig::new_default();
     c.mappings.physical_memory = Some(Mapping::Dynamic);
+    // User address spaces inherit only the supervisor half.
+    c.mappings.dynamic_range_start = Some(0xffff_8000_0000_0000);
     c.kernel_stack_size = 256 * 1024;
     c
 };

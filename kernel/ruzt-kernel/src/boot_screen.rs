@@ -23,15 +23,30 @@ const MILESTONES: [&str; 5] = [
     "First timer interrupt",
 ];
 
-static WAITING_FOR_TIMER: Mutex<Option<BootScreen>> = Mutex::new(None);
+static ACTIVE_SCREEN: Mutex<Option<BootScreen>> = Mutex::new(None);
 
-pub(crate) fn wait_for_timer(screen: Option<BootScreen>) {
-    *WAITING_FOR_TIMER.lock() = screen;
+pub(crate) fn attach(screen: Option<BootScreen>) {
+    *ACTIVE_SCREEN.lock() = screen;
 }
 
 pub(crate) fn timer_started() {
-    if let Some(mut screen) = WAITING_FOR_TIMER.lock().take() {
+    if let Some(screen) = ACTIVE_SCREEN.lock().as_mut() {
         screen.advance();
+    }
+}
+
+pub(crate) fn rootsrv_started() {
+    if let Some(screen) = ACTIVE_SCREEN.lock().as_mut() {
+        let y = screen.top + 340;
+        screen.rect(screen.left, y, screen.width, 16, CANVAS);
+        screen.text(
+            screen.left,
+            y,
+            "Ring 3 / rootsrv running",
+            RasterHeight::Size16,
+            BREEZE,
+            CANVAS,
+        );
     }
 }
 

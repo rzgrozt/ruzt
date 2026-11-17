@@ -4,9 +4,9 @@ Ruzt is an experimental, privacy-first operating system built around a Rust micr
 
 ## Development status
 
-The x86_64 kernel contains early boot code, serial diagnostics, interrupt handling, memory management, and a scheduler. Capability, IPC, and ELF-loading code is in development. Launching the first user-space process, `rootsrv`, from kernel startup is pending. The AArch64 boot path is a stub.
+The x86_64 kernel contains early boot code, serial diagnostics, interrupt handling, memory management, and a scheduler. The graphical x86_64 boot loads `rootsrv` into its own address space and starts it in ring 3. It reports its greeting and heartbeat through the debug syscall. The AArch64 boot path is a stub.
 
-The x86_64 QEMU smoke test checks that the kernel handles a breakpoint and resumes execution. The next milestone is launching `rootsrv` in ring 3.
+The next milestone is a capability-gated IPC round trip from user space.
 
 ## Repository layout
 
@@ -26,19 +26,20 @@ From the repository root, run the host tests for the ABI, capability types, and 
 cargo test --locked -p ruzt-abi -p ruzt-cap -p ruzt-hal
 ```
 
-Run the kernel-only boot smoke test with the pinned Rust nightly and components in [`rust-toolchain.toml`](rust-toolchain.toml). It requires `qemu-system-x86_64` and `timeout` on your path.
+Run the kernel-only and ring-3 QEMU tests with the pinned Rust nightly and components in [`rust-toolchain.toml`](rust-toolchain.toml). It requires `qemu-system-x86_64` and `timeout` on your path.
 
 ```sh
 cargo test --locked -p boot-x86_64 --test boot_test -- --nocapture
 ```
 
-The test builds the kernel in a fresh temporary directory, creates a BIOS disk image, and checks that QEMU prints the breakpoint and return messages in order before exiting successfully.
+Each test builds a BIOS image in a fresh temporary directory. The kernel-only test checks breakpoint recovery. The ring-3 test also packages `rootsrv` as the bootloader ramdisk and checks its serial greeting and first heartbeat.
 
 ## Graphical boot
 
 Run these commands from the repository root with QEMU's GTK display backend installed.
 
 ```sh
+(cd servers/rootsrv && cargo build --locked --target x86_64-unknown-none)
 (cd kernel/ruzt-kernel && cargo build --locked)
 cargo run --locked -p boot-x86_64
 ```

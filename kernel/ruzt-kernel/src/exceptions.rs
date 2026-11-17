@@ -24,22 +24,21 @@ pub fn init_idt() {
         idt[32].set_handler_fn(timer_handler);
         idt[33].set_handler_fn(keyboard_handler);
         unsafe {
-            idt[0x80].set_handler_addr(x86_64::VirtAddr::new(syscall_handler as *const () as usize as u64));
+            idt[0x80]
+                .set_handler_addr(x86_64::VirtAddr::from_ptr(syscall_handler as *const ()))
+                .set_privilege_level(x86_64::PrivilegeLevel::Ring3);
         }
         idt
     });
     idt.load();
 }
 
-#[allow(unsafe_code)]
-extern "C" fn syscall_handler_debug() {
-    crate::serial_println!("syscall_handler: entered!");
-}
-
 #[unsafe(naked)]
 extern "C" fn syscall_handler() {
     core::arch::naked_asm!(
-        "push r15",
+        // Save caller-clobbered registers and build SyscallArgs on the stack.
+        "push rcx",
+        "push r11",
         "push r9",
         "push r8",
         "push r10",
@@ -47,22 +46,20 @@ extern "C" fn syscall_handler() {
         "push rsi",
         "push rdi",
         "push rax",
-        "push r11",
-        "mov r11, rsp",
-        "add r11, 8",
-        "mov rdi, r11",
+        "mov rdi, rsp",
+        // Nine saved registers and one hardware-saved RIP precede CS.
+        "mov rsi, [rsp + 80]",
+        "cld",
         "call {syscall_dispatch}",
-        "mov r15, rax",
-        "pop r11",
-        "pop rax",
+        "add rsp, 8",
         "pop rdi",
         "pop rsi",
         "pop rdx",
         "pop r10",
         "pop r8",
         "pop r9",
-        "mov rax, r15",
-        "pop r15",
+        "pop r11",
+        "pop rcx",
         "iretq",
         syscall_dispatch = sym crate::syscall::syscall_dispatch,
     );
