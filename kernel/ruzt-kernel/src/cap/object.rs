@@ -1,7 +1,6 @@
 //! Kernel object table — every capability references a stable entry here.
 
 use alloc::vec::Vec;
-use core::mem;
 use spin::Mutex;
 use ruzt_abi::ErrorCode;
 use ruzt_cap::{CapType, NULL_SLOT};
@@ -9,6 +8,7 @@ use ruzt_hal::mem::PhysFrame;
 
 /// Maximum number of kernel objects in the table.
 const MAX_OBJECTS: usize = 256;
+const _: () = assert!(MAX_OBJECTS.is_power_of_two());
 
 /// Opaque handle for a kernel object entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,72 +89,109 @@ pub enum KernelObject {
 unsafe impl Send for KernelObject {}
 unsafe impl Sync for KernelObject {}
 
-/// Global object table protected by a spinlock.
-static TABLE: Mutex<[Option<KernelObject>; MAX_OBJECTS]> = Mutex::new([None; MAX_OBJECTS]);
+const INDEX_BITS: u32 = MAX_OBJECTS.trailing_zeros();
+const INDEX_MASK: u64 = MAX_OBJECTS as u64 - 1;
+const MAX_GENERATION: u64 = u64::MAX >> INDEX_BITS;
 
-/// One-time table initialisation.
+#[derive(Clone, Copy)]
+struct Entry {
+    generation: u64,
+    object: Option<KernelObject>,
+}
+
+impl Entry {
+    const EMPTY: Self = Self { generation: 0, object: None };
+
+    fn matches(&self, id: KObjectId) -> bool {
+        self.generation == id.0 >> INDEX_BITS
+    }
+}
+
+impl KObjectId {
+    fn index(self) -> usize {
+        (self.0 & INDEX_MASK) as usize
+    }
+}
+
+/// Global object table protected by a spinlock.
+static TABLE: Mutex<[Entry; MAX_OBJECTS]> = Mutex::new([Entry::EMPTY; MAX_OBJECTS]);
+
+/// Initialise the object table and the kernel-only CSpace.
 pub fn init() {
-    let mut guard = TABLE.lock();
-    for entry in guard.iter_mut() {
-        *entry = None;
+    {
+        let mut table = TABLE.lock();
+        for entry in table.iter_mut() {
+            if let Some(object) = entry.object.take() {
+                destroy(object);
+            }
+        }
     }
     super::cspace::init_kernel_cspace();
 }
 
-/// Allocate a free table slot and store the initial kernel object derived from
-/// `cap_type`.
-///
-/// Returns the [`KObjectId`] of the newly created entry.
+/// Allocate a kernel object and return its generation-qualified identity.
 pub fn allocate(cap_type: CapType) -> Result<KObjectId, ErrorCode> {
-    let mut guard = TABLE.lock();
-    let obj = kernel_object_from_cap_type(cap_type)?;
-    for (i, entry) in guard.iter_mut().enumerate() {
-        if entry.is_none() {
-            *entry = Some(obj);
-            return Ok(KObjectId(i as u64));
-        }
-    }
-    Err(ErrorCode::NoMemory)
+    let mut table = TABLE.lock();
+    let (index, entry) = table
+        .iter_mut()
+        .enumerate()
+        .find(|(_, entry)| entry.object.is_none() && entry.generation < MAX_GENERATION)
+        .ok_or(ErrorCode::NoMemory)?;
+    entry.object = Some(kernel_object_from_cap_type(cap_type)?);
+    entry.generation += 1;
+    Ok(KObjectId((entry.generation << INDEX_BITS) | index as u64))
 }
 
-/// Return a copy of the kernel object at `id`, or `None` if the slot is empty.
+/// Return the object identified by this live generation.
 pub fn get(id: KObjectId) -> Option<KernelObject> {
-    let guard = TABLE.lock();
-    guard.get(id.0 as usize).and_then(|opt| *opt)
+    let table = TABLE.lock();
+    let entry = &table[id.index()];
+    if entry.matches(id) { entry.object } else { None }
 }
 
 pub(crate) fn close_endpoint(id: KObjectId) {
-    let mut guard = TABLE.lock();
-    if let Some(Some(KernelObject::Endpoint { closed })) = guard.get_mut(id.0 as usize) {
-        *closed = true;
-    }
-}
-
-/// Zero the slot at `id` and, if it was a CNode, reclaim the heap-allocated
-/// slot array.
-pub fn deallocate(id: KObjectId) {
-    let mut guard = TABLE.lock();
-    if let Some(entry) = guard.get_mut(id.0 as usize) {
-        if let Some(obj) = entry {
-            if let KernelObject::CNode { slots, count, .. } = obj {
-                // SAFETY: ptr was allocated via Vec::with_capacity, count is
-                // correct. We reconstruct the Vec to drop it properly.
-                unsafe {
-                    let _ = Vec::from_raw_parts(*slots, 0, *count);
-                }
-            }
-            *entry = None;
+    update(id, |object| {
+        if let KernelObject::Endpoint { closed } = object {
+            *closed = true;
         }
+    });
+}
+
+/// Remove a kernel object and release its storage.
+pub fn deallocate(id: KObjectId) {
+    let object = {
+        let mut table = TABLE.lock();
+        let entry = &mut table[id.index()];
+        if entry.matches(id) { entry.object.take() } else { None }
+    };
+    if let Some(object) = object {
+        destroy(object);
     }
 }
 
-/// Set the signal state of a Notification object.
+fn destroy(object: KernelObject) {
+    if let KernelObject::CNode { slots, count, .. } = object {
+        // SAFETY: This is the unique boxed slice from CNode allocation.
+        unsafe { drop(alloc::boxed::Box::from_raw(core::ptr::slice_from_raw_parts_mut(slots, count))) };
+    }
+}
+
+/// Set the signal state of a live notification.
 pub fn set_notification_state(id: KObjectId, new_state: bool) {
-    let mut guard = TABLE.lock();
-    if let Some(Some(KernelObject::Notification { state, .. })) =
-        guard.get_mut(id.0 as usize)
-    {
-        *state = new_state;
+    update(id, |object| {
+        if let KernelObject::Notification { state } = object {
+            *state = new_state;
+        }
+    });
+}
+
+fn update(id: KObjectId, f: impl FnOnce(&mut KernelObject)) {
+    let mut table = TABLE.lock();
+    let entry = &mut table[id.index()];
+    if entry.matches(id) {
+        if let Some(object) = &mut entry.object {
+            f(object);
+        }
     }
 }
 
@@ -177,11 +214,11 @@ fn kernel_object_from_cap_type(cap_type: CapType) -> Result<KernelObject, ErrorC
             mapped_count: 0,
         }),
         CapType::CNode { radix_bits, .. } => {
-            let count = 1usize << (radix_bits as usize);
-            let mut slots = Vec::with_capacity(count);
+            let count = 1usize.checked_shl(u32::from(radix_bits)).ok_or(ErrorCode::BadMessage)?;
+            let mut slots = Vec::new();
+            slots.try_reserve_exact(count).map_err(|_| ErrorCode::NoMemory)?;
             slots.resize(count, NULL_SLOT);
-            let ptr = slots.as_mut_ptr();
-            mem::forget(slots);
+            let ptr = alloc::boxed::Box::into_raw(slots.into_boxed_slice()).cast();
             Ok(KernelObject::CNode {
                 slots: ptr,
                 radix_bits,
@@ -211,6 +248,21 @@ mod tests {
         assert!(get(id).is_some());
         deallocate(id);
         assert!(get(id).is_none());
+    }
+
+    #[test]
+    fn stale_handle_cannot_read_or_change_a_reused_slot() {
+        let _state = crate::isolated_kernel_state();
+        let old = allocate(CapType::Endpoint(EndpointId(0))).unwrap();
+        deallocate(old);
+        let new = allocate(CapType::Endpoint(EndpointId(0))).unwrap();
+
+        assert_eq!(old.index(), new.index());
+        assert_ne!(old, new);
+        assert_eq!(get(old), None);
+        close_endpoint(old);
+        deallocate(old);
+        assert_eq!(get(new), Some(KernelObject::Endpoint { closed: false }));
     }
 
     #[test]
@@ -285,9 +337,7 @@ mod tests {
         }
         for id in ids {
             deallocate(id);
-        }
-        for i in 0..16 {
-            assert!(get(KObjectId(i)).is_none());
+            assert!(get(id).is_none());
         }
     }
 }
