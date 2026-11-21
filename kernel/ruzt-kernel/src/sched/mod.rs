@@ -47,8 +47,25 @@ struct Thread {
 struct Scheduler {
     threads: Vec<alloc::boxed::Box<Thread>>,
     run_queue: VecDeque<ThreadId>,
+    wait_queue: VecDeque<ThreadId>,
     current: ThreadId,
     kernel_cr3: u64,
+}
+
+impl Scheduler {
+    fn mark_blocked(&mut self, id: ThreadId, reason: ThreadState) {
+        self.run_queue.retain(|&thread| thread != id);
+        self.threads[id].state = reason;
+        self.wait_queue.push_back(id);
+    }
+
+    fn mark_runnable(&mut self, id: ThreadId) {
+        if self.threads[id].state != ThreadState::Runnable {
+            self.wait_queue.retain(|&thread| thread != id);
+            self.threads[id].state = ThreadState::Runnable;
+            self.run_queue.push_back(id);
+        }
+    }
 }
 
 static SCHEDULER: Mutex<Option<Scheduler>> = Mutex::new(None);
@@ -77,6 +94,7 @@ pub fn init() {
     let mut sched = Scheduler {
         threads: Vec::with_capacity(16),
         run_queue: VecDeque::new(),
+        wait_queue: VecDeque::new(),
         current: 0,
         kernel_cr3,
     };
@@ -107,32 +125,39 @@ pub fn block_current(reason: ThreadState) {
     let current_id = sched.current;
 
     // Remove current from run queue.
-    sched.run_queue.retain(|&id| id != current_id);
-    sched.threads[current_id].state = reason;
+    assert_ne!(current_id, 0, "the idle thread cannot block");
+    sched.mark_blocked(current_id, reason);
 
     // Switch to next runnable thread.
-    let next_id = *sched.run_queue.front().unwrap_or(&0);
-    if next_id != current_id {
-        switch_to(guard, next_id);
-    }
+    let next_id = *sched
+        .run_queue
+        .front()
+        .expect("the idle thread is runnable");
+    switch_to(guard, next_id);
 }
 
 /// Unblock a thread and return it to the run queue.
 pub fn unblock(thread_id: ThreadId) {
     let mut guard = SCHEDULER.lock();
     let sched = guard.as_mut().expect("scheduler not initialised");
-    if !matches!(sched.threads[thread_id].state, ThreadState::Runnable) {
-        sched.threads[thread_id].state = ThreadState::Runnable;
-        sched.run_queue.push_back(thread_id);
-    }
+    sched.mark_runnable(thread_id);
+}
+
+pub(crate) fn first_waiter(reason: ThreadState) -> Option<ThreadId> {
+    let guard = SCHEDULER.lock();
+    let sched = guard.as_ref().expect("scheduler not initialised");
+    sched
+        .wait_queue
+        .iter()
+        .copied()
+        .find(|&id| sched.threads[id].state == reason)
 }
 
 pub(crate) fn wake_irq(thread_id: ThreadId, irq: u32) {
     let mut guard = SCHEDULER.lock();
     let sched = guard.as_mut().expect("scheduler not initialised");
     if sched.threads[thread_id].state == ThreadState::BlockedIrq(irq) {
-        sched.threads[thread_id].state = ThreadState::Runnable;
-        sched.run_queue.push_back(thread_id);
+        sched.mark_runnable(thread_id);
         request_switch();
     }
 }
@@ -283,41 +308,34 @@ mod tests {
     }
 
     #[test]
-    fn block_and_unblock() {
+    fn endpoint_waiters_are_selected_in_block_order() {
         let _state = crate::isolated_kernel_state();
-        let id = current_thread_id();
-        assert_eq!(id, 0);
+        fn entry() -> ! {
+            panic!("host tests do not switch stacks")
+        }
+        let earlier_spawned = spawn(entry);
+        let later_spawned = spawn(entry);
+        let unrelated = spawn(entry);
+        let reason = ThreadState::BlockedSend(KObjectId(0));
 
-        // Simulate blocking (we can't actually context switch in tests)
-        // but we can verify the state changes
         {
             let mut guard = SCHEDULER.lock();
             let sched = guard.as_mut().unwrap();
-            sched.threads[id].state = ThreadState::BlockedSend(KObjectId(0));
-            sched.run_queue.retain(|&i| i != id);
+            sched.mark_blocked(unrelated, ThreadState::BlockedRecv(KObjectId(1)));
+            sched.mark_blocked(later_spawned, reason);
+            sched.mark_blocked(earlier_spawned, reason);
         }
 
-        // Verify blocked
-        {
-            let guard = SCHEDULER.lock();
-            let sched = guard.as_ref().unwrap();
-            assert!(matches!(
-                sched.threads[id].state,
-                ThreadState::BlockedSend(_)
-            ));
-            assert!(!sched.run_queue.contains(&id));
-        }
-
-        // Unblock
-        unblock(id);
-
-        // Verify runnable
-        {
-            let guard = SCHEDULER.lock();
-            let sched = guard.as_ref().unwrap();
-            assert!(matches!(sched.threads[id].state, ThreadState::Runnable));
-            assert!(sched.run_queue.contains(&id));
-        }
+        assert_eq!(first_waiter(reason), Some(later_spawned));
+        unblock(later_spawned);
+        unblock(later_spawned);
+        assert_eq!(first_waiter(reason), Some(earlier_spawned));
+        unblock(earlier_spawned);
+        assert_eq!(first_waiter(reason), None);
+        let guard = SCHEDULER.lock();
+        let sched = guard.as_ref().unwrap();
+        assert_eq!(sched.run_queue, [0, later_spawned, earlier_spawned]);
+        assert_eq!(sched.wait_queue, [unrelated]);
     }
 
     #[test]

@@ -190,6 +190,23 @@ pub struct IpcMessage {
     pub caps: [CapTransferSlot; 4],
 }
 
+impl Default for IpcMessage {
+    fn default() -> Self {
+        Self {
+            label: 0,
+            length: 0,
+            cap_count: 0,
+            flags: 0,
+            data: [0; 56],
+            caps: [CapTransferSlot {
+                cptr: 0,
+                rights: CapRights::empty(),
+                badge: 0,
+            }; 4],
+        }
+    }
+}
+
 /// Register layout of the `syscall` / `sysret` fast path.
 ///
 /// On x86_64 the fields map to `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9`

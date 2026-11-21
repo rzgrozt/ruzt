@@ -32,19 +32,12 @@ pub struct AddressSpaceId(pub u64);
 pub enum KernelObject {
     /// Empty slot.
     Null,
-    /// IPC endpoint.
-    Endpoint {
-        /// Thread waiting to send (blocked).
-        blocked_sender: Option<usize>,
-        /// Thread waiting to receive (blocked).
-        blocked_receiver: Option<usize>,
-    },
+    /// IPC endpoint. Waiters live in the scheduler.
+    Endpoint,
     /// Async notification object.
     Notification {
-        /// Current signal state.
+        /// Whether a signal arrived while nobody was waiting.
         state: bool,
-        /// Thread waiting on this notification.
-        blocked_waiter: Option<usize>,
     },
     /// Thread control block.
     Thread {
@@ -145,46 +138,6 @@ pub fn deallocate(id: KObjectId) {
     }
 }
 
-/// Set the blocked sender on an Endpoint object.
-pub fn set_blocked_sender(id: KObjectId, sender_id: usize) {
-    let mut guard = TABLE.lock();
-    if let Some(Some(KernelObject::Endpoint { ref mut blocked_sender, .. })) =
-        guard.get_mut(id.0 as usize)
-    {
-        *blocked_sender = Some(sender_id);
-    }
-}
-
-/// Clear the blocked sender on an Endpoint object.
-pub fn clear_blocked_sender(id: KObjectId) {
-    let mut guard = TABLE.lock();
-    if let Some(Some(KernelObject::Endpoint { ref mut blocked_sender, .. })) =
-        guard.get_mut(id.0 as usize)
-    {
-        *blocked_sender = None;
-    }
-}
-
-/// Set the blocked receiver on an Endpoint object.
-pub fn set_blocked_receiver(id: KObjectId, receiver_id: usize) {
-    let mut guard = TABLE.lock();
-    if let Some(Some(KernelObject::Endpoint { ref mut blocked_receiver, .. })) =
-        guard.get_mut(id.0 as usize)
-    {
-        *blocked_receiver = Some(receiver_id);
-    }
-}
-
-/// Clear the blocked receiver on an Endpoint object.
-pub fn clear_blocked_receiver(id: KObjectId) {
-    let mut guard = TABLE.lock();
-    if let Some(Some(KernelObject::Endpoint { ref mut blocked_receiver, .. })) =
-        guard.get_mut(id.0 as usize)
-    {
-        *blocked_receiver = None;
-    }
-}
-
 /// Set the signal state of a Notification object.
 pub fn set_notification_state(id: KObjectId, new_state: bool) {
     let mut guard = TABLE.lock();
@@ -195,38 +148,12 @@ pub fn set_notification_state(id: KObjectId, new_state: bool) {
     }
 }
 
-/// Set the blocked waiter on a Notification object.
-pub fn set_blocked_waiter(id: KObjectId, waiter_id: usize) {
-    let mut guard = TABLE.lock();
-    if let Some(Some(KernelObject::Notification { ref mut blocked_waiter, .. })) =
-        guard.get_mut(id.0 as usize)
-    {
-        *blocked_waiter = Some(waiter_id);
-    }
-}
-
-/// Clear the blocked waiter on a Notification object.
-pub fn clear_blocked_waiter(id: KObjectId) {
-    let mut guard = TABLE.lock();
-    if let Some(Some(KernelObject::Notification { ref mut blocked_waiter, .. })) =
-        guard.get_mut(id.0 as usize)
-    {
-        *blocked_waiter = None;
-    }
-}
-
 /// Convert a [`CapType`] into the corresponding [`KernelObject`] variant.
 fn kernel_object_from_cap_type(cap_type: CapType) -> Result<KernelObject, ErrorCode> {
     match cap_type {
         CapType::Null => Err(ErrorCode::InvalidCap),
-        CapType::Endpoint(_) => Ok(KernelObject::Endpoint {
-            blocked_sender: None,
-            blocked_receiver: None,
-        }),
-        CapType::Notification(_) => Ok(KernelObject::Notification {
-            state: false,
-            blocked_waiter: None,
-        }),
+        CapType::Endpoint(_) => Ok(KernelObject::Endpoint),
+        CapType::Notification(_) => Ok(KernelObject::Notification { state: false }),
         CapType::Thread(thread_id) => Ok(KernelObject::Thread {
             thread_id: thread_id.0 as usize,
         }),
@@ -281,7 +208,7 @@ mod tests {
         let _state = crate::isolated_kernel_state();
         let id = allocate(CapType::Endpoint(EndpointId(0))).unwrap();
         let obj = get(id).unwrap();
-        assert!(matches!(obj, KernelObject::Endpoint { blocked_sender: None, blocked_receiver: None }));
+        assert!(matches!(obj, KernelObject::Endpoint));
     }
 
     #[test]
@@ -297,7 +224,7 @@ mod tests {
         let _state = crate::isolated_kernel_state();
         let id = allocate(CapType::Notification(NotificationId(0))).unwrap();
         let obj = get(id).unwrap();
-        assert!(matches!(obj, KernelObject::Notification { state: false, blocked_waiter: None }));
+        assert!(matches!(obj, KernelObject::Notification { state: false }));
     }
 
     #[test]
