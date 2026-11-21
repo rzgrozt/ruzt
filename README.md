@@ -21,10 +21,10 @@ The bootstrap endpoint has a single pending reply and is served by a kernel echo
 
 ## Local checks
 
-From the repository root, run the host tests for the ABI, capability types, and HAL traits with Cargo.
+From the repository root, run the host tests for the ABI, capability types, x86_64 HAL, and kernel.
 
 ```sh
-cargo test --locked -p ruzt-abi -p ruzt-cap -p ruzt-hal
+cargo test --locked -p ruzt-abi -p ruzt-cap -p ruzt-hal -p ruzt-hal-x86_64 -p ruzt-kernel --lib
 ```
 
 Run the kernel-only and ring-3 QEMU tests with the pinned Rust nightly and components in [`rust-toolchain.toml`](rust-toolchain.toml). It requires `qemu-system-x86_64` and `timeout` on your path.
@@ -34,6 +34,8 @@ cargo test --locked -p boot-x86_64 --test boot_test -- --nocapture
 ```
 
 Each test builds a BIOS image in a fresh temporary directory. The kernel-only test checks breakpoint recovery. The ring-3 test packages `rootsrv` as the bootloader ramdisk, checks its IPC round trip and rejection of an ungranted capability, then injects Space with the QEMU monitor and checks screenshots for the tile's color change.
+
+GitHub Actions runs both commands on pushes to `main` and on pull requests.
 
 ## Graphical boot
 
