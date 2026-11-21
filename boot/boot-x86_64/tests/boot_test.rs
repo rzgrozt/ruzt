@@ -115,11 +115,8 @@ fn build_image(temp: &Path, kernel_feature: &str, with_rootsrv: bool) -> PathBuf
     assert!(status.success(), "Kernel build failed: {status}");
 
     let disk_image = temp.join("ruzt-test.img");
-    let mut boot = bootloader::BiosBoot::new(&debug_dir.join("ruzt-kernel"));
-    if with_rootsrv {
-        boot.set_ramdisk(&debug_dir.join("rootsrv"));
-    }
-    boot.create_disk_image(&disk_image)
+    let programs: &[&str] = if with_rootsrv { &["rootsrv"] } else { &[] };
+    boot_x86_64::create_image(&disk_image, &debug_dir.join("ruzt-kernel"), programs)
         .expect("Failed to create disk image");
     disk_image
 }

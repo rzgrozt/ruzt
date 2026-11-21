@@ -25,10 +25,9 @@ fn main() {
         std::process::exit(1);
     }
 
-    let disk_image = PathBuf::from("/tmp/ruzt-boot.img");
-    bootloader::BiosBoot::new(&kernel_binary)
-        .set_ramdisk(&rootsrv)
-        .create_disk_image(&disk_image)
+    let temp = tempfile::tempdir().expect("Failed to create boot directory");
+    let disk_image = temp.path().join("ruzt-boot.img");
+    boot_x86_64::create_image(&disk_image, &kernel_binary, &["rootsrv"])
         .expect("Failed to create disk image");
 
     let status = Command::new("qemu-system-x86_64")
@@ -44,5 +43,6 @@ fn main() {
         .status()
         .expect("Failed to run QEMU");
 
+    drop(temp);
     std::process::exit(status.code().unwrap_or(1));
 }

@@ -27,13 +27,13 @@ From the repository root, run the host tests for the ABI, capability types, x86_
 cargo test --locked -p ruzt-abi -p ruzt-cap -p ruzt-hal -p ruzt-hal-x86_64 -p ruzt-kernel --lib
 ```
 
-Run the kernel-only and ring-3 QEMU tests with the pinned Rust nightly and components in [`rust-toolchain.toml`](rust-toolchain.toml). It requires `qemu-system-x86_64` and `timeout` on your path.
+Run the kernel-only and ring-3 QEMU tests with the pinned Rust nightly and components in [`rust-toolchain.toml`](rust-toolchain.toml). It requires `qemu-system-x86_64`, GNU `tar`, and `timeout` on your path.
 
 ```sh
 cargo test --locked -p boot-x86_64 --test boot_test -- --nocapture
 ```
 
-Each test builds a BIOS image in a fresh temporary directory. The kernel-only test checks breakpoint recovery, thread scheduling, and blocking IPC. The ring-3 test packages `rootsrv` as the bootloader ramdisk, checks its IPC round trip and rejection of an ungranted capability, then injects Space with the QEMU monitor and checks screenshots for the tile's color change.
+Each test builds a BIOS image in a fresh temporary directory. The kernel-only test checks breakpoint recovery, thread scheduling, and blocking IPC. The ring-3 test packages `rootsrv` in a ustar boot archive, checks its IPC round trip and rejection of an ungranted capability, then injects Space with the QEMU monitor and checks screenshots for the tile's color change.
 
 GitHub Actions runs both commands on pushes to `main` and on pull requests.
 

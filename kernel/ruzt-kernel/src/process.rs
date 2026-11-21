@@ -1,6 +1,7 @@
 //! Construction of the trusted boot-time user process.
 
 mod framebuffer;
+mod initrd;
 
 use ruzt_hal::boot::Framebuffer;
 use ruzt_hal::mem::{MapError, PageFlags, PhysFrame, VirtAddr};
@@ -41,11 +42,16 @@ pub(crate) struct UserProcess {
     pub(crate) bootstrap: crate::ipc::bootstrap::Bootstrap,
 }
 
-/// Map the bootloader-provided ELF and enqueue it on the boot CPU.
+/// Load the initial server and enqueue it on the boot CPU.
 ///
 /// Any failure stops boot. These frames belong to the initial process for
 /// the lifetime of the system.
-pub(crate) fn enqueue_initial(image: &'static [u8], framebuffer: Option<Framebuffer>) {
+pub(crate) fn enqueue_initial(archive: &'static [u8], framebuffer: Option<Framebuffer>) {
+    let image = if archive.starts_with(b"\x7fELF") {
+        archive
+    } else {
+        initrd::file(archive, b"rootsrv").expect("Unable to load rootsrv from the boot archive")
+    };
     let elf = crate::elf::load_elf(image).expect("Invalid rootsrv ELF");
     assert_eq!(elf.stack_size as u64, STACK_REGION.page_count * PAGE_SIZE);
     let (root, framebuffer) = mapper::with_mapper(|mapper| {
