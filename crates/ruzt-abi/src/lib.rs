@@ -29,6 +29,9 @@ pub const ROOTSRV_FRAMEBUFFER: u64 = 3;
 /// Capability slot granted to the initial process to receive console replies.
 pub const ROOTSRV_CONSOLE_REPLY: u64 = 4;
 
+/// Notification that the console signals after receiving an initial write.
+pub const ROOTSRV_CONSOLE_NOTIFICATION: u64 = 8;
+
 /// Boot console service protocol and capability slots.
 pub mod console {
     /// Receive requests from the initial process.
@@ -39,6 +42,8 @@ pub mod console {
     pub const UART_DATA: u64 = 2;
     /// Read the UART line status register.
     pub const UART_STATUS: u64 = 3;
+    /// Empty slot where the console accepts its boot notification.
+    pub const RECEIVED_NOTIFICATION: u64 = 4;
 
     /// Write the inline payload to the console.
     pub const WRITE: u64 = 1;
@@ -46,6 +51,10 @@ pub mod console {
     pub const WRITTEN: u64 = 2;
     /// The console did not recognize the request.
     pub const UNKNOWN_REQUEST: u64 = 3;
+    /// Check whether the transferred notification was revoked.
+    pub const CHECK_REVOCATION: u64 = 4;
+    /// The transferred notification is no longer valid.
+    pub const REVOKED: u64 = 5;
 }
 
 /// System-call numbers.
@@ -88,7 +97,8 @@ impl From<u64> for SyscallNumber {
 pub enum CapOp {
     /// Send an IPC message through an endpoint.
     Send = 0,
-    /// Receive an IPC message through an endpoint.
+    /// Receive an IPC message through an endpoint. For capability transfer,
+    /// `arg3` is the first receiving slot and `arg4` is the slot capacity.
     Recv = 1,
     /// Signal a notification object.
     Signal = 2,
@@ -204,13 +214,16 @@ impl CapRights {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct CapTransferSlot {
-    /// Capability pointer (index into sender's CSpace).
+    /// Source slot on send or installed slot on receive.
     pub cptr: u64,
     /// Rights to transfer.
     pub rights: CapRights,
     /// Optional badge to mint onto the copy.
     pub badge: u64,
 }
+
+/// Maximum number of capabilities transferred with one message.
+pub const IPC_CAP_SLOTS: usize = 4;
 
 /// The fixed-size message format exchanged via IPC.
 ///
@@ -230,7 +243,7 @@ pub struct IpcMessage {
     /// Inline payload.
     pub data: [u8; 56],
     /// Capability slots transferred with the message.
-    pub caps: [CapTransferSlot; 4],
+    pub caps: [CapTransferSlot; IPC_CAP_SLOTS],
 }
 
 impl Default for IpcMessage {
@@ -245,7 +258,7 @@ impl Default for IpcMessage {
                 cptr: 0,
                 rights: CapRights::empty(),
                 badge: 0,
-            }; 4],
+            }; IPC_CAP_SLOTS],
         }
     }
 }

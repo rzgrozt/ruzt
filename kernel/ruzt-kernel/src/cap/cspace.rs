@@ -1,7 +1,7 @@
 //! Per-process slots and the kernel-wide capability derivation tree.
 
 use alloc::{collections::BTreeMap, vec, vec::Vec};
-use ruzt_abi::ErrorCode;
+use ruzt_abi::{ErrorCode, IPC_CAP_SLOTS};
 use ruzt_cap::{CapRights, CapSlot, CapType, NULL_SLOT};
 use spin::Mutex;
 
@@ -10,6 +10,17 @@ use super::object::{self, KObjectId};
 /// A capability identity that survives moves between slots.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct CapabilityId(u64);
+
+#[derive(Clone, Copy)]
+pub(crate) struct CapGrant {
+    source: CapabilityId,
+    rights: CapRights,
+    badge: u64,
+}
+
+pub(crate) fn is_live(id: CapabilityId) -> bool {
+    DERIVATIONS.lock().nodes.contains_key(&id)
+}
 
 #[derive(Clone, Copy)]
 struct Node {
@@ -56,12 +67,11 @@ impl DerivationTree {
         rights: CapRights,
         badge: u64,
     ) -> Result<CapabilityId, ErrorCode> {
-        let &parent = self.nodes.get(&source).ok_or(ErrorCode::InvalidCap)?;
-        let can_grant = parent.slot.rights.contains(CapRights::GRANT.union(rights));
-        let can_badge = parent.slot.badge == 0 || parent.slot.badge == badge;
-        if !can_grant || !can_badge {
-            return Err(ErrorCode::CapRightsViolation);
-        }
+        let parent = self.validate_grant(CapGrant {
+            source,
+            rights,
+            badge,
+        })?;
         self.install(Node {
             slot: CapSlot {
                 rights,
@@ -71,6 +81,18 @@ impl DerivationTree {
             object: parent.object,
             parent: Some(source),
         })
+    }
+
+    fn validate_grant(&self, grant: CapGrant) -> Result<Node, ErrorCode> {
+        let &parent = self.nodes.get(&grant.source).ok_or(ErrorCode::InvalidCap)?;
+        let rights = grant.rights;
+        let badge = grant.badge;
+        let can_grant = parent.slot.rights.contains(CapRights::GRANT.union(rights));
+        let can_badge = parent.slot.badge == 0 || parent.slot.badge == badge;
+        if !can_grant || !can_badge {
+            return Err(ErrorCode::CapRightsViolation);
+        }
+        Ok(parent)
     }
 
     fn revoke(&mut self, source: CapabilityId) {
@@ -134,7 +156,7 @@ impl CSpace {
 
     pub(crate) fn capability_id(&self, cptr: u64) -> Result<CapabilityId, ErrorCode> {
         let id = self.slots[self.index(cptr)?].ok_or(ErrorCode::InvalidCap)?;
-        if DERIVATIONS.lock().nodes.contains_key(&id) {
+        if is_live(id) {
             Ok(id)
         } else {
             Err(ErrorCode::InvalidCap)
@@ -225,6 +247,68 @@ impl CSpace {
     pub(crate) fn revoke(&mut self, source: u64) -> Result<(), ErrorCode> {
         let id = self.capability_id(source)?;
         DERIVATIONS.lock().revoke(id);
+        Ok(())
+    }
+
+    pub(crate) fn revoke_all_descendants(&mut self) {
+        let mut tree = DERIVATIONS.lock();
+        for id in self.slots.iter().flatten() {
+            tree.revoke(*id);
+        }
+    }
+
+    pub(crate) fn prepare_grant(
+        &self,
+        source: u64,
+        rights: CapRights,
+        badge: u64,
+    ) -> Result<CapGrant, ErrorCode> {
+        let grant = CapGrant {
+            source: self.capability_id(source)?,
+            rights,
+            badge,
+        };
+        DERIVATIONS.lock().validate_grant(grant)?;
+        Ok(grant)
+    }
+
+    pub(crate) fn accept_grants(
+        &mut self,
+        first: u64,
+        grants: &[Option<CapGrant>],
+    ) -> Result<(), ErrorCode> {
+        if grants.is_empty() {
+            return Ok(());
+        }
+        if grants.len() > IPC_CAP_SLOTS {
+            return Err(ErrorCode::BadMessage);
+        }
+        let first = self.index(first)?;
+        let end = first
+            .checked_add(grants.len())
+            .filter(|&end| end <= self.slots.len())
+            .ok_or(ErrorCode::InvalidCap)?;
+        let mut tree = DERIVATIONS.lock();
+        for index in first..end {
+            self.vacant(index, &tree)?;
+        }
+
+        let mut installed = [None; IPC_CAP_SLOTS];
+        for (slot, grant) in installed.iter_mut().zip(grants) {
+            let result = grant
+                .ok_or(ErrorCode::BadMessage)
+                .and_then(|grant| tree.derive(grant.source, grant.rights, grant.badge));
+            match result {
+                Ok(id) => *slot = Some(id),
+                Err(error) => {
+                    for id in installed.iter().flatten() {
+                        tree.remove(*id);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        self.slots[first..end].copy_from_slice(&installed[..grants.len()]);
         Ok(())
     }
 
@@ -353,5 +437,35 @@ mod tests {
         );
         space.derive(child, 2, CapRights::READ, 42).unwrap();
         assert_eq!(space.lookup(2).unwrap().badge, 42);
+    }
+
+    #[test]
+    fn batch_receive_rolls_back_if_a_queued_grant_is_revoked() {
+        let _state = crate::isolated_kernel_state();
+        let mut sender = CSpace::new(2);
+        let mut receiver = CSpace::new(2);
+        let first = endpoint(&mut sender, 0);
+        endpoint(&mut sender, 1);
+        sender
+            .derive(
+                sender.capability_id(1).unwrap(),
+                2,
+                CapRights::READ.union(CapRights::GRANT),
+                0,
+            )
+            .unwrap();
+        let grants = [
+            Some(sender.prepare_grant(0, CapRights::READ, 0).unwrap()),
+            Some(sender.prepare_grant(2, CapRights::READ, 0).unwrap()),
+        ];
+        sender.revoke(1).unwrap();
+        assert_eq!(
+            receiver.accept_grants(0, &grants),
+            Err(ErrorCode::InvalidCap)
+        );
+        assert_eq!(receiver.lookup(0), Err(ErrorCode::InvalidCap));
+        assert_eq!(receiver.lookup(1), Err(ErrorCode::InvalidCap));
+        sender.delete(0).unwrap();
+        assert_eq!(object::get(first), None);
     }
 }

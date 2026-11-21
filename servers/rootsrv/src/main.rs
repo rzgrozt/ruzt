@@ -4,8 +4,9 @@
 mod tile;
 
 use ruzt_abi::{
-    console, CapRights, ErrorCode, IpcMessage, ROOTSRV_CONSOLE_REPLY, ROOTSRV_CONSOLE_REQUEST,
-    ROOTSRV_FRAMEBUFFER, ROOTSRV_KEYBOARD_DATA, ROOTSRV_KEYBOARD_IRQ,
+    console, CapRights, CapTransferSlot, ErrorCode, IpcMessage, ROOTSRV_CONSOLE_NOTIFICATION,
+    ROOTSRV_CONSOLE_REPLY, ROOTSRV_CONSOLE_REQUEST, ROOTSRV_FRAMEBUFFER, ROOTSRV_KEYBOARD_DATA,
+    ROOTSRV_KEYBOARD_IRQ,
 };
 use ruzt_runtime::{debug_putchar, runtime_init};
 
@@ -26,6 +27,12 @@ fn greet_via_console() -> Result<(), ErrorCode> {
     let mut request = IpcMessage::default();
     request.label = console::WRITE;
     request.length = payload.len() as u16;
+    request.cap_count = 1;
+    request.caps[0] = CapTransferSlot {
+        cptr: ROOTSRV_CONSOLE_NOTIFICATION,
+        rights: CapRights::WRITE,
+        badge: 0,
+    };
     request.data[..payload.len()].copy_from_slice(payload);
 
     let mut reply = IpcMessage::default();
@@ -50,8 +57,19 @@ fn greet_via_console() -> Result<(), ErrorCode> {
     ruzt_ipc::recv(ROOTSRV_CONSOLE_REPLY, &mut reply)?;
     assert_eq!(reply.label, console::WRITTEN);
     assert_eq!(reply.length, 0);
+    ruzt_ipc::wait(ROOTSRV_CONSOLE_NOTIFICATION)?;
     write_line("rootsrv: console write acknowledged over IPC");
     write_line("rootsrv: console endpoint rights verified");
+
+    ruzt_ipc::revoke(ROOTSRV_CONSOLE_NOTIFICATION)?;
+    let request = IpcMessage {
+        label: console::CHECK_REVOCATION,
+        ..IpcMessage::default()
+    };
+    ruzt_ipc::send(ROOTSRV_CONSOLE_REQUEST, &request)?;
+    ruzt_ipc::recv(ROOTSRV_CONSOLE_REPLY, &mut reply)?;
+    assert_eq!(reply.label, console::REVOKED);
+    write_line("rootsrv: notification transferred and revoked across capability spaces");
     Ok(())
 }
 

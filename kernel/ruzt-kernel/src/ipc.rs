@@ -1,11 +1,52 @@
 //! Blocking endpoint rendezvous and one-bit notifications.
 
-use ruzt_abi::{ErrorCode, IpcMessage, SyscallArgs};
+use ruzt_abi::{ErrorCode, IpcMessage, SyscallArgs, IPC_CAP_SLOTS};
 use ruzt_cap::{EndpointId, NotificationId};
 
+use crate::cap::cspace::{CSpace, CapGrant, CapabilityId};
 use crate::cap::object::{self, KObjectId, KernelObject};
 use crate::sched::{self, ThreadState};
 use crate::syscall::user_mem;
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ReceiveSlots {
+    pub first: u64,
+    pub capacity: usize,
+}
+
+pub(crate) struct Packet {
+    pub message: IpcMessage,
+    pub grants: [Option<CapGrant>; IPC_CAP_SLOTS],
+}
+
+impl Packet {
+    pub(crate) fn inline(message: IpcMessage) -> Self {
+        Self {
+            message,
+            grants: [None; IPC_CAP_SLOTS],
+        }
+    }
+
+    pub(crate) fn deliver(
+        mut self,
+        slots: ReceiveSlots,
+        space: Option<&mut CSpace>,
+    ) -> Result<IpcMessage, ErrorCode> {
+        let count = usize::from(self.message.cap_count);
+        if count == 0 {
+            return Ok(self.message);
+        }
+        if count > slots.capacity || count > IPC_CAP_SLOTS {
+            return Err(ErrorCode::BadMessage);
+        }
+        let space = space.ok_or(ErrorCode::InvalidCap)?;
+        space.accept_grants(slots.first, &self.grants[..count])?;
+        for (index, cap) in self.message.caps[..count].iter_mut().enumerate() {
+            cap.cptr = slots.first + index as u64;
+        }
+        Ok(self.message)
+    }
+}
 
 fn check_endpoint(endpoint: EndpointId) -> Result<KObjectId, ErrorCode> {
     let id = KObjectId(endpoint.0);
@@ -16,31 +57,59 @@ fn check_endpoint(endpoint: EndpointId) -> Result<KObjectId, ErrorCode> {
     }
 }
 
-pub(crate) fn send_message(endpoint: EndpointId, message: IpcMessage) -> Result<(), ErrorCode> {
-    let id = check_endpoint(endpoint)?;
-    // The IPC interrupt gate keeps this lookup and the subsequent scheduler
-    // transition atomic on the boot CPU.
-    if let Some(receiver) = sched::first_waiter(ThreadState::BlockedRecv(id)) {
-        sched::set_thread_message(receiver, message);
-        sched::unblock(receiver);
-    } else {
-        sched::set_thread_message(sched::current_thread_id(), message);
-        sched::block_current(ThreadState::BlockedSend(id));
-        sched::check_ipc_completion()?;
-    }
-    Ok(())
+fn send_message(endpoint: EndpointId, message: IpcMessage) -> Result<(), ErrorCode> {
+    send_packet(endpoint, None, Packet::inline(message))
 }
 
-pub(crate) fn receive_message(endpoint: EndpointId) -> Result<IpcMessage, ErrorCode> {
+pub(crate) fn send_packet(
+    endpoint: EndpointId,
+    authority: Option<CapabilityId>,
+    packet: Packet,
+) -> Result<(), ErrorCode> {
+    let id = check_endpoint(endpoint)?;
+    // The IPC gate keeps validation and delivery atomic on the boot CPU.
+    if let Some(receiver) = sched::first_waiter(ThreadState::BlockedRecv(id)) {
+        sched::deliver_to_waiter(receiver, packet)
+    } else {
+        sched::set_thread_message(sched::current_thread_id(), packet);
+        sched::block_with_authority(
+            ThreadState::BlockedSend(id),
+            authority,
+            ReceiveSlots::default(),
+        );
+        sched::check_ipc_completion()
+    }
+}
+
+fn receive_message(endpoint: EndpointId) -> Result<IpcMessage, ErrorCode> {
+    receive_packet(endpoint, None, ReceiveSlots::default())
+}
+
+pub(crate) fn receive_packet(
+    endpoint: EndpointId,
+    authority: Option<CapabilityId>,
+    slots: ReceiveSlots,
+) -> Result<IpcMessage, ErrorCode> {
     let id = check_endpoint(endpoint)?;
     if let Some(sender) = sched::first_waiter(ThreadState::BlockedSend(id)) {
-        let message = sched::take_thread_message(sender).ok_or(ErrorCode::BadMessage)?;
-        sched::unblock(sender);
-        Ok(message)
+        let result = sched::take_thread_message(sender)
+            .ok_or(ErrorCode::BadMessage)
+            .and_then(|packet| {
+                if packet.message.cap_count == 0 {
+                    Ok(packet.message)
+                } else {
+                    sched::with_current_user(|user| packet.deliver(slots, Some(&mut user.cspace)))
+                        .ok_or(ErrorCode::InvalidCap)?
+                }
+            });
+        sched::complete_ipc(sender, result.as_ref().err().copied());
+        result
     } else {
-        sched::block_current(ThreadState::BlockedRecv(id));
+        sched::block_with_authority(ThreadState::BlockedRecv(id), authority, slots);
         sched::check_ipc_completion()?;
-        sched::take_current_message().ok_or(ErrorCode::BadMessage)
+        sched::take_current_message()
+            .map(|packet| packet.message)
+            .ok_or(ErrorCode::BadMessage)
     }
 }
 
@@ -87,17 +156,30 @@ pub fn notification_signal(notification: NotificationId) -> u64 {
 
 /// Consume a pending notification or block until another thread signals it.
 pub fn notification_wait(notification: NotificationId) -> u64 {
+    wait_notification(notification, None)
+        .map_or_else(ErrorCode::as_u64, |()| ErrorCode::Ok.as_u64())
+}
+
+pub(crate) fn wait_notification(
+    notification: NotificationId,
+    authority: Option<CapabilityId>,
+) -> Result<(), ErrorCode> {
     let id = KObjectId(notification.0);
     match object::get(id) {
         Some(KernelObject::Notification { state: true }) => {
-            object::set_notification_state(id, false)
+            object::set_notification_state(id, false);
+            Ok(())
         }
         Some(KernelObject::Notification { state: false }) => {
-            sched::block_current(ThreadState::BlockedWait(id));
+            sched::block_with_authority(
+                ThreadState::BlockedWait(id),
+                authority,
+                ReceiveSlots::default(),
+            );
+            sched::check_ipc_completion()
         }
-        _ => return ErrorCode::InvalidCap.as_u64(),
+        _ => Err(ErrorCode::InvalidCap),
     }
-    ErrorCode::Ok.as_u64()
 }
 
 #[cfg(test)]

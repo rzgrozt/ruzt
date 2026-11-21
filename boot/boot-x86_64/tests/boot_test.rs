@@ -68,6 +68,7 @@ fn test_rootsrv_updates_the_framebuffer_from_keyboard_input() {
             "Hello from ring 3, rootsrv alive.",
             "rootsrv: console write acknowledged over IPC",
             "rootsrv: console endpoint rights verified",
+            "rootsrv: notification transferred and revoked across capability spaces",
             "rootsrv: framebuffer tile drawn",
             "rootsrv: press Space to test keyboard input",
             "rootsrv thread waiting for keyboard IRQ",

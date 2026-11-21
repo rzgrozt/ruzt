@@ -92,8 +92,12 @@ pub(crate) fn enqueue_initial(archive: &'static [u8], framebuffer: Option<Frameb
 }
 
 pub(crate) fn terminate_current(reason: core::fmt::Arguments<'_>) -> ! {
-    let (name, channels) = crate::sched::with_current_user(|user| (user.name, user.boot_channels))
-        .expect("termination requires a user task");
+    let (name, channels) = crate::sched::with_current_user(|user| {
+        user.cspace.revoke_all_descendants();
+        (user.name, user.boot_channels)
+    })
+    .expect("termination requires a user task");
+    crate::sched::cancel_revoked_waiters();
     crate::serial_println!("user process {name} terminated: {reason}");
     for channel in channels {
         crate::ipc::close_boot_channel(channel);

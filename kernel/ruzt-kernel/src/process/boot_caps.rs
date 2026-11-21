@@ -1,10 +1,10 @@
 //! Capabilities granted by the boot policy.
 
 use ruzt_abi::{
-    console, CapRights, ROOTSRV_CONSOLE_REPLY, ROOTSRV_CONSOLE_REQUEST, ROOTSRV_KEYBOARD_DATA,
-    ROOTSRV_KEYBOARD_IRQ,
+    console, CapRights, ROOTSRV_CONSOLE_NOTIFICATION, ROOTSRV_CONSOLE_REPLY,
+    ROOTSRV_CONSOLE_REQUEST, ROOTSRV_KEYBOARD_DATA, ROOTSRV_KEYBOARD_IRQ,
 };
-use ruzt_cap::{CapSlot, CapType, EndpointId};
+use ruzt_cap::{CapSlot, CapType, EndpointId, NotificationId};
 
 use crate::cap::{cspace::CSpace, object};
 use crate::{keyboard, serial};
@@ -15,7 +15,7 @@ pub(super) fn initial_services() -> ([EndpointId; 2], CSpace, CSpace) {
     let channels = [request, reply];
     let request = CapType::Endpoint(request);
     let reply = CapType::Endpoint(reply);
-    let mut rootsrv = CSpace::new(3);
+    let mut rootsrv = CSpace::new(4);
     grant(
         &mut rootsrv,
         ROOTSRV_CONSOLE_REQUEST,
@@ -40,7 +40,18 @@ pub(super) fn initial_services() -> ([EndpointId; 2], CSpace, CSpace) {
         CapRights::READ,
     );
 
-    let mut consoled = CSpace::new(2);
+    let notification = object::allocate(CapType::Notification(NotificationId(0)))
+        .expect("allocate boot notification");
+    grant(
+        &mut rootsrv,
+        ROOTSRV_CONSOLE_NOTIFICATION,
+        CapType::Notification(NotificationId(notification.0)),
+        CapRights::READ
+            .union(CapRights::WRITE)
+            .union(CapRights::GRANT),
+    );
+
+    let mut consoled = CSpace::new(3);
     grant(&mut consoled, console::REQUEST, request, CapRights::READ);
     grant(&mut consoled, console::REPLY, reply, CapRights::WRITE);
     grant(

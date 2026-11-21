@@ -1,6 +1,8 @@
 //! Round-robin scheduler.
 
+use crate::cap::cspace::{self, CapabilityId};
 use crate::cap::object::KObjectId;
+use crate::ipc::{Packet, ReceiveSlots};
 use crate::process::UserProcess;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
@@ -40,7 +42,9 @@ struct Thread {
     /// Current scheduling state.
     state: ThreadState,
     /// IPC message buffer for rendezvous delivery.
-    message: Option<ruzt_abi::IpcMessage>,
+    message: Option<Packet>,
+    receive_slots: ReceiveSlots,
+    wait_capability: Option<CapabilityId>,
     /// A failure delivered instead of a message when an endpoint closes.
     ipc_error: Option<ErrorCode>,
     /// Address space and capabilities of a user-mode thread.
@@ -72,7 +76,22 @@ impl Scheduler {
         ) {
             self.wait_queue.retain(|&thread| thread != id);
             self.threads[id].state = ThreadState::Runnable;
+            self.threads[id].wait_capability = None;
+            self.threads[id].receive_slots = ReceiveSlots::default();
             self.run_queue.push_back(id);
+        }
+    }
+    fn fail_waiters(&mut self, error: ErrorCode, matches: impl Fn(&Thread) -> bool) {
+        loop {
+            let waiter = self
+                .wait_queue
+                .iter()
+                .copied()
+                .find(|&id| matches(&self.threads[id]));
+            let Some(id) = waiter else { break };
+            self.threads[id].ipc_error = Some(error);
+            self.threads[id].message = None;
+            self.mark_runnable(id);
         }
     }
 }
@@ -114,6 +133,8 @@ pub fn init() {
         fp: FpState::default(),
         state: ThreadState::Runnable,
         message: None,
+        receive_slots: ReceiveSlots::default(),
+        wait_capability: None,
         ipc_error: None,
         user: None,
     }));
@@ -124,6 +145,14 @@ pub fn init() {
 ///
 /// Must be called with interrupts disabled.
 pub fn block_current(reason: ThreadState) {
+    block_with_authority(reason, None, ReceiveSlots::default());
+}
+
+pub(crate) fn block_with_authority(
+    reason: ThreadState,
+    capability: Option<CapabilityId>,
+    slots: ReceiveSlots,
+) {
     #[cfg(feature = "qemu-smoke-test")]
     crate::serial_println!(
         "block_current: thread={} reason={:?}",
@@ -136,6 +165,8 @@ pub fn block_current(reason: ThreadState) {
 
     // Remove current from run queue.
     assert_ne!(current_id, 0, "the idle thread cannot block");
+    sched.threads[current_id].wait_capability = capability;
+    sched.threads[current_id].receive_slots = slots;
     sched.mark_blocked(current_id, reason);
 
     // Switch to next runnable thread.
@@ -163,19 +194,52 @@ pub(crate) fn first_waiter(reason: ThreadState) -> Option<ThreadId> {
 pub(crate) fn cancel_endpoint_waiters(endpoint: KObjectId) {
     let mut guard = SCHEDULER.lock();
     let sched = guard.as_mut().expect("scheduler not initialised");
-    loop {
-        let waiter = sched.wait_queue.iter().copied().find(|&id| {
-            matches!(
-                sched.threads[id].state,
-                ThreadState::BlockedSend(object) | ThreadState::BlockedRecv(object)
-                    if object == endpoint
-            )
-        });
-        let Some(id) = waiter else { break };
-        sched.threads[id].ipc_error = Some(ErrorCode::NotFound);
-        sched.threads[id].message = None;
-        sched.mark_runnable(id);
-    }
+    sched.fail_waiters(ErrorCode::NotFound, |thread| {
+        matches!(
+            thread.state,
+            ThreadState::BlockedSend(object) | ThreadState::BlockedRecv(object)
+                if object == endpoint
+        )
+    });
+}
+
+pub(crate) fn cancel_revoked_waiters() {
+    let mut guard = SCHEDULER.lock();
+    let Some(sched) = guard.as_mut() else { return };
+    sched.fail_waiters(ErrorCode::InvalidCap, |thread| {
+        thread
+            .wait_capability
+            .is_some_and(|id| !cspace::is_live(id))
+    });
+}
+
+pub(crate) fn complete_ipc(id: ThreadId, error: Option<ErrorCode>) {
+    let mut guard = SCHEDULER.lock();
+    let sched = guard.as_mut().expect("scheduler not initialised");
+    sched.threads[id].ipc_error = error;
+    sched.mark_runnable(id);
+}
+
+pub(crate) fn deliver_to_waiter(id: ThreadId, packet: Packet) -> Result<(), ErrorCode> {
+    let mut guard = SCHEDULER.lock();
+    let sched = guard.as_mut().expect("scheduler not initialised");
+    let receiver = &mut sched.threads[id];
+    let result = packet.deliver(
+        receiver.receive_slots,
+        receiver.user.as_mut().map(|p| &mut p.cspace),
+    );
+    let status = match result {
+        Ok(message) => {
+            receiver.message = Some(Packet::inline(message));
+            Ok(())
+        }
+        Err(error) => {
+            receiver.ipc_error = Some(error);
+            Err(error)
+        }
+    };
+    sched.mark_runnable(id);
+    status
 }
 
 pub(crate) fn check_ipc_completion() -> Result<(), ErrorCode> {
@@ -253,7 +317,7 @@ pub fn current_thread_id() -> ThreadId {
 }
 
 /// Return a copy of the current thread's message buffer, clearing it.
-pub fn take_current_message() -> Option<ruzt_abi::IpcMessage> {
+pub(crate) fn take_current_message() -> Option<Packet> {
     let mut guard = SCHEDULER.lock();
     let sched = guard.as_mut().expect("scheduler not initialised");
     let current_id = sched.current;
@@ -261,14 +325,14 @@ pub fn take_current_message() -> Option<ruzt_abi::IpcMessage> {
 }
 
 /// Store a message into the given thread's buffer.
-pub fn set_thread_message(thread_id: ThreadId, msg: ruzt_abi::IpcMessage) {
+pub(crate) fn set_thread_message(thread_id: ThreadId, msg: Packet) {
     let mut guard = SCHEDULER.lock();
     let sched = guard.as_mut().expect("scheduler not initialised");
     sched.threads[thread_id].message = Some(msg);
 }
 
 /// Take a message from the given thread's buffer, clearing it.
-pub fn take_thread_message(thread_id: ThreadId) -> Option<ruzt_abi::IpcMessage> {
+pub(crate) fn take_thread_message(thread_id: ThreadId) -> Option<Packet> {
     let mut guard = SCHEDULER.lock();
     let sched = guard.as_mut().expect("scheduler not initialised");
     sched.threads[thread_id].message.take()
@@ -302,6 +366,8 @@ fn spawn_thread(f: fn() -> !, user: Option<UserProcess>) -> ThreadId {
         fp: FpState::default(),
         state: ThreadState::Runnable,
         message: None,
+        receive_slots: ReceiveSlots::default(),
+        wait_capability: None,
         ipc_error: None,
         user,
     }));
@@ -403,6 +469,54 @@ mod tests {
     }
 
     #[test]
+    fn revocation_wakes_only_waiters_that_lost_their_authority() {
+        use crate::cap::{cspace::CSpace, object};
+        use ruzt_cap::{CapRights, CapSlot, CapType, NotificationId};
+
+        let _state = crate::isolated_kernel_state();
+        let id = object::allocate(CapType::Notification(NotificationId(0))).unwrap();
+        let mut caps = CSpace::new(2);
+        caps.insert(
+            0,
+            CapSlot {
+                cap_type: CapType::Notification(NotificationId(id.0)),
+                rights: CapRights::new(),
+                badge: 0,
+            },
+        )
+        .unwrap();
+        let surviving_cap = caps.capability_id(0).unwrap();
+        caps.derive(surviving_cap, 1, CapRights::READ, 0).unwrap();
+        let revoked_cap = caps.capability_id(1).unwrap();
+        fn entry() -> ! {
+            panic!("host tests do not switch stacks")
+        }
+        let survivor = spawn(entry);
+        let revoked = spawn(entry);
+        {
+            let mut guard = SCHEDULER.lock();
+            let scheduler = guard.as_mut().unwrap();
+            scheduler.threads[survivor].wait_capability = Some(surviving_cap);
+            scheduler.threads[revoked].wait_capability = Some(revoked_cap);
+            scheduler.mark_blocked(survivor, ThreadState::BlockedWait(id));
+            scheduler.mark_blocked(revoked, ThreadState::BlockedWait(id));
+        }
+        caps.revoke(0).unwrap();
+        cancel_revoked_waiters();
+        let guard = SCHEDULER.lock();
+        let scheduler = guard.as_ref().unwrap();
+        assert_eq!(
+            scheduler.threads[survivor].state,
+            ThreadState::BlockedWait(id)
+        );
+        assert_eq!(scheduler.threads[revoked].state, ThreadState::Runnable);
+        assert_eq!(
+            scheduler.threads[revoked].ipc_error,
+            Some(ErrorCode::InvalidCap)
+        );
+    }
+
+    #[test]
     fn thread_message_buffer() {
         let _state = crate::isolated_kernel_state();
         let id = current_thread_id();
@@ -424,11 +538,11 @@ mod tests {
             }; 4],
         };
 
-        set_thread_message(id, msg);
+        set_thread_message(id, Packet::inline(msg));
 
         let taken = take_thread_message(id);
         assert!(taken.is_some());
-        let taken = taken.unwrap();
+        let taken = taken.unwrap().message;
         assert_eq!(taken.label, 99);
         assert_eq!(&taken.data[..3], b"abc");
 

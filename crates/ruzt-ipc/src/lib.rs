@@ -25,6 +25,16 @@ pub fn send(endpoint_cptr: u64, message: &IpcMessage) -> Result<(), ErrorCode> {
 }
 
 pub fn recv(endpoint_cptr: u64, message: &mut IpcMessage) -> Result<(), ErrorCode> {
+    recv_with_caps(endpoint_cptr, message, 0, 0)
+}
+
+/// Receive a message and accept up to `capacity` caps in slots starting at `first`.
+pub fn recv_with_caps(
+    endpoint_cptr: u64,
+    message: &mut IpcMessage,
+    first: u64,
+    capacity: u8,
+) -> Result<(), ErrorCode> {
     let return_value = {
         #[allow(unsafe_code)]
         // SAFETY: [Categories 1 and 13 - aliasing and library contract] The
@@ -36,14 +46,24 @@ pub fn recv(endpoint_cptr: u64, message: &mut IpcMessage) -> Result<(), ErrorCod
                 endpoint_cptr,
                 CapOp::Recv as u64,
                 message as *mut IpcMessage as u64,
-                0,
-                0,
+                first,
+                u64::from(capacity),
                 0,
             )
         }
     };
 
     ErrorCode::from_u64(return_value)
+}
+
+/// Set a notification or wake one of its waiters.
+pub fn signal(notification: u64) -> Result<(), ErrorCode> {
+    control(notification, CapOp::Signal, 0, 0, 0)
+}
+
+/// Block until the notification has been signalled.
+pub fn wait(notification: u64) -> Result<(), ErrorCode> {
+    control(notification, CapOp::Wait, 0, 0, 0)
 }
 
 /// Derive a capability in an empty slot of the caller's capability space.

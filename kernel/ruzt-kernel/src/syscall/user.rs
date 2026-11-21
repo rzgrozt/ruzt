@@ -1,7 +1,10 @@
 //! Capability invocations from scheduled user threads.
 
 use core::mem::{offset_of, size_of};
-use ruzt_abi::{CapOp, CapRights, ErrorCode, FramebufferInfo, IpcMessage, SyscallArgs};
+use ruzt_abi::{
+    CapOp, CapRights, CapTransferSlot, ErrorCode, FramebufferInfo, IpcMessage, SyscallArgs,
+    IPC_CAP_SLOTS,
+};
 use ruzt_cap::CapType;
 use ruzt_hal::mem::PhysFrame;
 use x86_64::instructions::port::{PortReadOnly, PortWriteOnly};
@@ -13,6 +16,11 @@ use crate::{ipc, keyboard, sched};
 const DATA_OFFSET: usize = offset_of!(IpcMessage, data);
 const LABEL_OFFSET: usize = offset_of!(IpcMessage, label);
 const LENGTH_OFFSET: usize = offset_of!(IpcMessage, length);
+const COUNT_OFFSET: usize = offset_of!(IpcMessage, cap_count);
+const CAPS_OFFSET: usize = offset_of!(IpcMessage, caps);
+const CPTR_OFFSET: usize = offset_of!(CapTransferSlot, cptr);
+const RIGHTS_OFFSET: usize = offset_of!(CapTransferSlot, rights);
+const BADGE_OFFSET: usize = offset_of!(CapTransferSlot, badge);
 
 pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
     let operation = args.arg1;
@@ -21,7 +29,7 @@ pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
         || operation == CapOp::Delete as u64
         || operation == CapOp::Revoke as u64
     {
-        return sched::with_current_user(|process| {
+        let result = sched::with_current_user(|process| {
             let space = &mut process.cspace;
             match operation {
                 op if op == CapOp::Mint as u64 => {
@@ -34,10 +42,22 @@ pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
             }
         })
         .ok_or(ErrorCode::InvalidCap)?;
+        if result.is_ok()
+            && (operation == CapOp::Revoke as u64 || operation == CapOp::Delete as u64)
+        {
+            sched::cancel_revoked_waiters();
+        }
+        return result;
     }
-    let (root, capability, framebuffer) = sched::with_current_user(|process| {
+    let (root, capability, authority, framebuffer) = sched::with_current_user(|process| {
         let capability = process.cspace.lookup(args.arg0)?;
-        Ok::<_, ErrorCode>((process.root(), capability, process.framebuffer))
+        let authority = process.cspace.capability_id(args.arg0)?;
+        Ok::<_, ErrorCode>((
+            process.root(),
+            capability,
+            Some(authority),
+            process.framebuffer,
+        ))
     })
     .ok_or(ErrorCode::InvalidCap)??;
     // Capability lookup is complete and the scheduler lock is released before
@@ -45,14 +65,34 @@ pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
     match capability.cap_type {
         CapType::Endpoint(id) if args.arg1 == CapOp::Send as u64 => {
             require(capability.rights, CapRights::WRITE)?;
-            ipc::send_message(id, read_message(root, args.arg2)?)
+            ipc::send_packet(
+                id,
+                authority,
+                read_packet(root, args.arg2, capability.rights)?,
+            )
         }
         CapType::Endpoint(id) if args.arg1 == CapOp::Recv as u64 => {
             require(capability.rights, CapRights::READ)?;
             // Reject bad buffers before consuming a pending sender or blocking.
             user_mem::validate_user_buffer(root, args.arg2, size_of::<IpcMessage>(), true)?;
-            let message = ipc::receive_message(id)?;
+            let capacity = usize::try_from(args.arg4).map_err(|_| ErrorCode::BadMessage)?;
+            if capacity > IPC_CAP_SLOTS {
+                return Err(ErrorCode::BadMessage);
+            }
+            let slots = ipc::ReceiveSlots {
+                first: args.arg3,
+                capacity,
+            };
+            let message = ipc::receive_packet(id, authority, slots)?;
             write_message(root, args.arg2, &message)
+        }
+        CapType::Notification(id) if args.arg1 == CapOp::Signal as u64 => {
+            require(capability.rights, CapRights::WRITE)?;
+            ErrorCode::from_u64(ipc::notification_signal(id))
+        }
+        CapType::Notification(id) if args.arg1 == CapOp::Wait as u64 => {
+            require(capability.rights, CapRights::READ)?;
+            ipc::wait_notification(id, authority)
         }
         CapType::Irq {
             irq_num: keyboard::IRQ,
@@ -102,30 +142,77 @@ fn require(rights: CapRights, required: CapRights) -> Result<(), ErrorCode> {
     }
 }
 
-fn read_message(root: PhysFrame, address: u64) -> Result<IpcMessage, ErrorCode> {
+fn read_packet(
+    root: PhysFrame,
+    address: u64,
+    endpoint_rights: CapRights,
+) -> Result<ipc::Packet, ErrorCode> {
     let mut message = IpcMessage::default();
-    // Read the fixed header and inline data only. The C layout has padding
-    // before the capability slots, which this operation never reads.
+    // Read the fixed header and inline data without copying C-layout padding.
     let mut bytes = [0; DATA_OFFSET + 56];
     user_mem::read_user_buffer(root, address, &mut bytes)?;
     message.label = u64::from_le_bytes(bytes[LABEL_OFFSET..][..8].try_into().unwrap());
     message.length = u16::from_le_bytes(bytes[LENGTH_OFFSET..][..2].try_into().unwrap());
+    message.cap_count = bytes[COUNT_OFFSET];
     let len = usize::from(message.length);
+    let count = usize::from(message.cap_count);
     if len > message.data.len()
-        || bytes[offset_of!(IpcMessage, cap_count)] != 0
+        || count > IPC_CAP_SLOTS
         || bytes[offset_of!(IpcMessage, flags)] != 0
     {
         return Err(ErrorCode::BadMessage);
     }
     message.data[..len].copy_from_slice(&bytes[DATA_OFFSET..][..len]);
-    Ok(message)
+    let mut packet = ipc::Packet::inline(message);
+    if count == 0 {
+        return Ok(packet);
+    }
+    require(endpoint_rights, CapRights::GRANT)?;
+    for index in 0..count {
+        // The header range proved this is a lower-half address. Offsets in
+        // the 168-byte message cannot overflow, and every read checks its pages.
+        let base = address + cap_offset(index) as u64;
+        let cptr = u64::from_le_bytes(read_wire(root, base + CPTR_OFFSET as u64)?);
+        let [rights] = read_wire(root, base + RIGHTS_OFFSET as u64)?;
+        let rights = CapRights::from_bits(u64::from(rights)).ok_or(ErrorCode::BadMessage)?;
+        let badge = u64::from_le_bytes(read_wire(root, base + BADGE_OFFSET as u64)?);
+        let grant = sched::with_current_user(|user| user.cspace.prepare_grant(cptr, rights, badge))
+            .ok_or(ErrorCode::InvalidCap)??;
+        packet.grants[index] = Some(grant);
+        packet.message.caps[index] = CapTransferSlot {
+            cptr,
+            rights,
+            badge,
+        };
+    }
+    Ok(packet)
+}
+
+fn read_wire<const N: usize>(root: PhysFrame, address: u64) -> Result<[u8; N], ErrorCode> {
+    let mut bytes = [0; N];
+    user_mem::read_user_buffer(root, address, &mut bytes)?;
+    Ok(bytes)
+}
+
+fn cap_offset(index: usize) -> usize {
+    CAPS_OFFSET + index * size_of::<CapTransferSlot>()
 }
 
 fn write_message(root: PhysFrame, address: u64, message: &IpcMessage) -> Result<(), ErrorCode> {
     let mut bytes = [0; size_of::<IpcMessage>()];
     bytes[LABEL_OFFSET..][..8].copy_from_slice(&message.label.to_le_bytes());
     bytes[LENGTH_OFFSET..][..2].copy_from_slice(&message.length.to_le_bytes());
+    bytes[COUNT_OFFSET] = message.cap_count;
     let len = usize::from(message.length);
     bytes[DATA_OFFSET..][..len].copy_from_slice(&message.data[..len]);
+    for (index, cap) in message.caps[..usize::from(message.cap_count)]
+        .iter()
+        .enumerate()
+    {
+        let offset = cap_offset(index);
+        bytes[offset + CPTR_OFFSET..][..8].copy_from_slice(&cap.cptr.to_le_bytes());
+        bytes[offset + RIGHTS_OFFSET] = cap.rights.bits();
+        bytes[offset + BADGE_OFFSET..][..8].copy_from_slice(&cap.badge.to_le_bytes());
+    }
     user_mem::write_user_buffer(root, address, &bytes)
 }
