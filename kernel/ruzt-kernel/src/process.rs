@@ -1,5 +1,8 @@
 //! Construction of the trusted boot-time user process.
 
+mod framebuffer;
+
+use ruzt_hal::boot::Framebuffer;
 use ruzt_hal::mem::{MapError, PageFlags, PhysFrame, VirtAddr};
 use ruzt_hal_x86_64::mapper::{self, X86_64Mapper};
 
@@ -36,10 +39,10 @@ fn initial_stack_pointer() -> u64 {
 ///
 /// Any failure stops boot. These frames belong to the initial process for
 /// the lifetime of the system.
-pub(crate) fn launch(image: &'static [u8]) -> ! {
+pub(crate) fn launch(image: &'static [u8], framebuffer: Option<Framebuffer>) -> ! {
     let elf = crate::elf::load_elf(image).expect("Invalid rootsrv ELF");
     assert_eq!(elf.stack_size as u64, STACK_REGION.page_count * PAGE_SIZE);
-    let root = mapper::with_mapper(|mapper| {
+    let (root, framebuffer) = mapper::with_mapper(|mapper| {
         let root = mapper.create_user_address_space()?;
         for segment in &elf.segments {
             if segment.mem_size == 0 {
@@ -73,11 +76,15 @@ pub(crate) fn launch(image: &'static [u8]) -> ! {
                 map_page(mapper, root, page, PageFlags::WRITABLE, 0, &[])?;
             }
         }
-        Ok::<_, MapError>(root)
+        let framebuffer = framebuffer
+            .map(|framebuffer| framebuffer::map(mapper, root, framebuffer))
+            .transpose()?
+            .flatten();
+        Ok::<_, MapError>((root, framebuffer))
     })
     .expect("Failed to map rootsrv address space");
 
-    crate::ipc::bootstrap::init(root);
+    crate::ipc::bootstrap::init(root, framebuffer);
     crate::serial_println!("rootsrv process created, entering user mode...");
     #[allow(unsafe_code)]
     // SAFETY: The private root shares the supervisor mappings containing the

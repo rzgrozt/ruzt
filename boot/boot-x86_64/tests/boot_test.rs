@@ -19,7 +19,7 @@ fn test_kernel_boots() {
 }
 
 #[test]
-fn test_rootsrv_boots_and_reads_keyboard_in_ring_three() {
+fn test_rootsrv_updates_the_framebuffer_from_keyboard_input() {
     let temp = tempfile::tempdir().expect("Failed to create boot test directory");
     let disk_image = build_image(temp.path(), "qemu-rootsrv-test", true);
     let serial_path = temp.path().join("serial.log");
@@ -43,6 +43,8 @@ fn test_rootsrv_boots_and_reads_keyboard_in_ring_three() {
         "rootsrv: press Space to test keyboard input",
         deadline,
     );
+    let initial_image = temp.path().join("before.ppm");
+    assert_tile_color(&mut vm.0, &initial_image, [0x8a, 0xb4, 0xff], deadline);
     monitor(&mut vm.0, "sendkey spc");
     let serial = wait_for_serial(
         &mut vm.0,
@@ -50,6 +52,8 @@ fn test_rootsrv_boots_and_reads_keyboard_in_ring_three() {
         "rootsrv: Space key received",
         deadline,
     );
+    let updated_image = temp.path().join("after.ppm");
+    assert_tile_color(&mut vm.0, &updated_image, [0x7f, 0xe3, 0xc4], deadline);
     monitor(&mut vm.0, "quit");
     assert!(vm.0.wait().expect("Failed to wait for QEMU").success());
     assert_markers(
@@ -60,6 +64,7 @@ fn test_rootsrv_boots_and_reads_keyboard_in_ring_three() {
             "Hello from ring 3, rootsrv alive.",
             "rootsrv: bootstrap IPC request and reply verified",
             "rootsrv: ungranted endpoint rejected on send and receive",
+            "rootsrv: framebuffer tile drawn",
             "rootsrv: press Space to test keyboard input",
             "rootsrv: Space key received",
         ],
@@ -173,6 +178,42 @@ fn wait_for_serial(vm: &mut Child, path: &Path, marker: &str, deadline: Instant)
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn assert_tile_color(vm: &mut Child, path: &Path, color: [u8; 3], deadline: Instant) {
+    let path = path.to_str().expect("UTF-8 screenshot path");
+    monitor(vm, &format!("screendump \"{path}\""));
+    loop {
+        if let Ok(image) = std::fs::read(path) {
+            if let Some((width, pixels)) = ppm_pixels(&image) {
+                let x = width - 28;
+                let y = 28;
+                let offset = 3 * (y * width + x);
+                assert_eq!(&pixels[offset..offset + 3], &color, "Tile pixel in {path}");
+                return;
+            }
+        }
+        assert!(
+            vm.try_wait().expect("Failed to poll QEMU").is_none() && Instant::now() < deadline,
+            "QEMU did not produce a complete screenshot at {path}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn ppm_pixels(image: &[u8]) -> Option<(usize, &[u8])> {
+    let mut parts = image.splitn(4, |&byte| byte == b'\n');
+    if parts.next()? != b"P6" {
+        return None;
+    }
+    let mut dimensions = std::str::from_utf8(parts.next()?).ok()?.split_whitespace();
+    let width = dimensions.next()?.parse::<usize>().ok()?;
+    let height = dimensions.next()?.parse::<usize>().ok()?;
+    if parts.next()? != b"255" || width < 40 || height < 40 {
+        return None;
+    }
+    let pixels = parts.next()?;
+    (pixels.len() == width.checked_mul(height)?.checked_mul(3)?).then_some((width, pixels))
 }
 
 fn assert_markers(serial: &str, markers: &[&str]) {

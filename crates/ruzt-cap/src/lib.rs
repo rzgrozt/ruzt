@@ -98,6 +98,8 @@ pub enum CapType {
         /// Hardware port number.
         port: u16,
     },
+    /// Access to a mapped boot framebuffer.
+    Framebuffer,
 }
 
 /// A capability as it lives in a CNode slot.

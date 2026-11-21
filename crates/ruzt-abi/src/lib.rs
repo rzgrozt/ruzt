@@ -23,6 +23,9 @@ pub const ROOTSRV_KEYBOARD_IRQ: u64 = 1;
 /// Capability slot granted to the initial process for the PS/2 data port.
 pub const ROOTSRV_KEYBOARD_DATA: u64 = 2;
 
+/// Capability slot granted to the initial process when a framebuffer is available.
+pub const ROOTSRV_FRAMEBUFFER: u64 = 3;
+
 /// System-call numbers.
 ///
 /// These values are loaded into `rax` (x86_64) or `x8` (AArch64)
@@ -76,7 +79,40 @@ pub enum CapOp {
     Move = 7,
     /// Read one byte from a port capability into the user pointer in `arg2`.
     ReadPort8 = 8,
+    /// Copy a mapped framebuffer's layout into the user pointer in `arg2`.
+    FramebufferInfo = 9,
 }
+
+/// Byte layout of an RGB framebuffer.
+pub const FRAMEBUFFER_RGB: u32 = 1;
+/// Byte layout of a BGR framebuffer.
+pub const FRAMEBUFFER_BGR: u32 = 2;
+/// Byte layout of a grayscale framebuffer.
+pub const FRAMEBUFFER_GRAY8: u32 = 3;
+
+/// Description of a boot framebuffer mapped into the caller's address space.
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+pub struct FramebufferInfo {
+    /// Base address of the user mapping.
+    pub address: u64,
+    /// Total byte length of the visible framebuffer, including row padding.
+    pub byte_len: u64,
+    /// Visible width in pixels.
+    pub width: u32,
+    /// Visible height in pixels.
+    pub height: u32,
+    /// Row pitch in bytes.
+    pub pitch: u32,
+    /// Number of bytes per pixel.
+    pub bytes_per_pixel: u32,
+    /// Pixel byte layout, one of the `FRAMEBUFFER_*` constants.
+    pub format: u32,
+    /// Reserved for ABI growth. Set to zero.
+    pub reserved: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<FramebufferInfo>() == 40);
 
 /// Rights that can be attached to a capability.
 ///
@@ -292,6 +328,7 @@ mod tests {
         assert_eq!(CapOp::Mint as u64, 6);
         assert_eq!(CapOp::Move as u64, 7);
         assert_eq!(CapOp::ReadPort8 as u64, 8);
+        assert_eq!(CapOp::FramebufferInfo as u64, 9);
     }
 
     #[test]
@@ -313,10 +350,7 @@ mod tests {
         // Then: zero succeeds and each non-zero value preserves its error.
         assert_eq!(ErrorCode::from_u64(0), Ok(()));
         assert_eq!(ErrorCode::from_u64(1), Err(ErrorCode::InvalidCap));
-        assert_eq!(
-            ErrorCode::from_u64(2),
-            Err(ErrorCode::CapRightsViolation)
-        );
+        assert_eq!(ErrorCode::from_u64(2), Err(ErrorCode::CapRightsViolation));
         assert_eq!(ErrorCode::from_u64(3), Err(ErrorCode::NoMemory));
         assert_eq!(ErrorCode::from_u64(4), Err(ErrorCode::BadMessage));
         assert_eq!(ErrorCode::from_u64(5), Err(ErrorCode::NotFound));

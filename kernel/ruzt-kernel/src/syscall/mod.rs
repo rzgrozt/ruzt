@@ -29,12 +29,7 @@ pub(crate) extern "C" fn syscall_dispatch(args: &SyscallArgs, caller_cs: u64) ->
             .map_or_else(ErrorCode::as_u64, |()| ErrorCode::Ok.as_u64()),
         SyscallNumber::Invoke => invoke::invoke(args),
         SyscallNumber::DebugPutChar => {
-            let byte = args.arg0 as u8;
-            static ROOTSRV_STARTED: spin::Once<()> = spin::Once::new();
-            if from_user {
-                ROOTSRV_STARTED.call_once(crate::boot_screen::rootsrv_started);
-            }
-            crate::serial::SERIAL1.lock().send(byte);
+            crate::serial::SERIAL1.lock().send(args.arg0 as u8);
             ErrorCode::Ok.as_u64()
         }
         SyscallNumber::NotImplemented | SyscallNumber::_Reply | SyscallNumber::_Yield => {

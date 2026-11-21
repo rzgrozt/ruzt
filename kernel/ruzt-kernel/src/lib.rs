@@ -35,7 +35,13 @@ use ruzt_hal::cpu::CpuOps;
 pub fn main(boot_info: &'static mut BootInfo) -> ! {
     serial::SERIAL1.lock().init();
 
-    let mut screen = boot_info.framebuffer.take().and_then(boot_screen::BootScreen::new);
+    let (mut screen, undrawn_framebuffer) = match boot_info.framebuffer.take() {
+        Some(framebuffer) => match boot_screen::BootScreen::new(framebuffer) {
+            Ok(screen) => (Some(screen), None),
+            Err(framebuffer) => (None, Some(framebuffer)),
+        },
+        None => (None, None),
+    };
     let mut advance_screen = || {
         if let Some(screen) = &mut screen {
             screen.advance();
@@ -103,8 +109,8 @@ pub fn main(boot_info: &'static mut BootInfo) -> ! {
     advance_screen();
 
     if let Some(image) = boot_info.initrd {
-        boot_screen::attach(screen);
-        process::launch(image);
+        let framebuffer = screen.map(boot_screen::BootScreen::hand_off).or(undrawn_framebuffer);
+        process::launch(image, framebuffer);
     }
     assert!(!cfg!(feature = "qemu-rootsrv-test"), "rootsrv is missing from the boot image");
 

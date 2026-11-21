@@ -20,7 +20,7 @@ const MILESTONES: [&str; 5] = [
     "Capability table",
     "Breakpoint returned",
     "Scheduler initialized",
-    "First timer interrupt",
+    "Boot handoff",
 ];
 
 static ACTIVE_SCREEN: Mutex<Option<BootScreen>> = Mutex::new(None);
@@ -35,21 +35,6 @@ pub(crate) fn timer_started() {
     }
 }
 
-pub(crate) fn rootsrv_started() {
-    if let Some(screen) = ACTIVE_SCREEN.lock().as_mut() {
-        let y = screen.top + 340;
-        screen.rect(screen.left, y, screen.width, 16, CANVAS);
-        screen.text(
-            screen.left,
-            y,
-            "Ring 3 / rootsrv running",
-            RasterHeight::Size16,
-            BREEZE,
-            CANVAS,
-        );
-    }
-}
-
 pub(crate) struct BootScreen {
     fb: Framebuffer,
     left: usize,
@@ -59,7 +44,7 @@ pub(crate) struct BootScreen {
 }
 
 impl BootScreen {
-    pub(crate) fn new(fb: Framebuffer) -> Option<Self> {
+    pub(crate) fn new(fb: Framebuffer) -> Result<Self, Framebuffer> {
         let width = fb.width as usize;
         let height = fb.height as usize;
         let stride = fb.stride as usize;
@@ -69,13 +54,16 @@ impl BootScreen {
             PixelFormat::U8 => bytes == 1,
             _ => false,
         };
+        let required_bytes = stride
+            .checked_mul(height)
+            .and_then(|size| size.checked_mul(bytes));
         if !supported
             || width > stride
-            || stride.checked_mul(height)?.checked_mul(bytes)? > fb.buffer.len()
             || width < 480
             || height < 400
+            || required_bytes.is_none_or(|size| size > fb.buffer.len())
         {
-            return None;
+            return Err(fb);
         }
 
         let content_width = (width - 64).min(960);
@@ -88,7 +76,22 @@ impl BootScreen {
         };
         screen.rect(0, 0, width, height, CANVAS);
         screen.draw();
-        Some(screen)
+        Ok(screen)
+    }
+
+    pub(crate) fn hand_off(mut self) -> Framebuffer {
+        self.advance();
+        let y = self.top + 340;
+        self.rect(self.left, y, self.width, 16, CANVAS);
+        self.text(
+            self.left,
+            y,
+            "Display handed to user space",
+            RasterHeight::Size16,
+            BREEZE,
+            CANVAS,
+        );
+        self.fb
     }
 
     pub(crate) fn advance(&mut self) {

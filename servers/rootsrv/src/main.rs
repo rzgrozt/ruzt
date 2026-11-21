@@ -1,9 +1,11 @@
 #![no_std]
 #![no_main]
 
+mod tile;
+
 use ruzt_abi::{
     CapRights, CapTransferSlot, ErrorCode, IpcMessage, ROOTSRV_BOOTSTRAP_ENDPOINT,
-    ROOTSRV_KEYBOARD_DATA, ROOTSRV_KEYBOARD_IRQ,
+    ROOTSRV_FRAMEBUFFER, ROOTSRV_KEYBOARD_DATA, ROOTSRV_KEYBOARD_IRQ,
 };
 use ruzt_runtime::{debug_putchar, runtime_init};
 
@@ -80,6 +82,18 @@ fn main() -> ! {
         ruzt_driver_sdk::read_port_u8(ROOTSRV_KEYBOARD_IRQ),
         Err(ErrorCode::InvalidCap)
     );
+    assert!(matches!(
+        ruzt_driver_sdk::framebuffer_info(ROOTSRV_KEYBOARD_IRQ),
+        Err(ErrorCode::InvalidCap)
+    ));
+    let mut tile = match tile::Tile::from_capability(ROOTSRV_FRAMEBUFFER) {
+        Ok(tile) => tile,
+        Err(ErrorCode::InvalidCap) => None,
+        Err(error) => panic!("framebuffer capability failed: {error:?}"),
+    };
+    if tile.is_some() {
+        write_line("rootsrv: framebuffer tile drawn");
+    }
     write_line("rootsrv: press Space to test keyboard input");
     loop {
         match ruzt_driver_sdk::poll_irq(ROOTSRV_KEYBOARD_IRQ) {
@@ -88,6 +102,9 @@ fn main() -> ! {
                     .expect("read PS/2 keyboard data");
                 // The boot firmware configures translated set-1 scancodes.
                 if scancode == 0x39 {
+                    if let Some(tile) = &mut tile {
+                        tile.toggle();
+                    }
                     write_line("rootsrv: Space key received");
                 }
             }

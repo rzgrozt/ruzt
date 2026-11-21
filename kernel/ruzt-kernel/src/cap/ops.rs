@@ -165,7 +165,7 @@ fn kobject_id_from_cap(cap: &CapSlot) -> Option<KObjectId> {
         CapType::Frame { .. } => Some(KObjectId(cap.badge)),
         CapType::Untyped { .. } => Some(KObjectId(cap.badge)),
         CapType::Irq { .. } => Some(KObjectId(cap.badge)),
-        CapType::Null | CapType::IoPort { .. } => None,
+        CapType::Null | CapType::IoPort { .. } | CapType::Framebuffer => None,
     }
 }
 

@@ -2,7 +2,7 @@
 
 #![no_std]
 
-use ruzt_abi::{CapOp, ErrorCode, SyscallNumber};
+use ruzt_abi::{CapOp, ErrorCode, FramebufferInfo, SyscallNumber};
 use ruzt_runtime::syscall::syscall;
 
 /// Consume a pending interrupt, or return [`ErrorCode::WouldBlock`].
@@ -30,4 +30,24 @@ pub fn read_port_u8(cap: u64) -> Result<u8, ErrorCode> {
     };
     ErrorCode::from_u64(status)?;
     Ok(byte)
+}
+
+/// Return the address and layout of the framebuffer mapped for this capability.
+pub fn framebuffer_info(cap: u64) -> Result<FramebufferInfo, ErrorCode> {
+    let mut info = FramebufferInfo::default();
+    // SAFETY: The kernel can write this full record before returning, and all
+    // bit patterns of the record's integer fields are valid.
+    let status = unsafe {
+        syscall(
+            SyscallNumber::Invoke,
+            cap,
+            CapOp::FramebufferInfo as u64,
+            &mut info as *mut FramebufferInfo as u64,
+            0,
+            0,
+            0,
+        )
+    };
+    ErrorCode::from_u64(status)?;
+    Ok(info)
 }

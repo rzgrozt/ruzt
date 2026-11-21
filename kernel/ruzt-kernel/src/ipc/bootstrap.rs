@@ -3,8 +3,8 @@
 use core::mem::{offset_of, size_of};
 
 use ruzt_abi::{
-    CapOp, CapRights, ErrorCode, IpcMessage, SyscallArgs, ROOTSRV_BOOTSTRAP_ENDPOINT,
-    ROOTSRV_KEYBOARD_DATA, ROOTSRV_KEYBOARD_IRQ,
+    CapOp, CapRights, ErrorCode, FramebufferInfo, IpcMessage, SyscallArgs,
+    ROOTSRV_BOOTSTRAP_ENDPOINT, ROOTSRV_FRAMEBUFFER, ROOTSRV_KEYBOARD_DATA, ROOTSRV_KEYBOARD_IRQ,
 };
 use ruzt_cap::{CapSlot, CapType, EndpointId};
 use ruzt_hal::mem::PhysFrame;
@@ -22,11 +22,12 @@ struct Bootstrap {
     cspace: CSpace,
     endpoint: EndpointId,
     reply: Option<MessageBytes>,
+    framebuffer: Option<FramebufferInfo>,
 }
 
 static BOOTSTRAP: Mutex<Option<Bootstrap>> = Mutex::new(None);
 
-pub(crate) fn init(root: PhysFrame) {
+pub(crate) fn init(root: PhysFrame, framebuffer: Option<FramebufferInfo>) {
     let mut cspace = CSpace::new(2);
     let endpoint = EndpointId(
         object::allocate(CapType::Endpoint(EndpointId(0)))
@@ -68,12 +69,25 @@ pub(crate) fn init(root: PhysFrame) {
             )
             .expect("Failed to grant keyboard capability");
     }
+    if framebuffer.is_some() {
+        cspace
+            .insert(
+                ROOTSRV_FRAMEBUFFER,
+                CapSlot {
+                    cap_type: CapType::Framebuffer,
+                    rights: CapRights::WRITE,
+                    badge: 0,
+                },
+            )
+            .expect("Failed to grant the framebuffer capability");
+    }
 
     *BOOTSTRAP.lock() = Some(Bootstrap {
         root,
         cspace,
         endpoint,
         reply: None,
+        framebuffer,
     });
     keyboard::enable_user_driver();
 }
@@ -103,6 +117,16 @@ pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
                 let byte = unsafe { PortReadOnly::<u8>::new(port).read() };
                 [byte]
             })
+        }
+        CapType::Framebuffer if args.arg1 == CapOp::FramebufferInfo as u64 => {
+            if !slot.rights.contains(CapRights::WRITE) {
+                return Err(ErrorCode::CapRightsViolation);
+            }
+            let info = bootstrap.framebuffer.ok_or(ErrorCode::InvalidCap)?;
+            #[allow(unsafe_code)]
+            // SAFETY: The C-layout integer fields occupy all 40 bytes.
+            let bytes: [u8; size_of::<FramebufferInfo>()] = unsafe { core::mem::transmute(info) };
+            write_user_buffer(bootstrap.root, args.arg2, &bytes)
         }
         _ => Err(ErrorCode::InvalidCap),
     }
