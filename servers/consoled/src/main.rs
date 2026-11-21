@@ -40,12 +40,13 @@ fn main() -> ! {
             },
             ..IpcMessage::default()
         };
+        #[cfg(feature = "qemu-preemption-test")]
+        if reply.label == console::WRITTEN {
+            uart_write(b"consoled: reply followed by CPU-bound loop\n");
+        }
         ruzt_ipc::send(console::REPLY, &reply).expect("reply to console request");
         #[cfg(feature = "qemu-preemption-test")]
         if reply.label == console::WRITTEN {
-            for byte in b"consoled: entering CPU-bound test loop\n" {
-                ruzt_runtime::debug_putchar(*byte);
-            }
             loop {
                 core::hint::spin_loop();
             }

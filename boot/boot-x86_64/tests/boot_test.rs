@@ -85,7 +85,7 @@ fn test_timer_preempts_cpu_bound_user_code() {
     wait_for_serial(
         &mut vm.child,
         &serial_path,
-        "consoled: entering CPU-bound test loop",
+        "consoled: reply followed by CPU-bound loop",
         deadline,
     );
     wait_for_serial(
