@@ -19,13 +19,19 @@ pub fn invoke(args: &SyscallArgs) -> u64 {
         let mut guard = crate::cap::cspace::kernel_cspace();
         let cspace = guard.as_mut().expect("kernel cspace not initialised");
         match cspace.lookup(cptr) {
-            Ok(s) => *s,
+            Ok(s) => s,
             Err(e) => return e.as_u64(),
         }
     };
     crate::serial_println!("invoke: cap_type={:?}", slot.cap_type);
 
     match op {
+        CapOp::Unsupported => AbiErrorCode::NotImplemented.as_u64(),
+        CapOp::Revoke { cptr } => {
+            let mut guard = crate::cap::cspace::kernel_cspace();
+            let space = guard.as_mut().expect("kernel cspace not initialised");
+            space.revoke(cptr).map_or_else(AbiErrorCode::as_u64, |()| AbiErrorCode::Ok.as_u64())
+        }
         CapOp::Delete { cptr } => {
             let mut guard = crate::cap::cspace::kernel_cspace();
             let cspace = guard.as_mut().expect("kernel cspace not initialised");

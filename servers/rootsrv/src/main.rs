@@ -4,7 +4,7 @@
 mod tile;
 
 use ruzt_abi::{
-    console, ErrorCode, IpcMessage, ROOTSRV_CONSOLE_REPLY, ROOTSRV_CONSOLE_REQUEST,
+    console, CapRights, ErrorCode, IpcMessage, ROOTSRV_CONSOLE_REPLY, ROOTSRV_CONSOLE_REQUEST,
     ROOTSRV_FRAMEBUFFER, ROOTSRV_KEYBOARD_DATA, ROOTSRV_KEYBOARD_IRQ,
 };
 use ruzt_runtime::{debug_putchar, runtime_init};
@@ -55,7 +55,26 @@ fn greet_via_console() -> Result<(), ErrorCode> {
     Ok(())
 }
 
+fn check_revocation() {
+    const CHILD: u64 = 5;
+    const GRANDCHILD: u64 = 6;
+    const MOVED: u64 = 7;
+    let source = ROOTSRV_CONSOLE_REQUEST;
+    let rights = CapRights::WRITE.union(CapRights::GRANT);
+    ruzt_ipc::mint(source, CHILD, rights, 0).expect("derive console capability");
+    ruzt_ipc::mint(CHILD, GRANDCHILD, CapRights::WRITE, 0).expect("derive attenuated capability");
+    ruzt_ipc::move_cap(GRANDCHILD, MOVED).expect("move derived capability");
+    ruzt_ipc::delete(CHILD).expect("delete intermediate capability");
+    ruzt_ipc::revoke(source).expect("revoke console descendants");
+    assert_eq!(
+        ruzt_ipc::send(MOVED, &IpcMessage::default()),
+        Err(ErrorCode::InvalidCap)
+    );
+    write_line("rootsrv: moved capability revoked transitively");
+}
+
 fn main() -> ! {
+    check_revocation();
     match greet_via_console() {
         Ok(()) => {}
         Err(ErrorCode::NotFound) => write_line("rootsrv: console disconnected"),

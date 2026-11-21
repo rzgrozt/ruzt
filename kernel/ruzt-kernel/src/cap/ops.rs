@@ -42,6 +42,13 @@ pub enum CapOp {
         /// Type of the new kernel object.
         new_type: CapType,
     },
+    /// Revoke the derived capabilities of the invoked slot.
+    Revoke {
+        /// Root of the derivation subtree.
+        cptr: u64,
+    },
+    /// Unrecognized operation.
+    Unsupported,
     /// Send an IPC message through an endpoint.
     Send,
     /// Receive an IPC message through an endpoint.
@@ -79,7 +86,8 @@ impl CapOp {
                 src_cptr: _args.arg2,
                 dest_cptr: _args.arg3,
             },
-            _ => Self::Send,
+            11 => Self::Revoke { cptr: _args.arg0 },
+            _ => Self::Unsupported,
         }
     }
 }
@@ -87,43 +95,44 @@ impl CapOp {
 /// Delete a capability from a CSpace, deallocating the underlying kernel
 /// object if this is the last reference.
 pub fn cap_delete(cspace: &mut CSpace, cptr: u64) -> Result<(), ErrorCode> {
-    let old = cspace.delete(cptr)?;
-    if let Some(id) = kobject_id_from_cap(&old) {
-        super::object::deallocate(id);
-    }
+    cspace.delete(cptr)?;
     Ok(())
 }
 
-/// Consume an Untyped capability and create a new kernel object.
-///
-/// The source Untyped capability is removed (fully consumed) and the new
-/// capability is inserted at `dest_cptr`.
+/// Replace the source Untyped with a kernel object of the requested type.
+/// Failed allocation or destination validation leaves the source untouched.
 pub fn cap_retype(
     cspace: &mut CSpace,
     src_cptr: u64,
     dest_cptr: u64,
     new_type: CapType,
 ) -> Result<(), ErrorCode> {
-    let src = cspace.delete(src_cptr)?;
-    let untyped = match src.cap_type {
-        CapType::Untyped { phys, size_bits } => (phys, size_bits),
-        _ => return Err(ErrorCode::InvalidCap),
+    let src = cspace.lookup(src_cptr)?;
+    let CapType::Untyped { phys, size_bits } = src.cap_type else {
+        return Err(ErrorCode::InvalidCap);
     };
-
-    let required_bits = size_bits_for_type(new_type);
-    if required_bits > untyped.1 {
-        // Put the untyped back
-        cspace.insert(src_cptr, src)?;
+    if !src.rights.contains(CapRights::WRITE) {
+        return Err(ErrorCode::CapRightsViolation);
+    }
+    cspace.require_vacant(dest_cptr)?;
+    if size_bits_for_type(new_type) > size_bits {
         return Err(ErrorCode::BadMessage);
     }
-
+    let new_type = match new_type {
+        CapType::Frame { size, .. } => CapType::Frame { phys, size },
+        other => other,
+    };
     let id = super::object::allocate(new_type)?;
     let slot = cap_slot_with_id(new_type, id, CapRights::new());
-    cspace.insert(dest_cptr, slot)?;
+    if let Err(error) = cspace.install(dest_cptr, slot, Some(id)) {
+        super::object::deallocate(id);
+        return Err(error);
+    }
+    cspace.delete(src_cptr)?;
     Ok(())
 }
 
-/// Copy a capability with potentially reduced rights.
+/// Copy a capability with reduced rights and preserve its derivation.
 pub fn cap_mint(
     cspace: &mut CSpace,
     src_cptr: u64,
@@ -131,42 +140,13 @@ pub fn cap_mint(
     new_rights: CapRights,
     badge: u64,
 ) -> Result<(), ErrorCode> {
-    let src = *cspace.lookup(src_cptr)?;
-    if !src.rights.contains(new_rights) {
-        return Err(ErrorCode::CapRightsViolation);
-    }
-    let mut slot = src;
-    slot.rights = new_rights;
-    slot.badge = badge;
-    cspace.insert(dest_cptr, slot)?;
-    Ok(())
+    let source = cspace.capability_id(src_cptr)?;
+    cspace.derive(source, dest_cptr, new_rights, badge)
 }
 
-/// Move a capability from one slot to another.
-pub fn cap_move(
-    cspace: &mut CSpace,
-    src_cptr: u64,
-    dest_cptr: u64,
-) -> Result<(), ErrorCode> {
-    let src = cspace.delete(src_cptr)?;
-    cspace.insert(dest_cptr, src)?;
-    Ok(())
-}
-
-/// Extract the [`KObjectId`] from a capability slot, if it references a
-/// kernel object.
-fn kobject_id_from_cap(cap: &CapSlot) -> Option<KObjectId> {
-    match cap.cap_type {
-        CapType::Endpoint(id) => Some(KObjectId(id.0)),
-        CapType::Notification(id) => Some(KObjectId(id.0)),
-        CapType::Thread(id) => Some(KObjectId(id.0)),
-        CapType::AddressSpace(id) => Some(KObjectId(id.0)),
-        CapType::CNode { ptr, .. } => Some(KObjectId(ptr)),
-        CapType::Frame { .. } => Some(KObjectId(cap.badge)),
-        CapType::Untyped { .. } => Some(KObjectId(cap.badge)),
-        CapType::Irq { .. } => Some(KObjectId(cap.badge)),
-        CapType::Null | CapType::IoPort { .. } | CapType::Framebuffer => None,
-    }
+/// Move a capability to an empty slot.
+pub fn cap_move(cspace: &mut CSpace, src_cptr: u64, dest_cptr: u64) -> Result<(), ErrorCode> {
+    cspace.move_cap(src_cptr, dest_cptr)
 }
 
 /// Create a [`CapSlot`] for a newly allocated kernel object.
@@ -176,17 +156,16 @@ fn cap_slot_with_id(cap_type: CapType, id: KObjectId, rights: CapRights) -> CapS
         CapType::Notification(_) => CapType::Notification(ruzt_cap::NotificationId(id.0)),
         CapType::Thread(_) => CapType::Thread(ruzt_cap::ThreadId(id.0)),
         CapType::AddressSpace(_) => CapType::AddressSpace(ruzt_cap::AddressSpaceId(id.0)),
-        CapType::CNode { radix_bits, .. } => CapType::CNode { radix_bits, ptr: id.0 },
+        CapType::CNode { radix_bits, .. } => CapType::CNode {
+            radix_bits,
+            ptr: id.0,
+        },
         other => other,
-    };
-    let badge = match cap_type {
-        CapType::Frame { .. } | CapType::Untyped { .. } | CapType::Irq { .. } => id.0,
-        _ => 0,
     };
     CapSlot {
         cap_type,
         rights,
-        badge,
+        badge: 0,
     }
 }
 
@@ -198,7 +177,7 @@ fn size_bits_for_type(cap_type: CapType) -> u8 {
             FrameSize::Size2M => 21,
             FrameSize::Size1G => 30,
         },
-        CapType::CNode { radix_bits, .. } => radix_bits + 4, // CapSlot is ~40 bytes
+        CapType::CNode { radix_bits, .. } => radix_bits.saturating_add(6),
         _ => 0,
     }
 }
@@ -206,169 +185,55 @@ fn size_bits_for_type(cap_type: CapType) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ruzt_cap::{EndpointId, FrameSize};
-    use ruzt_hal::mem::PhysAddr;
+    use ruzt_hal::mem::{PhysAddr, PhysFrame};
 
     #[test]
-    fn cap_delete_deallocates_object() {
+    fn retype_is_atomic_and_uses_the_owned_frame() {
         let _state = crate::isolated_kernel_state();
-        let mut cspace = CSpace::new(4);
-        let id = super::super::object::allocate(CapType::Endpoint(EndpointId(0))).unwrap();
-        let slot = CapSlot {
-            cap_type: CapType::Endpoint(EndpointId(id.0)),
-            rights: CapRights::READ,
-            badge: 0,
-        };
-        cspace.insert(0, slot).unwrap();
-
-        // Verify the slot was inserted
-        let found = cspace.lookup(0).unwrap();
-        assert_eq!(found.cap_type, CapType::Endpoint(EndpointId(id.0)));
-
-        super::cap_delete(&mut cspace, 0).unwrap();
-        assert_eq!(cspace.lookup(0), Err(ErrorCode::InvalidCap));
-        assert!(super::super::object::get(id).is_none(), "object still exists at id={}", id.0);
-    }
-
-    #[test]
-    fn cap_delete_null_slot_ok() {
-        let mut cspace = CSpace::new(4);
-        // Deleting a null slot should be a no-op (no object to deallocate)
-        assert!(super::cap_delete(&mut cspace, 0).is_ok());
-    }
-
-    #[test]
-    fn cap_retype_untyped_to_frame() {
-        let _state = crate::isolated_kernel_state();
-        let mut cspace = CSpace::new(4);
-        let frame = ruzt_hal::mem::PhysFrame::from_base(PhysAddr::new(0x4000)).unwrap();
-        let untyped = CapSlot {
-            cap_type: CapType::Untyped { phys: frame, size_bits: 12 },
+        let mut cspace = CSpace::new(2);
+        let owned = PhysFrame::from_base(PhysAddr::new(0x4000)).unwrap();
+        let other = PhysFrame::from_base(PhysAddr::new(0x5000)).unwrap();
+        let source = CapSlot {
+            cap_type: CapType::Untyped {
+                phys: owned,
+                size_bits: 12,
+            },
             rights: CapRights::new(),
             badge: 0,
         };
-        cspace.insert(0, untyped).unwrap();
-
-        super::cap_retype(
-            &mut cspace,
-            0,
-            1,
-            CapType::Frame { phys: frame, size: FrameSize::Size4K },
-        )
-        .unwrap();
-
-        assert_eq!(cspace.lookup(0), Err(ErrorCode::InvalidCap));
-        let new_cap = cspace.lookup(1).unwrap();
-        assert!(matches!(new_cap.cap_type, CapType::Frame { size: FrameSize::Size4K, .. }));
-    }
-
-    #[test]
-    fn cap_retype_wrong_type_fails() {
-        let mut cspace = CSpace::new(4);
-        let slot = CapSlot {
-            cap_type: CapType::Endpoint(EndpointId(1)),
-            rights: CapRights::READ,
-            badge: 0,
+        cspace.insert(0, source).unwrap();
+        cspace.insert(1, source).unwrap();
+        let frame = CapType::Frame {
+            phys: other,
+            size: FrameSize::Size4K,
         };
-        cspace.insert(0, slot).unwrap();
 
         assert_eq!(
-            super::cap_retype(
-                &mut cspace,
-                0,
-                1,
-                CapType::Frame {
-                    phys: ruzt_hal::mem::PhysFrame::from_base(PhysAddr::new(0x5000)).unwrap(),
-                    size: FrameSize::Size4K,
-                },
-            ),
+            cap_retype(&mut cspace, 0, 1, frame),
+            Err(ErrorCode::SlotOccupied)
+        );
+        assert_eq!(
+            cap_retype(&mut cspace, 0, 2, CapType::Null),
             Err(ErrorCode::InvalidCap)
         );
-    }
-
-    #[test]
-    fn cap_retype_too_small_untyped() {
-        let mut cspace = CSpace::new(4);
-        let frame = ruzt_hal::mem::PhysFrame::from_base(PhysAddr::new(0x6000)).unwrap();
-        let untyped = CapSlot {
-            cap_type: CapType::Untyped { phys: frame, size_bits: 10 },
-            rights: CapRights::new(),
-            badge: 0,
+        assert_eq!(cspace.lookup(0), Ok(source));
+        let huge = CapType::Frame {
+            phys: other,
+            size: FrameSize::Size2M,
         };
-        cspace.insert(0, untyped).unwrap();
-
         assert_eq!(
-            super::cap_retype(
-                &mut cspace,
-                0,
-                1,
-                CapType::Frame { phys: frame, size: FrameSize::Size4K },
-            ),
+            cap_retype(&mut cspace, 0, 2, huge),
             Err(ErrorCode::BadMessage)
         );
-        // Untyped should be restored
-        assert!(matches!(cspace.lookup(0).unwrap().cap_type, CapType::Untyped { .. }));
-    }
-
-    #[test]
-    fn cap_mint_reduces_rights() {
-        let mut cspace = CSpace::new(4);
-        let slot = CapSlot {
-            cap_type: CapType::Endpoint(EndpointId(1)),
-            rights: CapRights::READ.union(CapRights::WRITE),
-            badge: 0,
-        };
-        cspace.insert(0, slot).unwrap();
-
-        super::cap_mint(
-            &mut cspace,
-            0,
-            1,
-            CapRights::READ,
-            42,
-        )
-        .unwrap();
-
-        let minted = cspace.lookup(1).unwrap();
-        assert!(minted.rights.contains(CapRights::READ));
-        assert!(!minted.rights.contains(CapRights::WRITE));
-        assert_eq!(minted.badge, 42);
-    }
-
-    #[test]
-    fn cap_mint_rights_violation() {
-        let mut cspace = CSpace::new(4);
-        let slot = CapSlot {
-            cap_type: CapType::Endpoint(EndpointId(1)),
-            rights: CapRights::READ,
-            badge: 0,
-        };
-        cspace.insert(0, slot).unwrap();
-
-        assert_eq!(
-            super::cap_mint(
-                &mut cspace,
-                0,
-                1,
-                CapRights::WRITE,
-                0,
-            ),
-            Err(ErrorCode::CapRightsViolation)
-        );
-    }
-
-    #[test]
-    fn cap_move_works() {
-        let mut cspace = CSpace::new(4);
-        let slot = CapSlot {
-            cap_type: CapType::Endpoint(EndpointId(1)),
-            rights: CapRights::READ,
-            badge: 0,
-        };
-        cspace.insert(0, slot).unwrap();
-
-        super::cap_move(&mut cspace, 0, 1).unwrap();
+        assert_eq!(cspace.lookup(0), Ok(source));
+        cap_retype(&mut cspace, 0, 2, frame).unwrap();
         assert_eq!(cspace.lookup(0), Err(ErrorCode::InvalidCap));
-        assert_eq!(cspace.lookup(1).unwrap().cap_type, CapType::Endpoint(EndpointId(1)));
+        assert_eq!(
+            cspace.lookup(2).unwrap().cap_type,
+            CapType::Frame {
+                phys: owned,
+                size: FrameSize::Size4K
+            }
+        );
     }
 }

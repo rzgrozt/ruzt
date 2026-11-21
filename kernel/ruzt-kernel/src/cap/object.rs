@@ -1,10 +1,10 @@
 //! Kernel object table — every capability references a stable entry here.
 
 use alloc::vec::Vec;
-use spin::Mutex;
 use ruzt_abi::ErrorCode;
 use ruzt_cap::{CapType, NULL_SLOT};
 use ruzt_hal::mem::PhysFrame;
+use spin::Mutex;
 
 /// Maximum number of kernel objects in the table.
 const MAX_OBJECTS: usize = 256;
@@ -97,10 +97,15 @@ const MAX_GENERATION: u64 = u64::MAX >> INDEX_BITS;
 struct Entry {
     generation: u64,
     object: Option<KernelObject>,
+    references: usize,
 }
 
 impl Entry {
-    const EMPTY: Self = Self { generation: 0, object: None };
+    const EMPTY: Self = Self {
+        generation: 0,
+        object: None,
+        references: 0,
+    };
 
     fn matches(&self, id: KObjectId) -> bool {
         self.generation == id.0 >> INDEX_BITS
@@ -118,15 +123,16 @@ static TABLE: Mutex<[Entry; MAX_OBJECTS]> = Mutex::new([Entry::EMPTY; MAX_OBJECT
 
 /// Initialise the object table and the kernel-only CSpace.
 pub fn init() {
+    super::cspace::init_kernel_cspace();
     {
         let mut table = TABLE.lock();
         for entry in table.iter_mut() {
             if let Some(object) = entry.object.take() {
                 destroy(object);
             }
+            entry.references = 0;
         }
     }
-    super::cspace::init_kernel_cspace();
 }
 
 /// Allocate a kernel object and return its generation-qualified identity.
@@ -146,7 +152,11 @@ pub fn allocate(cap_type: CapType) -> Result<KObjectId, ErrorCode> {
 pub fn get(id: KObjectId) -> Option<KernelObject> {
     let table = TABLE.lock();
     let entry = &table[id.index()];
-    if entry.matches(id) { entry.object } else { None }
+    if entry.matches(id) {
+        entry.object
+    } else {
+        None
+    }
 }
 
 pub(crate) fn close_endpoint(id: KObjectId) {
@@ -162,7 +172,38 @@ pub fn deallocate(id: KObjectId) {
     let object = {
         let mut table = TABLE.lock();
         let entry = &mut table[id.index()];
-        if entry.matches(id) { entry.object.take() } else { None }
+        if entry.matches(id) && entry.references == 0 {
+            entry.object.take()
+        } else {
+            None
+        }
+    };
+    if let Some(object) = object {
+        destroy(object);
+    }
+}
+
+pub(super) fn retain(id: KObjectId) -> Result<(), ErrorCode> {
+    let mut table = TABLE.lock();
+    let entry = &mut table[id.index()];
+    if !entry.matches(id) || entry.object.is_none() {
+        return Err(ErrorCode::InvalidCap);
+    }
+    entry.references = entry.references.checked_add(1).ok_or(ErrorCode::NoMemory)?;
+    Ok(())
+}
+
+pub(super) fn release(id: KObjectId) {
+    let object = {
+        let mut table = TABLE.lock();
+        let entry = &mut table[id.index()];
+        assert!(entry.matches(id) && entry.references != 0);
+        entry.references -= 1;
+        if entry.references == 0 {
+            entry.object.take()
+        } else {
+            None
+        }
     };
     if let Some(object) = object {
         destroy(object);
@@ -172,7 +213,11 @@ pub fn deallocate(id: KObjectId) {
 fn destroy(object: KernelObject) {
     if let KernelObject::CNode { slots, count, .. } = object {
         // SAFETY: This is the unique boxed slice from CNode allocation.
-        unsafe { drop(alloc::boxed::Box::from_raw(core::ptr::slice_from_raw_parts_mut(slots, count))) };
+        unsafe {
+            drop(alloc::boxed::Box::from_raw(
+                core::ptr::slice_from_raw_parts_mut(slots, count),
+            ))
+        };
     }
 }
 
@@ -205,8 +250,7 @@ fn kernel_object_from_cap_type(cap_type: CapType) -> Result<KernelObject, ErrorC
             thread_id: thread_id.0 as usize,
         }),
         CapType::AddressSpace(_) => Ok(KernelObject::AddressSpace {
-            root_page_table: crate::mm::frame::allocate()
-                .ok_or(ErrorCode::NoMemory)?,
+            root_page_table: crate::mm::frame::allocate().ok_or(ErrorCode::NoMemory)?,
         }),
         CapType::Frame { phys, size: _ } => Ok(KernelObject::Frame {
             phys,
@@ -214,9 +258,13 @@ fn kernel_object_from_cap_type(cap_type: CapType) -> Result<KernelObject, ErrorC
             mapped_count: 0,
         }),
         CapType::CNode { radix_bits, .. } => {
-            let count = 1usize.checked_shl(u32::from(radix_bits)).ok_or(ErrorCode::BadMessage)?;
+            let count = 1usize
+                .checked_shl(u32::from(radix_bits))
+                .ok_or(ErrorCode::BadMessage)?;
             let mut slots = Vec::new();
-            slots.try_reserve_exact(count).map_err(|_| ErrorCode::NoMemory)?;
+            slots
+                .try_reserve_exact(count)
+                .map_err(|_| ErrorCode::NoMemory)?;
             slots.resize(count, NULL_SLOT);
             let ptr = alloc::boxed::Box::into_raw(slots.into_boxed_slice()).cast();
             Ok(KernelObject::CNode {
@@ -225,10 +273,7 @@ fn kernel_object_from_cap_type(cap_type: CapType) -> Result<KernelObject, ErrorC
                 count,
             })
         }
-        CapType::Untyped { phys, size_bits } => Ok(KernelObject::Untyped {
-            phys,
-            size_bits,
-        }),
+        CapType::Untyped { phys, size_bits } => Ok(KernelObject::Untyped { phys, size_bits }),
         CapType::Irq { irq_num } => Ok(KernelObject::Irq { irq_num }),
         // Boot device capabilities are only provisioned at process creation.
         CapType::IoPort { .. } | CapType::Framebuffer => Err(ErrorCode::NotImplemented),
@@ -299,7 +344,11 @@ mod tests {
     fn allocate_frame() {
         let _state = crate::isolated_kernel_state();
         let frame = ruzt_hal::mem::PhysFrame::from_base(PhysAddr::new(0x1000)).unwrap();
-        let id = allocate(CapType::Frame { phys: frame, size: ruzt_cap::FrameSize::Size4K }).unwrap();
+        let id = allocate(CapType::Frame {
+            phys: frame,
+            size: ruzt_cap::FrameSize::Size4K,
+        })
+        .unwrap();
         let obj = get(id).unwrap();
         assert!(matches!(obj, KernelObject::Frame { .. }));
     }
@@ -308,7 +357,11 @@ mod tests {
     fn allocate_untyped() {
         let _state = crate::isolated_kernel_state();
         let frame = ruzt_hal::mem::PhysFrame::from_base(PhysAddr::new(0x2000)).unwrap();
-        let id = allocate(CapType::Untyped { phys: frame, size_bits: 12 }).unwrap();
+        let id = allocate(CapType::Untyped {
+            phys: frame,
+            size_bits: 12,
+        })
+        .unwrap();
         let obj = get(id).unwrap();
         assert!(matches!(obj, KernelObject::Untyped { size_bits: 12, .. }));
     }
@@ -316,9 +369,16 @@ mod tests {
     #[test]
     fn allocate_cnode() {
         let _state = crate::isolated_kernel_state();
-        let id = allocate(CapType::CNode { radix_bits: 4, ptr: 0 }).unwrap();
+        let id = allocate(CapType::CNode {
+            radix_bits: 4,
+            ptr: 0,
+        })
+        .unwrap();
         let obj = get(id).unwrap();
-        if let KernelObject::CNode { radix_bits, count, .. } = obj {
+        if let KernelObject::CNode {
+            radix_bits, count, ..
+        } = obj
+        {
             assert_eq!(radix_bits, 4);
             assert_eq!(count, 16);
         } else {

@@ -7,6 +7,7 @@ use ruzt_hal::mem::PhysFrame;
 use x86_64::instructions::port::{PortReadOnly, PortWriteOnly};
 
 use super::user_mem;
+use crate::cap::ops::{cap_delete, cap_mint, cap_move};
 use crate::{ipc, keyboard, sched};
 
 const DATA_OFFSET: usize = offset_of!(IpcMessage, data);
@@ -14,8 +15,28 @@ const LABEL_OFFSET: usize = offset_of!(IpcMessage, label);
 const LENGTH_OFFSET: usize = offset_of!(IpcMessage, length);
 
 pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
+    let operation = args.arg1;
+    if operation == CapOp::Mint as u64
+        || operation == CapOp::Move as u64
+        || operation == CapOp::Delete as u64
+        || operation == CapOp::Revoke as u64
+    {
+        return sched::with_current_user(|process| {
+            let space = &mut process.cspace;
+            match operation {
+                op if op == CapOp::Mint as u64 => {
+                    let rights = CapRights::from_bits(args.arg3).ok_or(ErrorCode::BadMessage)?;
+                    cap_mint(space, args.arg0, args.arg2, rights, args.arg4)
+                }
+                op if op == CapOp::Move as u64 => cap_move(space, args.arg0, args.arg2),
+                op if op == CapOp::Delete as u64 => cap_delete(space, args.arg0),
+                _ => space.revoke(args.arg0),
+            }
+        })
+        .ok_or(ErrorCode::InvalidCap)?;
+    }
     let (root, capability, framebuffer) = sched::with_current_user(|process| {
-        let capability = *process.cspace.lookup(args.arg0)?;
+        let capability = process.cspace.lookup(args.arg0)?;
         Ok::<_, ErrorCode>((process.root(), capability, process.framebuffer))
     })
     .ok_or(ErrorCode::InvalidCap)??;

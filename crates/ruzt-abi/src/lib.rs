@@ -108,6 +108,8 @@ pub enum CapOp {
     FramebufferInfo = 9,
     /// Write the byte in `arg2` to a port capability.
     WritePort8 = 10,
+    /// Remove all capabilities derived from the invoked capability.
+    Revoke = 11,
 }
 
 /// Byte layout of an RGB framebuffer.
@@ -166,6 +168,20 @@ impl CapRights {
     /// Create an empty `CapRights`.
     pub const fn empty() -> Self {
         Self(0)
+    }
+
+    /// Encode the rights for a capability invocation.
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Decode a rights mask, rejecting reserved bits.
+    pub const fn from_bits(bits: u64) -> Option<Self> {
+        if bits <= Self::new().0 as u64 {
+            Some(Self(bits as u8))
+        } else {
+            None
+        }
     }
 
     /// Check if all rights in `other` are set in `self`.
@@ -278,6 +294,8 @@ pub enum ErrorCode {
     WouldBlock = 6,
     /// Syscall or operation not yet implemented.
     NotImplemented = 7,
+    /// The destination capability slot is already occupied.
+    SlotOccupied = 8,
 }
 
 impl ErrorCode {
@@ -290,7 +308,7 @@ impl ErrorCode {
     ///
     /// # Errors
     ///
-    /// Returns the corresponding error for codes 1 through 7. Unknown values
+    /// Returns the corresponding error for codes 1 through 8. Unknown values
     /// are reported as [`ErrorCode::NotImplemented`].
     pub const fn from_u64(value: u64) -> Result<(), ErrorCode> {
         match value {
@@ -302,6 +320,7 @@ impl ErrorCode {
             5 => Err(Self::NotFound),
             6 => Err(Self::WouldBlock),
             7 => Err(Self::NotImplemented),
+            8 => Err(Self::SlotOccupied),
             _ => Err(Self::NotImplemented),
         }
     }
@@ -374,6 +393,7 @@ mod tests {
         assert_eq!(CapOp::ReadPort8 as u64, 8);
         assert_eq!(CapOp::FramebufferInfo as u64, 9);
         assert_eq!(CapOp::WritePort8 as u64, 10);
+        assert_eq!(CapOp::Revoke as u64, 11);
     }
 
     #[test]

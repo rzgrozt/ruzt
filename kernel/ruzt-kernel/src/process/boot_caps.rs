@@ -20,7 +20,7 @@ pub(super) fn initial_services() -> ([EndpointId; 2], CSpace, CSpace) {
         &mut rootsrv,
         ROOTSRV_CONSOLE_REQUEST,
         request,
-        CapRights::WRITE,
+        CapRights::WRITE.union(CapRights::GRANT),
     );
     grant(&mut rootsrv, ROOTSRV_CONSOLE_REPLY, reply, CapRights::READ);
     grant(

@@ -64,6 +64,7 @@ fn test_rootsrv_updates_the_framebuffer_from_keyboard_input() {
             "Breakpoint returned cleanly.",
             "consoled process created, entering user mode...",
             "rootsrv process created, entering user mode...",
+            "rootsrv: moved capability revoked transitively",
             "Hello from ring 3, rootsrv alive.",
             "rootsrv: console write acknowledged over IPC",
             "rootsrv: console endpoint rights verified",

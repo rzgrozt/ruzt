@@ -1,222 +1,357 @@
-//! CSpace — capability namespace for a single process.
+//! Per-process slots and the kernel-wide capability derivation tree.
 
-use alloc::vec::Vec;
+use alloc::{collections::BTreeMap, vec, vec::Vec};
 use ruzt_abi::ErrorCode;
-use ruzt_cap::{CapSlot, CapType, NULL_SLOT};
-
-/// A capability table node (CNode) owning a heap-allocated slot array.
-pub struct CapSlotCNode {
-    /// All slots in this node.
-    slots: Vec<CapSlot>,
-    /// Number of bits used to index into this node.
-    radix_bits: u8,
-}
-
-/// A process's capability namespace.
-///
-/// For Phase 2, only a single root CNode is supported (no multi-level lookup).
-pub struct CSpace {
-    /// The root CNode of this CSpace.
-    root: CapSlotCNode,
-}
-
+use ruzt_cap::{CapRights, CapSlot, CapType, NULL_SLOT};
 use spin::Mutex;
 
-/// Global kernel CSpace used for the kernel-internal IPC self-test.
-static KERNEL_CSPACE: Mutex<Option<CSpace>> = Mutex::new(None);
+use super::object::{self, KObjectId};
 
-/// Initialise the global kernel CSpace.
-pub fn init_kernel_cspace() {
-    let mut guard = KERNEL_CSPACE.lock();
-    *guard = Some(CSpace::new(6));
+/// A capability identity that survives moves between slots.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct CapabilityId(u64);
+
+#[derive(Clone, Copy)]
+struct Node {
+    slot: CapSlot,
+    object: Option<KObjectId>,
+    parent: Option<CapabilityId>,
 }
 
-/// Return a lock guard on the global kernel CSpace.
+struct DerivationTree {
+    nodes: BTreeMap<CapabilityId, Node>,
+    next: u64,
+}
+
+impl DerivationTree {
+    fn install(&mut self, node: Node) -> Result<CapabilityId, ErrorCode> {
+        let id = CapabilityId(self.next);
+        let next = self.next.checked_add(1).ok_or(ErrorCode::NoMemory)?;
+        if let Some(object) = node.object {
+            object::retain(object)?;
+        }
+        self.nodes.insert(id, node);
+        self.next = next;
+        Ok(id)
+    }
+
+    fn remove(&mut self, id: CapabilityId) -> Option<CapSlot> {
+        let node = self.nodes.remove(&id)?;
+        // Deleting a cap leaves its children live. Link them to the nearest
+        // surviving ancestor so revocation still reaches them.
+        for child in self.nodes.values_mut() {
+            if child.parent == Some(id) {
+                child.parent = node.parent;
+            }
+        }
+        if let Some(object) = node.object {
+            object::release(object);
+        }
+        Some(node.slot)
+    }
+
+    fn derive(
+        &mut self,
+        source: CapabilityId,
+        rights: CapRights,
+        badge: u64,
+    ) -> Result<CapabilityId, ErrorCode> {
+        let &parent = self.nodes.get(&source).ok_or(ErrorCode::InvalidCap)?;
+        let can_grant = parent.slot.rights.contains(CapRights::GRANT.union(rights));
+        let can_badge = parent.slot.badge == 0 || parent.slot.badge == badge;
+        if !can_grant || !can_badge {
+            return Err(ErrorCode::CapRightsViolation);
+        }
+        self.install(Node {
+            slot: CapSlot {
+                rights,
+                badge,
+                ..parent.slot
+            },
+            object: parent.object,
+            parent: Some(source),
+        })
+    }
+
+    fn revoke(&mut self, source: CapabilityId) {
+        // Remove one immediate child at a time. Removing it reparents its
+        // own children, so this visits the entire subtree without recursion.
+        while let Some(id) = self
+            .nodes
+            .iter()
+            .find_map(|(&id, node)| (node.parent == Some(source)).then_some(id))
+        {
+            self.remove(id);
+        }
+    }
+}
+
+static DERIVATIONS: Mutex<DerivationTree> = Mutex::new(DerivationTree {
+    nodes: BTreeMap::new(),
+    next: 1,
+});
+
+/// A process's capability namespace, initially a single CNode.
+pub struct CSpace {
+    slots: Vec<Option<CapabilityId>>,
+}
+
+static KERNEL_CSPACE: Mutex<Option<CSpace>> = Mutex::new(None);
+
+/// Initialise the capability space of the kernel IPC diagnostic.
+pub fn init_kernel_cspace() {
+    *KERNEL_CSPACE.lock() = Some(CSpace::new(6));
+}
+
+/// Return the locked kernel diagnostic capability space.
 pub fn kernel_cspace() -> spin::MutexGuard<'static, Option<CSpace>> {
     KERNEL_CSPACE.lock()
 }
 
 impl CSpace {
-    /// Create a new CSpace with a root CNode of `radix_bits` depth.
-    ///
-    /// All slots are initialised to [`NULL_SLOT`].
+    /// Create a root CNode with 2^radix_bits slots.
     pub fn new(radix_bits: u8) -> Self {
-        let count = 1usize << (radix_bits as usize);
-        let mut slots = Vec::with_capacity(count);
-        slots.resize(count, NULL_SLOT);
         Self {
-            root: CapSlotCNode { slots, radix_bits },
+            slots: vec![None; 1usize << radix_bits],
         }
     }
 
-    /// Resolve a single-level cptr to a capability slot.
-    ///
-    /// Returns [`ErrorCode::InvalidCap`] if the cptr is out of bounds or the
-    /// slot is empty (`Null`).
-    pub fn lookup(&self, cptr: u64) -> Result<&CapSlot, ErrorCode> {
-        let slot = self
-            .root
-            .slots
-            .get(cptr as usize)
-            .ok_or(ErrorCode::InvalidCap)?;
-        if matches!(slot.cap_type, CapType::Null) {
-            return Err(ErrorCode::InvalidCap);
+    fn index(&self, cptr: u64) -> Result<usize, ErrorCode> {
+        let index = usize::try_from(cptr).map_err(|_| ErrorCode::InvalidCap)?;
+        if index < self.slots.len() {
+            Ok(index)
+        } else {
+            Err(ErrorCode::InvalidCap)
         }
-        Ok(slot)
     }
 
-    /// Resolve a single-level cptr to a mutable capability slot.
-    ///
-    /// Returns [`ErrorCode::InvalidCap`] if the cptr is out of bounds or the
-    /// slot is empty (`Null`).
-    pub fn lookup_mut(&mut self, cptr: u64) -> Result<&mut CapSlot, ErrorCode> {
-        let slot = self
-            .root
-            .slots
-            .get_mut(cptr as usize)
-            .ok_or(ErrorCode::InvalidCap)?;
-        if matches!(slot.cap_type, CapType::Null) {
-            return Err(ErrorCode::InvalidCap);
+    fn vacant(&self, index: usize, tree: &DerivationTree) -> Result<(), ErrorCode> {
+        match self.slots[index] {
+            Some(id) if tree.nodes.contains_key(&id) => Err(ErrorCode::SlotOccupied),
+            _ => Ok(()),
         }
-        Ok(slot)
     }
 
-    /// Overwrite the slot at `cptr` with `slot`.
+    pub(crate) fn capability_id(&self, cptr: u64) -> Result<CapabilityId, ErrorCode> {
+        let id = self.slots[self.index(cptr)?].ok_or(ErrorCode::InvalidCap)?;
+        if DERIVATIONS.lock().nodes.contains_key(&id) {
+            Ok(id)
+        } else {
+            Err(ErrorCode::InvalidCap)
+        }
+    }
+
+    /// Resolve a live slot to its descriptor.
+    pub fn lookup(&self, cptr: u64) -> Result<CapSlot, ErrorCode> {
+        let id = self.slots[self.index(cptr)?].ok_or(ErrorCode::InvalidCap)?;
+        DERIVATIONS
+            .lock()
+            .nodes
+            .get(&id)
+            .map(|node| node.slot)
+            .ok_or(ErrorCode::InvalidCap)
+    }
+
+    /// Install a capability issued by the kernel at boot.
     pub fn insert(&mut self, cptr: u64, slot: CapSlot) -> Result<(), ErrorCode> {
-        let s = self
-            .root
-            .slots
-            .get_mut(cptr as usize)
-            .ok_or(ErrorCode::InvalidCap)?;
-        *s = slot;
+        let object = match slot.cap_type {
+            CapType::Endpoint(id) => Some(KObjectId(id.0)),
+            CapType::Notification(id) => Some(KObjectId(id.0)),
+            CapType::Thread(id) => Some(KObjectId(id.0)),
+            CapType::AddressSpace(id) => Some(KObjectId(id.0)),
+            CapType::CNode { ptr, .. } => Some(KObjectId(ptr)),
+            CapType::Untyped { .. }
+            | CapType::Irq { .. }
+            | CapType::IoPort { .. }
+            | CapType::Framebuffer => None,
+            CapType::Null | CapType::Frame { .. } => return Err(ErrorCode::InvalidCap),
+        };
+        self.install(cptr, slot, object)
+    }
+
+    pub(super) fn install(
+        &mut self,
+        cptr: u64,
+        slot: CapSlot,
+        object: Option<KObjectId>,
+    ) -> Result<(), ErrorCode> {
+        let index = self.index(cptr)?;
+        let mut tree = DERIVATIONS.lock();
+        self.vacant(index, &tree)?;
+        self.slots[index] = Some(tree.install(Node {
+            slot,
+            object,
+            parent: None,
+        })?);
         Ok(())
     }
 
-    /// Replace the slot at `cptr` with [`NULL_SLOT`] and return the old value.
+    /// Delete the slot. Object storage is reclaimed after its last reference.
     pub fn delete(&mut self, cptr: u64) -> Result<CapSlot, ErrorCode> {
-        let s = self
-            .root
-            .slots
-            .get_mut(cptr as usize)
-            .ok_or(ErrorCode::InvalidCap)?;
-        let old = *s;
-        *s = NULL_SLOT;
-        Ok(old)
+        let index = self.index(cptr)?;
+        let Some(id) = self.slots[index].take() else {
+            return Ok(NULL_SLOT);
+        };
+        Ok(DERIVATIONS.lock().remove(id).unwrap_or(NULL_SLOT))
     }
 
-    /// Find the first empty slot and return its cptr.
-    pub fn alloc_slot(&mut self) -> Result<u64, ErrorCode> {
-        for (i, slot) in self.root.slots.iter().enumerate() {
-            if matches!(slot.cap_type, CapType::Null) {
-                return Ok(i as u64);
-            }
+    pub(super) fn move_cap(&mut self, source: u64, dest: u64) -> Result<(), ErrorCode> {
+        let source_index = self.index(source)?;
+        let dest_index = self.index(dest)?;
+        let id = self.slots[source_index].ok_or(ErrorCode::InvalidCap)?;
+        let tree = DERIVATIONS.lock();
+        if !tree.nodes.contains_key(&id) {
+            return Err(ErrorCode::InvalidCap);
         }
-        Err(ErrorCode::NoMemory)
+        self.vacant(dest_index, &tree)?;
+        self.slots[dest_index] = self.slots[source_index].take();
+        Ok(())
+    }
+
+    pub(crate) fn derive(
+        &mut self,
+        source: CapabilityId,
+        dest: u64,
+        rights: CapRights,
+        badge: u64,
+    ) -> Result<(), ErrorCode> {
+        let index = self.index(dest)?;
+        let mut tree = DERIVATIONS.lock();
+        self.vacant(index, &tree)?;
+        self.slots[index] = Some(tree.derive(source, rights, badge)?);
+        Ok(())
+    }
+
+    pub(crate) fn revoke(&mut self, source: u64) -> Result<(), ErrorCode> {
+        let id = self.capability_id(source)?;
+        DERIVATIONS.lock().revoke(id);
+        Ok(())
+    }
+
+    /// Find the first usable slot, including slots invalidated by revocation.
+    pub fn alloc_slot(&self) -> Result<u64, ErrorCode> {
+        let tree = DERIVATIONS.lock();
+        self.slots
+            .iter()
+            .position(|slot| slot.is_none_or(|id| !tree.nodes.contains_key(&id)))
+            .map(|index| index as u64)
+            .ok_or(ErrorCode::NoMemory)
+    }
+
+    pub(super) fn require_vacant(&self, cptr: u64) -> Result<(), ErrorCode> {
+        self.vacant(self.index(cptr)?, &DERIVATIONS.lock())
+    }
+}
+
+impl Drop for CSpace {
+    fn drop(&mut self) {
+        let mut tree = DERIVATIONS.lock();
+        for id in self.slots.iter().flatten() {
+            tree.remove(*id);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ruzt_cap::{CapRights, CapSlot, EndpointId, FrameSize};
-    use ruzt_hal::mem::PhysAddr;
+    use ruzt_cap::EndpointId;
 
-    #[test]
-    fn cspace_new_all_null() {
-        let cspace = CSpace::new(4);
-        for i in 0..16 {
-            assert_eq!(cspace.lookup(i), Err(ErrorCode::InvalidCap));
-        }
+    fn endpoint(space: &mut CSpace, cptr: u64) -> KObjectId {
+        let id = object::allocate(CapType::Endpoint(EndpointId(0))).unwrap();
+        space
+            .insert(
+                cptr,
+                CapSlot {
+                    cap_type: CapType::Endpoint(EndpointId(id.0)),
+                    rights: CapRights::new(),
+                    badge: 0,
+                },
+            )
+            .unwrap();
+        id
     }
 
     #[test]
-    fn cspace_insert_and_lookup() {
-        let mut cspace = CSpace::new(4);
-        let slot = CapSlot {
-            cap_type: CapType::Endpoint(EndpointId(7)),
-            rights: CapRights::READ,
-            badge: 0,
-        };
-        cspace.insert(3, slot).unwrap();
-        let found = cspace.lookup(3).unwrap();
-        assert_eq!(found.cap_type, CapType::Endpoint(EndpointId(7)));
-        assert_eq!(found.rights, CapRights::READ);
+    fn copies_pin_objects_until_the_last_space_is_dropped() {
+        let _state = crate::isolated_kernel_state();
+        let mut a = CSpace::new(1);
+        let mut b = CSpace::new(1);
+        let object = endpoint(&mut a, 0);
+        b.derive(a.capability_id(0).unwrap(), 0, CapRights::READ, 42)
+            .unwrap();
+        drop(a);
+        assert!(object::get(object).is_some());
+        assert_eq!(b.lookup(0).unwrap().badge, 42);
+        drop(b);
+        assert!(object::get(object).is_none());
     }
 
     #[test]
-    fn cspace_delete_returns_old() {
-        let mut cspace = CSpace::new(4);
-        let slot = CapSlot {
-            cap_type: CapType::Endpoint(EndpointId(7)),
-            rights: CapRights::READ,
-            badge: 0,
-        };
-        cspace.insert(3, slot).unwrap();
-        let old = cspace.delete(3).unwrap();
-        assert_eq!(old.cap_type, CapType::Endpoint(EndpointId(7)));
-        assert_eq!(cspace.lookup(3), Err(ErrorCode::InvalidCap));
+    fn revoke_reaches_moved_grandchildren_after_deleting_their_parent() {
+        let _state = crate::isolated_kernel_state();
+        let mut a = CSpace::new(2);
+        let mut b = CSpace::new(2);
+        let object = endpoint(&mut a, 0);
+        let original = a.capability_id(0).unwrap();
+        let rights = CapRights::GRANT.union(CapRights::READ);
+        b.derive(original, 0, rights, 0).unwrap();
+        let child = b.capability_id(0).unwrap();
+        b.derive(child, 1, CapRights::READ, 7).unwrap();
+        b.move_cap(1, 2).unwrap();
+        b.delete(0).unwrap();
+        b.derive(original, 3, CapRights::READ, 8).unwrap();
+
+        a.revoke(0).unwrap();
+        assert_eq!(b.lookup(2), Err(ErrorCode::InvalidCap));
+        assert_eq!(b.lookup(3), Err(ErrorCode::InvalidCap));
+        b.derive(original, 2, CapRights::READ, 0).unwrap();
+        assert!(object::get(object).is_some());
+        assert_eq!(a.lookup(0).unwrap().rights, CapRights::new());
     }
 
     #[test]
-    fn cspace_lookup_empty_returns_invalid_cap() {
-        let cspace = CSpace::new(4);
-        assert_eq!(cspace.lookup(5), Err(ErrorCode::InvalidCap));
+    fn occupied_slots_and_failed_rights_checks_leave_both_caps_live() {
+        let _state = crate::isolated_kernel_state();
+        let mut space = CSpace::new(2);
+        endpoint(&mut space, 0);
+        endpoint(&mut space, 1);
+        let authority = space.capability_id(0).unwrap();
+        assert_eq!(space.move_cap(0, 1), Err(ErrorCode::SlotOccupied));
+        assert_eq!(space.move_cap(0, u64::MAX), Err(ErrorCode::InvalidCap));
+        assert_eq!(space.capability_id(0), Ok(authority));
+        assert_eq!(
+            space.derive(authority, 1, CapRights::READ, 0),
+            Err(ErrorCode::SlotOccupied)
+        );
+        space.derive(authority, 2, CapRights::READ, 0).unwrap();
+        let restricted = space.capability_id(2).unwrap();
+        assert_eq!(
+            space.derive(restricted, 3, CapRights::READ, 0),
+            Err(ErrorCode::CapRightsViolation)
+        );
+        assert_eq!(space.alloc_slot(), Ok(3));
     }
 
     #[test]
-    fn cspace_lookup_out_of_bounds() {
-        let cspace = CSpace::new(4);
-        assert_eq!(cspace.lookup(100), Err(ErrorCode::InvalidCap));
-    }
-
-    #[test]
-    fn cspace_alloc_slot() {
-        let mut cspace = CSpace::new(4);
-        let cptr = cspace.alloc_slot().unwrap();
-        assert_eq!(cptr, 0);
-        cspace.insert(0, CapSlot {
-            cap_type: CapType::Endpoint(EndpointId(1)),
-            rights: CapRights::READ,
-            badge: 0,
-        }).unwrap();
-        let cptr2 = cspace.alloc_slot().unwrap();
-        assert_eq!(cptr2, 1);
-    }
-
-    #[test]
-    fn cspace_alloc_slot_full() {
-        let mut cspace = CSpace::new(2);
-        for i in 0..4 {
-            cspace.insert(i, CapSlot {
-                cap_type: CapType::Endpoint(EndpointId(i as u64)),
-                rights: CapRights::READ,
-                badge: 0,
-            }).unwrap();
-        }
-        assert_eq!(cspace.alloc_slot(), Err(ErrorCode::NoMemory));
-    }
-
-    #[test]
-    fn cspace_retype_untyped_to_frame() {
-        let mut cspace = CSpace::new(4);
-        let frame = ruzt_hal::mem::PhysFrame::from_base(PhysAddr::new(0x3000)).unwrap();
-        let untyped = CapSlot {
-            cap_type: CapType::Untyped { phys: frame, size_bits: 12 },
-            rights: CapRights::new(),
-            badge: 0,
-        };
-        cspace.insert(0, untyped).unwrap();
-
-        let old = cspace.delete(0).unwrap();
-        assert!(matches!(old.cap_type, CapType::Untyped { size_bits: 12, .. }));
-
-        let new_slot = CapSlot {
-            cap_type: CapType::Frame { phys: frame, size: FrameSize::Size4K },
-            rights: CapRights::READ,
-            badge: 0,
-        };
-        cspace.insert(0, new_slot).unwrap();
-        let found = cspace.lookup(0).unwrap();
-        assert!(matches!(found.cap_type, CapType::Frame { size: FrameSize::Size4K, .. }));
+    fn derivation_cannot_expand_rights_or_replace_a_badge() {
+        let _state = crate::isolated_kernel_state();
+        let mut space = CSpace::new(2);
+        endpoint(&mut space, 0);
+        let rights = CapRights::READ.union(CapRights::GRANT);
+        space
+            .derive(space.capability_id(0).unwrap(), 1, rights, 42)
+            .unwrap();
+        let child = space.capability_id(1).unwrap();
+        assert_eq!(
+            space.derive(child, 2, CapRights::WRITE, 42),
+            Err(ErrorCode::CapRightsViolation)
+        );
+        assert_eq!(
+            space.derive(child, 2, CapRights::READ, 7),
+            Err(ErrorCode::CapRightsViolation)
+        );
+        space.derive(child, 2, CapRights::READ, 42).unwrap();
+        assert_eq!(space.lookup(2).unwrap().badge, 42);
     }
 }
