@@ -81,7 +81,10 @@ pub fn main(boot_info: &'static mut BootInfo) -> ! {
 
     #[allow(unsafe_code)]
     // SAFETY: Single boot CPU, before interrupts and IDT initialization.
-    unsafe { ruzt_hal_x86_64::gdt::init() };
+    unsafe {
+        ruzt_hal_x86_64::gdt::init();
+        ruzt_hal_x86_64::context::init_fp();
+    }
     serial_println!("GDT+TSS initialised.");
 
     serial_println!("Ruzt booting...");

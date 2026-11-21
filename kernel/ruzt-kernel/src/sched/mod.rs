@@ -5,6 +5,7 @@ use crate::process::UserProcess;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
+use ruzt_hal_x86_64::context::FpState;
 use spin::Mutex;
 
 /// Opaque handle for a scheduler thread.
@@ -31,6 +32,8 @@ struct Thread {
     stack: Option<alloc::boxed::Box<[u8]>>,
     /// Saved stack pointer from the last context switch.
     rsp: u64,
+    /// Saved architectural floating-point context.
+    fp: FpState,
     /// Current scheduling state.
     state: ThreadState,
     /// IPC message buffer for rendezvous delivery.
@@ -80,6 +83,7 @@ pub fn init() {
     sched.threads.push(alloc::boxed::Box::new(Thread {
         stack: None,
         rsp: 0,
+        fp: FpState::default(),
         state: ThreadState::Runnable,
         message: None,
         user: None,
@@ -193,6 +197,7 @@ fn spawn_thread(f: fn() -> !, user: Option<UserProcess>) -> ThreadId {
     sched.threads.push(alloc::boxed::Box::new(Thread {
         stack: Some(stack),
         rsp,
+        fp: FpState::default(),
         state: ThreadState::Runnable,
         message: None,
         user,
@@ -240,9 +245,12 @@ pub fn yield_thread() {
 #[allow(unsafe_code)]
 fn switch_to(mut guard: spin::MutexGuard<'_, Option<Scheduler>>, next_id: ThreadId) {
     let sched = guard.as_mut().expect("scheduler not initialised");
-    let old_rsp = &mut sched.threads[sched.current].rsp as *mut u64;
+    let current = &mut sched.threads[sched.current];
+    let old_rsp = &mut current.rsp as *mut u64;
+    let old_fp = &mut current.fp as *mut FpState;
     let next = &sched.threads[next_id];
     let new_rsp = next.rsp;
+    let new_fp = &next.fp as *const FpState;
     let new_cr3 = if let Some(user) = &next.user {
         let stack = next
             .stack
@@ -258,9 +266,9 @@ fn switch_to(mut guard: spin::MutexGuard<'_, Option<Scheduler>>, next_id: Thread
     };
     sched.current = next_id;
     drop(guard);
-    // SAFETY: The scheduler owns both live kernel stacks. The next root maps
-    // both stacks, the switch code and all other higher-half kernel mappings.
-    unsafe { ruzt_hal_x86_64::context::switch(old_rsp, new_rsp, new_cr3) };
+    // SAFETY: Both thread records are pinned in separate boxes, and the boot
+    // kernel heap, the switch code, and both stacks are mapped in both roots.
+    unsafe { ruzt_hal_x86_64::context::switch(old_rsp, new_rsp, new_cr3, old_fp, new_fp) };
 }
 
 #[cfg(test)]

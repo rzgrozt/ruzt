@@ -1,6 +1,43 @@
 //! x86_64 context switch.
 
 use crate::gdt::{USER_CODE_SELECTOR, USER_DATA_SELECTOR};
+use x86_64::registers::control::{Cr0, Cr0Flags, Cr4, Cr4Flags};
+
+/// The x87, MMX, and SSE state of one thread.
+#[repr(C, align(16))]
+pub struct FpState([u8; 512]);
+
+impl Default for FpState {
+    fn default() -> Self {
+        // Intel SDM Vol. 1, FXSAVE/FXRSTOR layout and reset state.
+        // The x87 tag word is empty, and the SSE registers are zero.
+        let mut bytes = [0; 512];
+        bytes[..2].copy_from_slice(&0x037fu16.to_le_bytes());
+        bytes[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
+        Self(bytes)
+    }
+}
+
+/// Enable the register state supported by the context switch.
+///
+/// # Safety
+/// Call once on the boot CPU before running user code or switching threads.
+/// Kernel code must use the soft-float target, including interrupt handlers.
+pub unsafe fn init_fp() {
+    // SAFETY: At boot no thread owns the CPU's floating-point state. FXSAVE
+    // is available on x86_64. Keep extended state and user TLS base writes
+    // disabled until the scheduler can preserve them.
+    unsafe {
+        Cr4::update(|flags| {
+            flags.insert(Cr4Flags::OSFXSR | Cr4Flags::OSXMMEXCPT_ENABLE);
+            flags.remove(Cr4Flags::OSXSAVE | Cr4Flags::FSGSBASE);
+        });
+        Cr0::update(|flags| {
+            flags.insert(Cr0Flags::MONITOR_COPROCESSOR | Cr0Flags::NUMERIC_ERROR);
+            flags.remove(Cr0Flags::EMULATE_COPROCESSOR | Cr0Flags::TASK_SWITCHED);
+        });
+    }
+}
 
 /// Read the active page-table root and its CR3 flags.
 pub fn current_cr3() -> u64 {
@@ -40,18 +77,25 @@ pub unsafe fn init_stack(stack: &mut [u8], entry: fn() -> !) -> u64 {
 
 /// Perform a context switch.
 ///
-/// Saves the current thread's callee-saved registers, stores the current
-/// stack pointer in `*old_rsp`, loads `new_rsp`, restores the new thread's
-/// callee-saved registers, and returns into the new thread.
+/// Saves the current stack and floating-point state and restores the next
+/// thread's address space, stack, and registers.
 ///
 /// # Safety
 /// - `old_rsp` must point to a valid, writable `u64`.
 /// - `new_rsp` must be a valid stack pointer initialised by [`init_stack`].
 /// - `new_cr3` must be valid and map the kernel and both kernel stacks.
+/// - `old_fp` and `new_fp` must point to distinct, aligned kernel-owned
+///   states mapped in both address spaces. Call [`init_fp`] before switching.
 /// - Interrupts must be disabled by the caller.
 /// - The current thread's stack must remain live until the thread is resumed.
 #[unsafe(naked)]
-pub unsafe extern "C" fn switch(_old_rsp: *mut u64, _new_rsp: u64, _new_cr3: u64) {
+pub unsafe extern "C" fn switch(
+    _old_rsp: *mut u64,
+    _new_rsp: u64,
+    _new_cr3: u64,
+    _old_fp: *mut FpState,
+    _new_fp: *const FpState,
+) {
     // SAFETY: [Categories 3/6/10/13 - Dangling, alignment, bounds, library
     // contract] The caller provides writable `rdi`, a frame-aligned `rsi`
     // created by `init_stack` or `switch`, and disabled interrupts. Each push,
@@ -64,11 +108,13 @@ pub unsafe extern "C" fn switch(_old_rsp: *mut u64, _new_rsp: u64, _new_cr3: u64
         "push r14",
         "push r15",
         "mov [rdi], rsp",
+        "fxsave64 [rcx]",
         "mov rax, cr3",
         "cmp rax, rdx",
         "je 2f",
         "mov cr3, rdx",
         "2:",
+        "fxrstor64 [r8]",
         "mov rsp, rsi",
         "pop r15",
         "pop r14",
