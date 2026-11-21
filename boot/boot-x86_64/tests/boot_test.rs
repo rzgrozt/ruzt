@@ -101,6 +101,51 @@ enum Services {
     None,
     Console,
     CpuBoundConsole,
+    FaultingConsole,
+    ExitingConsole,
+}
+
+#[test]
+fn test_user_fault_closes_ipc_and_keeps_the_other_process_running() {
+    assert_console_shutdown_isolated(Services::FaultingConsole, "instruction exception");
+}
+
+#[test]
+fn test_user_exit_closes_ipc_and_keeps_the_other_process_running() {
+    assert_console_shutdown_isolated(Services::ExitingConsole, "exit status 23");
+}
+
+fn assert_console_shutdown_isolated(services: Services, reason: &str) {
+    let temp = tempfile::tempdir().expect("Failed to create boot test directory");
+    let disk_image = build_image(temp.path(), "qemu-rootsrv-test", services);
+    let serial_path = temp.path().join("serial.log");
+    let mut vm = start_guest(&disk_image, &serial_path);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    wait_for_serial(
+        &mut vm.0,
+        &serial_path,
+        "rootsrv thread waiting for keyboard IRQ",
+        deadline,
+    );
+    monitor(&mut vm.0, "sendkey spc");
+    let serial = wait_for_serial(
+        &mut vm.0,
+        &serial_path,
+        "rootsrv: Space key received",
+        deadline,
+    );
+    monitor(&mut vm.0, "quit");
+    assert!(vm.0.wait().expect("Failed to wait for QEMU").success());
+    assert_markers(
+        &serial,
+        &[
+            &format!("user process consoled terminated: {reason}"),
+            "reaped user process consoled",
+            "rootsrv: console disconnected",
+            "rootsrv thread waiting for keyboard IRQ",
+            "rootsrv: Space key received",
+        ],
+    );
 }
 
 fn build_image(temp: &Path, kernel_feature: &str, services: Services) -> PathBuf {
@@ -129,9 +174,14 @@ fn build_image(temp: &Path, kernel_feature: &str, services: Services) -> PathBuf
             ])
             .arg(&build_dir)
             .current_dir(workspace.join("servers"));
-        if matches!(services, Services::CpuBoundConsole) {
-            build.args(["--features", "consoled/qemu-preemption-test"]);
-        }
+        match services {
+            Services::CpuBoundConsole => {
+                build.args(["--features", "consoled/qemu-preemption-test"])
+            }
+            Services::FaultingConsole => build.args(["--features", "consoled/qemu-fault-test"]),
+            Services::ExitingConsole => build.args(["--features", "consoled/qemu-exit-test"]),
+            _ => &mut build,
+        };
         let status = build.status().expect("Failed to build boot services");
         assert!(status.success(), "Boot services build failed: {status}");
     }

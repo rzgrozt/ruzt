@@ -33,7 +33,10 @@ pub enum KernelObject {
     /// Empty slot.
     Null,
     /// IPC endpoint. Waiters live in the scheduler.
-    Endpoint,
+    Endpoint {
+        /// The peer of a boot channel has exited.
+        closed: bool,
+    },
     /// Async notification object.
     Notification {
         /// Whether a signal arrived while nobody was waiting.
@@ -120,6 +123,13 @@ pub fn get(id: KObjectId) -> Option<KernelObject> {
     guard.get(id.0 as usize).and_then(|opt| *opt)
 }
 
+pub(crate) fn close_endpoint(id: KObjectId) {
+    let mut guard = TABLE.lock();
+    if let Some(Some(KernelObject::Endpoint { closed })) = guard.get_mut(id.0 as usize) {
+        *closed = true;
+    }
+}
+
 /// Zero the slot at `id` and, if it was a CNode, reclaim the heap-allocated
 /// slot array.
 pub fn deallocate(id: KObjectId) {
@@ -152,7 +162,7 @@ pub fn set_notification_state(id: KObjectId, new_state: bool) {
 fn kernel_object_from_cap_type(cap_type: CapType) -> Result<KernelObject, ErrorCode> {
     match cap_type {
         CapType::Null => Err(ErrorCode::InvalidCap),
-        CapType::Endpoint(_) => Ok(KernelObject::Endpoint),
+        CapType::Endpoint(_) => Ok(KernelObject::Endpoint { closed: false }),
         CapType::Notification(_) => Ok(KernelObject::Notification { state: false }),
         CapType::Thread(thread_id) => Ok(KernelObject::Thread {
             thread_id: thread_id.0 as usize,
@@ -208,7 +218,7 @@ mod tests {
         let _state = crate::isolated_kernel_state();
         let id = allocate(CapType::Endpoint(EndpointId(0))).unwrap();
         let obj = get(id).unwrap();
-        assert!(matches!(obj, KernelObject::Endpoint));
+        assert!(matches!(obj, KernelObject::Endpoint { closed: false }));
     }
 
     #[test]

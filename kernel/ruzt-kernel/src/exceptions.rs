@@ -1,10 +1,10 @@
 //! x86_64 interrupt descriptor table and exception handlers.
 
-use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
-use spin::Once;
 use crate::serial_println;
 use ruzt_hal::cpu::CpuOps;
 use ruzt_hal::time::Timer;
+use spin::Once;
+use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
 /// Static IDT, initialised once.
 static IDT: Once<InterruptDescriptorTable> = Once::new();
@@ -21,6 +21,20 @@ pub fn init_idt() {
         idt.breakpoint.set_handler_fn(breakpoint_handler);
         idt.double_fault.set_handler_fn(double_fault_handler);
         idt.page_fault.set_handler_fn(page_fault_handler);
+        idt.divide_error.set_handler_fn(arithmetic_fault);
+        idt.x87_floating_point.set_handler_fn(arithmetic_fault);
+        idt.simd_floating_point.set_handler_fn(arithmetic_fault);
+        idt.debug.set_handler_fn(instruction_fault);
+        idt.overflow.set_handler_fn(arithmetic_fault);
+        idt.bound_range_exceeded.set_handler_fn(arithmetic_fault);
+        idt.invalid_opcode.set_handler_fn(instruction_fault);
+        idt.device_not_available.set_handler_fn(instruction_fault);
+        idt.invalid_tss.set_handler_fn(protection_fault);
+        idt.segment_not_present.set_handler_fn(protection_fault);
+        idt.stack_segment_fault.set_handler_fn(protection_fault);
+        idt.general_protection_fault
+            .set_handler_fn(protection_fault);
+        idt.alignment_check.set_handler_fn(protection_fault);
         idt[32].set_handler_fn(timer_handler);
         idt[33].set_handler_fn(keyboard_handler);
         unsafe {
@@ -66,7 +80,10 @@ extern "C" fn syscall_handler() {
 }
 
 extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
-    serial_println!("EXCEPTION: BREAKPOINT @ {:?}", stack_frame.instruction_pointer);
+    serial_println!(
+        "EXCEPTION: BREAKPOINT @ {:?}",
+        stack_frame.instruction_pointer
+    );
 }
 
 extern "x86-interrupt" fn double_fault_handler(
@@ -83,12 +100,29 @@ extern "x86-interrupt" fn page_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
-    serial_println!("EXCEPTION: PAGE FAULT");
-    serial_println!("Error Code: {:?}", error_code);
-    serial_println!("{:#?}", stack_frame);
-    loop {
-        ruzt_hal_x86_64::cpu::X86_64Cpu::cpu_idle();
+    fatal_fault(stack_frame, format_args!("page fault ({error_code:?})"));
+}
+
+extern "x86-interrupt" fn arithmetic_fault(frame: InterruptStackFrame) {
+    fatal_fault(frame, format_args!("arithmetic exception"));
+}
+
+extern "x86-interrupt" fn instruction_fault(frame: InterruptStackFrame) {
+    fatal_fault(frame, format_args!("instruction exception"));
+}
+
+extern "x86-interrupt" fn protection_fault(frame: InterruptStackFrame, code: u64) {
+    fatal_fault(frame, format_args!("protection fault ({code:#x})"));
+}
+
+fn fatal_fault(frame: InterruptStackFrame, reason: core::fmt::Arguments<'_>) -> ! {
+    if frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
+        crate::process::terminate_current(format_args!(
+            "{reason} at {:?}",
+            frame.instruction_pointer
+        ));
     }
+    panic!("kernel {reason}\n{frame:#?}");
 }
 
 #[allow(unsafe_code)]

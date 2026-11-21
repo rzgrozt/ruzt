@@ -110,12 +110,47 @@ fn convert_map_error(error: MapToError<Size4KiB>) -> MapError {
 pub struct X86_64Mapper {
     inner: OffsetPageTable<'static>,
     alloc: fn() -> Option<PhysFrame>,
-    /// Currently unused — the x86_64 crate's `FrameAllocator` only allocates.
-    /// Reserved for future page-table frame reclamation.
-    _dealloc: fn(PhysFrame),
+    dealloc: fn(PhysFrame),
 }
 
 impl X86_64Mapper {
+    /// Free an inactive user root and the page tables owned by its lower half.
+    ///
+    /// Mapped leaf frames and the shared supervisor tables stay with their owners.
+    ///
+    /// # Safety
+    /// The caller must own the root returned by [`Self::create_user_address_space`].
+    /// The scheduler must have stopped using the root on every CPU. Its lower
+    /// half must contain only private page tables built by this mapper.
+    pub unsafe fn destroy_user_address_space(&mut self, root: PhysFrame) {
+        assert_ne!(Cr3::read().0.start_address().as_u64(), root.base.as_u64());
+        // SAFETY: The caller owns the inactive root and all its lower-half tables.
+        unsafe { self.free_user_tables(root, 4) };
+    }
+
+    unsafe fn free_user_tables(&mut self, frame: PhysFrame, level: u8) {
+        if level > 1 {
+            // SAFETY: This owned frame is a populated page table covered by
+            // the boot physmap. No CPU can walk it during destruction.
+            let table = unsafe { &*frame_pointer(frame).cast::<PageTable>() };
+            let count = if level == 4 { 256 } else { 512 };
+            for entry in table.iter().take(count) {
+                let flags = entry.flags();
+                if flags.contains(PageTableFlags::PRESENT) {
+                    assert!(!flags.contains(PageTableFlags::HUGE_PAGE));
+                    let child = PhysFrame::from_base(PhysAddr::new(entry.addr().as_u64()))
+                        .expect("aligned child page table");
+                    // SAFETY: Present non-leaf entries in the private part
+                    // of the tree name exclusive child page tables.
+                    unsafe { self.free_user_tables(child, level - 1) };
+                }
+            }
+        }
+        // SAFETY: The table is still exclusively owned until deallocation.
+        unsafe { zero_frame(frame) };
+        (self.dealloc)(frame);
+    }
+
     /// Allocate an empty user PML4 that shares only the active kernel half.
     ///
     /// # Errors
@@ -412,7 +447,7 @@ pub unsafe fn init(
         // for the mapper's static lifetime.
         let inner = unsafe { OffsetPageTable::new(page_table, offset) };
 
-        let mapper = X86_64Mapper { inner, alloc, _dealloc: dealloc };
+        let mapper = X86_64Mapper { inner, alloc, dealloc };
         MAPPER.lock().write(mapper);
     });
 }

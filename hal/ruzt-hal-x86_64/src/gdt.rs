@@ -148,6 +148,15 @@ pub unsafe fn set_trap_stack(top: u64) {
     }
 }
 
+/// Restore the boot CPU's fallback privilege stack.
+///
+/// # Safety
+/// Call on the boot CPU with interrupts disabled.
+pub unsafe fn use_boot_trap_stack() {
+    // SAFETY: The static fallback stack lives for the kernel's lifetime.
+    unsafe { set_trap_stack(RING3_TRAP_STACK.top().as_u64()) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -16,7 +16,7 @@ const LENGTH_OFFSET: usize = offset_of!(IpcMessage, length);
 pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
     let (root, capability, framebuffer) = sched::with_current_user(|process| {
         let capability = *process.cspace.lookup(args.arg0)?;
-        Ok::<_, ErrorCode>((process.root, capability, process.framebuffer))
+        Ok::<_, ErrorCode>((process.root(), capability, process.framebuffer))
     })
     .ok_or(ErrorCode::InvalidCap)??;
     // Capability lookup is complete and the scheduler lock is released before

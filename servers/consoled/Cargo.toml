@@ -5,6 +5,8 @@ edition = "2021"
 
 [features]
 qemu-preemption-test = []
+qemu-fault-test = []
+qemu-exit-test = []
 
 [dependencies]
 ruzt-abi = { path = "../../crates/ruzt-abi" }

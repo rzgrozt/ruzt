@@ -9,9 +9,12 @@ use ruzt_cap::{CapSlot, CapType, EndpointId};
 use crate::cap::{cspace::CSpace, object};
 use crate::{keyboard, serial};
 
-pub(super) fn initial_services() -> (CSpace, CSpace) {
+pub(super) fn initial_services() -> ([EndpointId; 2], CSpace, CSpace) {
     let request = endpoint();
     let reply = endpoint();
+    let channels = [request, reply];
+    let request = CapType::Endpoint(request);
+    let reply = CapType::Endpoint(reply);
     let mut rootsrv = CSpace::new(3);
     grant(
         &mut rootsrv,
@@ -54,13 +57,13 @@ pub(super) fn initial_services() -> (CSpace, CSpace) {
         },
         CapRights::READ,
     );
-    (rootsrv, consoled)
+    (channels, rootsrv, consoled)
 }
 
-fn endpoint() -> CapType {
+fn endpoint() -> EndpointId {
     let id =
         object::allocate(CapType::Endpoint(EndpointId(0))).expect("allocate boot service endpoint");
-    CapType::Endpoint(EndpointId(id.0))
+    EndpointId(id.0)
 }
 
 pub(super) fn grant(cspace: &mut CSpace, index: u64, cap_type: CapType, rights: CapRights) {

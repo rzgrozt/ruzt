@@ -60,3 +60,12 @@ pub fn debug_putchar(byte: u8) {
         )
     };
 }
+
+/// Terminate the calling user task.
+pub fn exit(status: u32) -> ! {
+    // SAFETY: Exit takes a scalar status and has no memory operands.
+    let _ = unsafe { syscall(SyscallNumber::Exit, u64::from(status), 0, 0, 0, 0, 0) };
+    loop {
+        core::hint::spin_loop();
+    }
+}

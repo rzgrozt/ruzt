@@ -151,7 +151,9 @@ fn idle_loop() -> ! {
     loop {
         if crate::sched::should_switch() {
             let _guard = ruzt_hal_x86_64::cpu::X86_64Cpu::disable_interrupts();
+            crate::sched::reap_retired_user();
             crate::sched::yield_thread();
+            continue;
         }
         ruzt_hal_x86_64::cpu::X86_64Cpu::cpu_idle();
     }

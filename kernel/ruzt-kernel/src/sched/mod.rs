@@ -5,6 +5,7 @@ use crate::process::UserProcess;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
+use ruzt_abi::ErrorCode;
 use ruzt_hal_x86_64::context::FpState;
 use spin::Mutex;
 
@@ -24,6 +25,8 @@ pub enum ThreadState {
     BlockedWait(KObjectId),
     /// A user driver is blocked waiting for a device interrupt.
     BlockedIrq(u32),
+    /// The task has terminated and will never run again.
+    Exited,
 }
 
 /// Per-thread state.
@@ -38,6 +41,8 @@ struct Thread {
     state: ThreadState,
     /// IPC message buffer for rendezvous delivery.
     message: Option<ruzt_abi::IpcMessage>,
+    /// A failure delivered instead of a message when an endpoint closes.
+    ipc_error: Option<ErrorCode>,
     /// Address space and capabilities of a user-mode thread.
     user: Option<UserProcess>,
 }
@@ -50,6 +55,7 @@ struct Scheduler {
     wait_queue: VecDeque<ThreadId>,
     current: ThreadId,
     kernel_cr3: u64,
+    retired: Option<ThreadId>,
 }
 
 impl Scheduler {
@@ -60,7 +66,10 @@ impl Scheduler {
     }
 
     fn mark_runnable(&mut self, id: ThreadId) {
-        if self.threads[id].state != ThreadState::Runnable {
+        if !matches!(
+            self.threads[id].state,
+            ThreadState::Runnable | ThreadState::Exited
+        ) {
             self.wait_queue.retain(|&thread| thread != id);
             self.threads[id].state = ThreadState::Runnable;
             self.run_queue.push_back(id);
@@ -97,6 +106,7 @@ pub fn init() {
         wait_queue: VecDeque::new(),
         current: 0,
         kernel_cr3,
+        retired: None,
     };
     sched.threads.push(alloc::boxed::Box::new(Thread {
         stack: None,
@@ -104,6 +114,7 @@ pub fn init() {
         fp: FpState::default(),
         state: ThreadState::Runnable,
         message: None,
+        ipc_error: None,
         user: None,
     }));
     *guard = Some(sched);
@@ -149,6 +160,33 @@ pub(crate) fn first_waiter(reason: ThreadState) -> Option<ThreadId> {
         .find(|&id| sched.threads[id].state == reason)
 }
 
+pub(crate) fn cancel_endpoint_waiters(endpoint: KObjectId) {
+    let mut guard = SCHEDULER.lock();
+    let sched = guard.as_mut().expect("scheduler not initialised");
+    loop {
+        let waiter = sched.wait_queue.iter().copied().find(|&id| {
+            matches!(
+                sched.threads[id].state,
+                ThreadState::BlockedSend(object) | ThreadState::BlockedRecv(object)
+                    if object == endpoint
+            )
+        });
+        let Some(id) = waiter else { break };
+        sched.threads[id].ipc_error = Some(ErrorCode::NotFound);
+        sched.threads[id].message = None;
+        sched.mark_runnable(id);
+    }
+}
+
+pub(crate) fn check_ipc_completion() -> Result<(), ErrorCode> {
+    let mut guard = SCHEDULER.lock();
+    let sched = guard.as_mut().expect("scheduler not initialised");
+    sched.threads[sched.current]
+        .ipc_error
+        .take()
+        .map_or(Ok(()), Err)
+}
+
 pub(crate) fn wake_irq(thread_id: ThreadId, irq: u32) {
     let mut guard = SCHEDULER.lock();
     let sched = guard.as_mut().expect("scheduler not initialised");
@@ -162,6 +200,49 @@ pub(crate) fn with_current_user<T>(f: impl FnOnce(&mut UserProcess) -> T) -> Opt
     let mut guard = SCHEDULER.lock();
     let sched = guard.as_mut()?;
     sched.threads[sched.current].user.as_mut().map(f)
+}
+
+/// Leave the dying task on its own stack until the idle thread can reap it.
+/// Called from a syscall or user fault with interrupts disabled.
+pub(crate) fn retire_current_user() -> ! {
+    let mut guard = SCHEDULER.lock();
+    let sched = guard.as_mut().expect("scheduler not initialised");
+    let id = sched.current;
+    assert!(sched.threads[id].user.is_some());
+    assert!(sched.retired.is_none());
+    sched.run_queue.retain(|&thread| thread != id);
+    sched.threads[id].state = ThreadState::Exited;
+    sched.retired = Some(id);
+    request_switch();
+    switch_to(guard, 0);
+    unreachable!("exited thread resumed");
+}
+
+pub(crate) fn reap_retired_user() {
+    let (user, stack) = {
+        let mut guard = SCHEDULER.lock();
+        let sched = guard.as_mut().expect("scheduler not initialised");
+        let Some(id) = sched.retired.take() else {
+            return;
+        };
+        assert_eq!(sched.current, 0);
+        let retired = &mut sched.threads[id];
+        retired.fp = FpState::default();
+        (
+            retired.user.take().expect("retired user task"),
+            retired.stack.take(),
+        )
+    };
+    #[allow(unsafe_code)]
+    // SAFETY: Idle is running on its boot stack with interrupts disabled.
+    // Restore RSP0 before releasing the task's former privilege stack.
+    unsafe {
+        ruzt_hal_x86_64::gdt::use_boot_trap_stack()
+    };
+    let name = user.name;
+    drop(user);
+    drop(stack);
+    crate::serial_println!("reaped user process {name}");
 }
 
 /// Return the current thread's ID.
@@ -221,6 +302,7 @@ fn spawn_thread(f: fn() -> !, user: Option<UserProcess>) -> ThreadId {
         fp: FpState::default(),
         state: ThreadState::Runnable,
         message: None,
+        ipc_error: None,
         user,
     }));
     sched.run_queue.push_back(id);
@@ -267,7 +349,7 @@ fn switch_to(mut guard: spin::MutexGuard<'_, Option<Scheduler>>, next_id: Thread
         // SAFETY: Interrupts are disabled, and this owned kernel stack lies in
         // the common supervisor mapping of every supported page-table root.
         unsafe { ruzt_hal_x86_64::gdt::set_trap_stack(stack_top) };
-        user.root.base.as_u64()
+        user.root().base.as_u64()
     } else {
         sched.kernel_cr3
     };

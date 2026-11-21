@@ -20,6 +20,16 @@ fn main() -> ! {
     loop {
         let mut request = IpcMessage::default();
         ruzt_ipc::recv(console::REQUEST, &mut request).expect("receive console request");
+        #[cfg(feature = "qemu-fault-test")]
+        if request.label == console::WRITE {
+            // SAFETY: This test deliberately raises an instruction fault in
+            // the guest's user mode. The task must never resume at this site.
+            unsafe { core::arch::asm!("ud2", options(noreturn, nomem, nostack)) }
+        }
+        #[cfg(feature = "qemu-exit-test")]
+        if request.label == console::WRITE {
+            ruzt_runtime::syscall::exit(23);
+        }
         let reply = IpcMessage {
             label: match request.label {
                 console::WRITE => {

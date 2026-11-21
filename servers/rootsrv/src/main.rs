@@ -20,7 +20,7 @@ fn write_line(text: &str) {
     }
 }
 
-fn greet_via_console() {
+fn greet_via_console() -> Result<(), ErrorCode> {
     let ungranted = u64::MAX;
     let payload = b"Hello from ring 3, rootsrv alive.\n";
     let mut request = IpcMessage::default();
@@ -46,16 +46,21 @@ fn greet_via_console() {
         Err(ErrorCode::CapRightsViolation)
     );
 
-    ruzt_ipc::send(ROOTSRV_CONSOLE_REQUEST, &request).expect("send greeting to console");
-    ruzt_ipc::recv(ROOTSRV_CONSOLE_REPLY, &mut reply).expect("receive console acknowledgement");
+    ruzt_ipc::send(ROOTSRV_CONSOLE_REQUEST, &request)?;
+    ruzt_ipc::recv(ROOTSRV_CONSOLE_REPLY, &mut reply)?;
     assert_eq!(reply.label, console::WRITTEN);
     assert_eq!(reply.length, 0);
     write_line("rootsrv: console write acknowledged over IPC");
     write_line("rootsrv: console endpoint rights verified");
+    Ok(())
 }
 
 fn main() -> ! {
-    greet_via_console();
+    match greet_via_console() {
+        Ok(()) => {}
+        Err(ErrorCode::NotFound) => write_line("rootsrv: console disconnected"),
+        Err(error) => panic!("console IPC failed: {error:?}"),
+    }
 
     assert_eq!(
         ruzt_driver_sdk::wait_irq(u64::MAX),

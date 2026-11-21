@@ -1,11 +1,11 @@
 //! PS/2 keyboard scancode handling.
 
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use x86_64::instructions::port::PortReadOnly;
 
 static SCANCODE_READY: AtomicBool = AtomicBool::new(false);
 static SCANCODE: AtomicU8 = AtomicU8::new(0);
-static USER_DRIVER: spin::Once<crate::sched::ThreadId> = spin::Once::new();
+static USER_DRIVER: AtomicUsize = AtomicUsize::new(0);
 static IRQ_PENDING: AtomicBool = AtomicBool::new(false);
 
 pub(crate) const IRQ: u32 = 1;
@@ -13,7 +13,14 @@ pub(crate) const DATA_PORT: u16 = 0x60;
 
 /// Route the keyboard interrupt to the initial user process.
 pub(crate) fn enable_user_driver(thread: crate::sched::ThreadId) {
-    USER_DRIVER.call_once(|| thread);
+    assert_ne!(thread, 0);
+    assert_eq!(USER_DRIVER.swap(thread, Ordering::Relaxed), 0);
+}
+
+pub(crate) fn detach_user_driver(thread: crate::sched::ThreadId) {
+    if USER_DRIVER.compare_exchange(thread, 0, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        IRQ_PENDING.store(false, Ordering::Relaxed);
+    }
 }
 
 /// Sleep until the driver has an interrupt to handle.
@@ -35,7 +42,8 @@ pub(crate) fn wait_irq() {
 /// For the boot-time user driver, only records the interrupt.
 #[allow(unsafe_code)]
 pub fn on_interrupt() {
-    if let Some(&thread) = USER_DRIVER.get() {
+    let thread = USER_DRIVER.load(Ordering::Relaxed);
+    if thread != 0 {
         // The controller drops the IRQ line when the driver reads the byte.
         // On the edge-triggered PIC, no other interrupt arrives for that byte.
         IRQ_PENDING.store(true, Ordering::Relaxed);

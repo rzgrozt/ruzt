@@ -5,8 +5,9 @@ mod framebuffer;
 mod initrd;
 
 use crate::cap::cspace::CSpace;
+use alloc::vec::Vec;
 use ruzt_abi::{CapRights, FramebufferInfo, ROOTSRV_FRAMEBUFFER};
-use ruzt_cap::CapType;
+use ruzt_cap::{CapType, EndpointId};
 use ruzt_hal::boot::Framebuffer;
 use ruzt_hal::mem::{MapError, PageFlags, PhysFrame, VirtAddr};
 use ruzt_hal_x86_64::mapper::{self, X86_64Mapper};
@@ -41,11 +42,40 @@ fn initial_stack_pointer() -> u64 {
 }
 
 pub(crate) struct UserProcess {
-    pub(crate) root: PhysFrame,
+    space: UserAddressSpace,
     entry: u64,
-    name: &'static str,
+    pub(crate) name: &'static str,
     pub(crate) cspace: CSpace,
     pub(crate) framebuffer: Option<FramebufferInfo>,
+    pub(crate) boot_channels: [EndpointId; 2],
+}
+
+impl UserProcess {
+    pub(crate) fn root(&self) -> PhysFrame {
+        self.space.root
+    }
+}
+
+struct UserAddressSpace {
+    root: PhysFrame,
+    ram: Vec<PhysFrame>,
+}
+
+impl Drop for UserAddressSpace {
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        mapper::with_mapper(|mapper| {
+            // SAFETY: An address space can be dropped only during failed
+            // construction or after the scheduler permanently switches away.
+            unsafe { mapper.destroy_user_address_space(self.root) };
+        });
+        for frame in self.ram.drain(..) {
+            // SAFETY: These are owned allocator frames. No user table maps
+            // them after destroying the root. Device pages are never tracked.
+            unsafe { mapper::zero_frame(frame) };
+            crate::mm::frame::deallocate(frame);
+        }
+    }
 }
 
 /// Load the initial servers and enqueue them on the boot CPU.
@@ -55,10 +85,21 @@ pub(crate) struct UserProcess {
 pub(crate) fn enqueue_initial(archive: &'static [u8], framebuffer: Option<Framebuffer>) {
     let rootsrv = initrd::file(archive, b"rootsrv").expect("unable to load rootsrv from initrd");
     let consoled = initrd::file(archive, b"consoled").expect("unable to load consoled from initrd");
-    let (root_space, console_space) = boot_caps::initial_services();
-    enqueue("consoled", consoled, console_space, None);
-    let root = enqueue("rootsrv", rootsrv, root_space, framebuffer);
+    let (channels, root_space, console_space) = boot_caps::initial_services();
+    enqueue("consoled", consoled, console_space, None, channels);
+    let root = enqueue("rootsrv", rootsrv, root_space, framebuffer, channels);
     crate::keyboard::enable_user_driver(root);
+}
+
+pub(crate) fn terminate_current(reason: core::fmt::Arguments<'_>) -> ! {
+    let (name, channels) = crate::sched::with_current_user(|user| (user.name, user.boot_channels))
+        .expect("termination requires a user task");
+    crate::serial_println!("user process {name} terminated: {reason}");
+    for channel in channels {
+        crate::ipc::close_boot_channel(channel);
+    }
+    crate::keyboard::detach_user_driver(crate::sched::current_thread_id());
+    crate::sched::retire_current_user()
 }
 
 fn enqueue(
@@ -66,11 +107,44 @@ fn enqueue(
     image: &'static [u8],
     mut cspace: CSpace,
     framebuffer: Option<Framebuffer>,
+    boot_channels: [EndpointId; 2],
 ) -> crate::sched::ThreadId {
     let elf = crate::elf::load_elf(image).unwrap_or_else(|e| panic!("invalid {name} ELF: {e:?}"));
     assert_eq!(elf.stack_size as u64, STACK_REGION.page_count * PAGE_SIZE);
-    let (root, framebuffer) = mapper::with_mapper(|mapper| {
-        let root = mapper.create_user_address_space()?;
+    let (space, framebuffer) = map_image(&elf, framebuffer)
+        .unwrap_or_else(|e| panic!("failed to map {name} address space: {e:?}"));
+
+    if framebuffer.is_some() {
+        boot_caps::grant(
+            &mut cspace,
+            ROOTSRV_FRAMEBUFFER,
+            CapType::Framebuffer,
+            CapRights::WRITE,
+        );
+    }
+    crate::sched::spawn_user(
+        UserProcess {
+            space,
+            entry: elf.entry_point,
+            name,
+            cspace,
+            framebuffer,
+            boot_channels,
+        },
+        enter_user,
+    )
+}
+
+fn map_image(
+    elf: &crate::elf::LoadedElf,
+    framebuffer: Option<Framebuffer>,
+) -> Result<(UserAddressSpace, Option<FramebufferInfo>), MapError> {
+    let root = mapper::with_mapper(|mapper| mapper.create_user_address_space())?;
+    let mut space = UserAddressSpace {
+        root,
+        ram: Vec::new(),
+    };
+    let framebuffer = mapper::with_mapper(|mapper| {
         for segment in &elf.segments {
             if segment.mem_size == 0 {
                 continue;
@@ -89,7 +163,7 @@ fn enqueue(
                 };
                 map_page(
                     mapper,
-                    root,
+                    &mut space,
                     page,
                     segment.flags,
                     (copy_start - page) as usize,
@@ -100,40 +174,22 @@ fn enqueue(
 
         for region in [STACK_REGION, HEAP_REGION] {
             for page in (region.start..region.end().unwrap()).step_by(PhysFrame::SIZE) {
-                map_page(mapper, root, page, PageFlags::WRITABLE, 0, &[])?;
+                map_page(mapper, &mut space, page, PageFlags::WRITABLE, 0, &[])?;
             }
         }
-        let framebuffer = framebuffer
-            .map(|framebuffer| framebuffer::map(mapper, root, framebuffer))
-            .transpose()?
-            .flatten();
-        Ok::<_, MapError>((root, framebuffer))
-    })
-    .unwrap_or_else(|e| panic!("failed to map {name} address space: {e:?}"));
-
-    if framebuffer.is_some() {
-        boot_caps::grant(
-            &mut cspace,
-            ROOTSRV_FRAMEBUFFER,
-            CapType::Framebuffer,
-            CapRights::WRITE,
-        );
-    }
-    crate::sched::spawn_user(
-        UserProcess {
-            root,
-            entry: elf.entry_point,
-            name,
-            cspace,
-            framebuffer,
-        },
-        enter_user,
-    )
+        Ok::<_, MapError>(
+            framebuffer
+                .map(|framebuffer| framebuffer::map(mapper, root, framebuffer))
+                .transpose()?
+                .flatten(),
+        )
+    })?;
+    Ok((space, framebuffer))
 }
 
 fn enter_user() -> ! {
     let (entry, root, name) =
-        crate::sched::with_current_user(|user| (user.entry, user.root, user.name))
+        crate::sched::with_current_user(|user| (user.entry, user.root(), user.name))
             .expect("scheduled user process");
     crate::serial_println!("{name} process created, entering user mode...");
     #[allow(unsafe_code)]
@@ -149,23 +205,36 @@ fn enter_user() -> ! {
 #[allow(unsafe_code)]
 fn map_page(
     mapper: &mut X86_64Mapper,
-    root: PhysFrame,
+    space: &mut UserAddressSpace,
     page: u64,
     flags: PageFlags,
     offset: usize,
     bytes: &[u8],
 ) -> Result<(), MapError> {
+    space
+        .ram
+        .try_reserve(1)
+        .map_err(|_| MapError::FrameAllocationFailed)?;
     let frame = crate::mm::frame::allocate().ok_or(MapError::FrameAllocationFailed)?;
     // SAFETY: The allocator gives exclusive ownership of this physmapped
     // frame, and root is the inactive address space under construction.
     let result = unsafe {
         mapper::zero_frame(frame);
         mapper::copy_to_frame(frame, offset, bytes).and_then(|()| {
-            mapper.map_in_address_space(root, VirtAddr::new(page), frame, flags | PageFlags::USER)
+            mapper.map_in_address_space(
+                space.root,
+                VirtAddr::new(page),
+                frame,
+                flags | PageFlags::USER,
+            )
         })
     };
     if result.is_err() {
+        // SAFETY: A failed mapping leaves this leaf exclusively owned here.
+        unsafe { mapper::zero_frame(frame) };
         crate::mm::frame::deallocate(frame);
+    } else {
+        space.ram.push(frame);
     }
     result
 }

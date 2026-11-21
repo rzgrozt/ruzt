@@ -18,7 +18,5 @@ impl Write for DebugWriter {
 fn panic(info: &PanicInfo<'_>) -> ! {
     let _ = write!(DebugWriter, "PANIC: {info}\n");
 
-    loop {
-        core::hint::spin_loop();
-    }
+    crate::syscall::exit(1)
 }

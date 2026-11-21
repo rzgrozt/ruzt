@@ -8,6 +8,8 @@ The x86_64 kernel contains early boot code, serial diagnostics, interrupt handli
 
 Each service has its own capability space. The console endpoints grant send and receive rights separately. The kernel forwards PS/2 interrupts to `rootsrv` and hands it the boot framebuffer. The server sleeps while waiting for an interrupt, then decodes the Space key and draws a status tile in ring 3.
 
+When a boot service exits or takes a user-mode fault, the kernel closes its console channels, wakes blocked peers, and reclaims its stack and private address-space memory after switching away.
+
 ## Repository layout
 
 | Path | Contents |
@@ -37,6 +39,8 @@ cargo test --locked -p boot-x86_64 --test boot_test -- --nocapture
 Each test builds a BIOS image in a fresh temporary directory. The kernel-only test checks breakpoint recovery, scheduling, and blocking IPC. The ring-3 test packages both services in a ustar archive, checks a console write and acknowledgement, and checks capability rights. It then injects Space with the QEMU monitor and verifies the tile's color change in screenshots.
 
 A separate guest keeps the console service CPU-bound after its first reply. It verifies that timer preemption still lets `rootsrv` handle keyboard input.
+
+The exit and fault guests verify that `rootsrv` sees the console disconnect and can still handle input after the kernel reaps the console process.
 
 GitHub Actions runs both commands on pushes to `main` and on pull requests.
 

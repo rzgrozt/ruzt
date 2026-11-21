@@ -26,16 +26,21 @@ pub(crate) extern "C" fn syscall_dispatch(args: &SyscallArgs, caller_cs: u64) ->
     let from_user = caller_cs & 3 == 3;
     match SyscallNumber::from(args.number) {
         // The shared kernel CSpace serves only the internal IPC self-test.
-        SyscallNumber::Invoke if from_user => user::invoke(args)
-            .map_or_else(ErrorCode::as_u64, |()| ErrorCode::Ok.as_u64()),
+        SyscallNumber::Invoke if from_user => {
+            user::invoke(args).map_or_else(ErrorCode::as_u64, |()| ErrorCode::Ok.as_u64())
+        }
         SyscallNumber::Invoke => invoke::invoke(args),
         SyscallNumber::DebugPutChar => {
             crate::serial::SERIAL1.lock().send(args.arg0 as u8);
             ErrorCode::Ok.as_u64()
         }
-        SyscallNumber::NotImplemented | SyscallNumber::_Reply | SyscallNumber::_Yield => {
-            ErrorCode::NotImplemented.as_u64()
+        SyscallNumber::Exit if from_user => {
+            crate::process::terminate_current(format_args!("exit status {}", args.arg0 as u32))
         }
+        SyscallNumber::Exit
+        | SyscallNumber::NotImplemented
+        | SyscallNumber::_Reply
+        | SyscallNumber::_Yield => ErrorCode::NotImplemented.as_u64(),
     }
 }
 

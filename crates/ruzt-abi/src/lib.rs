@@ -65,6 +65,8 @@ pub enum SyscallNumber {
     DebugPutChar = 3,
     /// Syscall number not recognised.
     NotImplemented = 4,
+    /// Terminate the calling user task with the status in `arg0`.
+    Exit = 5,
 }
 
 impl From<u64> for SyscallNumber {
@@ -74,6 +76,7 @@ impl From<u64> for SyscallNumber {
             1 => Self::_Reply,
             2 => Self::_Yield,
             3 => Self::DebugPutChar,
+            5 => Self::Exit,
             _ => Self::NotImplemented,
         }
     }

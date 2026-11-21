@@ -10,7 +10,8 @@ use crate::syscall::user_mem;
 fn check_endpoint(endpoint: EndpointId) -> Result<KObjectId, ErrorCode> {
     let id = KObjectId(endpoint.0);
     match object::get(id) {
-        Some(KernelObject::Endpoint) => Ok(id),
+        Some(KernelObject::Endpoint { closed: false }) => Ok(id),
+        Some(KernelObject::Endpoint { closed: true }) => Err(ErrorCode::NotFound),
         _ => Err(ErrorCode::InvalidCap),
     }
 }
@@ -25,6 +26,7 @@ pub(crate) fn send_message(endpoint: EndpointId, message: IpcMessage) -> Result<
     } else {
         sched::set_thread_message(sched::current_thread_id(), message);
         sched::block_current(ThreadState::BlockedSend(id));
+        sched::check_ipc_completion()?;
     }
     Ok(())
 }
@@ -37,8 +39,15 @@ pub(crate) fn receive_message(endpoint: EndpointId) -> Result<IpcMessage, ErrorC
         Ok(message)
     } else {
         sched::block_current(ThreadState::BlockedRecv(id));
+        sched::check_ipc_completion()?;
         sched::take_current_message().ok_or(ErrorCode::BadMessage)
     }
+}
+
+pub(crate) fn close_boot_channel(endpoint: EndpointId) {
+    let id = KObjectId(endpoint.0);
+    object::close_endpoint(id);
+    sched::cancel_endpoint_waiters(id);
 }
 
 /// Send through the endpoint used by the kernel-only IPC diagnostic.
@@ -94,6 +103,23 @@ pub fn notification_wait(notification: NotificationId) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closed_boot_channel_stays_closed_with_a_live_handle() {
+        let _state = crate::isolated_kernel_state();
+        let cap_type = ruzt_cap::CapType::Endpoint(EndpointId(0));
+        let old = object::allocate(cap_type).unwrap();
+        let endpoint = EndpointId(old.0);
+
+        close_boot_channel(endpoint);
+        let new = object::allocate(cap_type).unwrap();
+        assert_ne!(old, new);
+        assert_eq!(
+            send_message(endpoint, IpcMessage::default()),
+            Err(ErrorCode::NotFound)
+        );
+        assert_eq!(receive_message(endpoint), Err(ErrorCode::NotFound));
+    }
 
     #[test]
     fn notification_signal_wait() {
