@@ -14,6 +14,9 @@
 /// Both kernel and userland must agree on this value.
 pub const SYS_SYSCALL: u32 = 0x80;
 
+/// Capability slot granted to the initial process for bootstrap IPC.
+pub const ROOTSRV_BOOTSTRAP_ENDPOINT: u64 = 0;
+
 /// System-call numbers.
 ///
 /// These values are loaded into `rax` (x86_64) or `x8` (AArch64)

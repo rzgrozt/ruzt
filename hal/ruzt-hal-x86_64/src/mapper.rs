@@ -272,6 +272,64 @@ fn frame_pointer(frame: PhysFrame) -> *mut u8 {
     (physical_memory_offset() + frame.base.as_u64()).as_mut_ptr()
 }
 
+/// Check all pages in a nonempty user buffer in the expected active root.
+///
+/// Only 4 KiB mappings are supported. Every level must permit user access
+/// and, for an output buffer, writes.
+pub fn active_user_range_accessible(
+    root: PhysFrame,
+    address: u64,
+    len: usize,
+    writable: bool,
+) -> bool {
+    let Some(last) = address.checked_add(len as u64).and_then(|end| end.checked_sub(1)) else {
+        return false;
+    };
+    if len == 0 || address == 0 || last >= 1 << 47 {
+        return false;
+    }
+    if Cr3::read().0.start_address().as_u64() != root.base.as_u64() {
+        return false;
+    }
+
+    let mut required = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+    if writable {
+        required |= PageTableFlags::WRITABLE;
+    }
+    let page_mask = !(PhysFrame::SIZE as u64 - 1);
+    (address & page_mask..=last & page_mask)
+        .step_by(PhysFrame::SIZE)
+        .all(|page| user_page_accessible(root, X64VirtAddr::new(page), required))
+}
+
+fn user_page_accessible(
+    root: PhysFrame,
+    addr: X64VirtAddr,
+    required: PageTableFlags,
+) -> bool {
+    let mut physical = root.base.as_u64();
+    for (level, index) in [addr.p4_index(), addr.p3_index(), addr.p2_index(), addr.p1_index()]
+        .into_iter()
+        .enumerate()
+    {
+        let virtual_addr = physical_memory_offset() + physical;
+        // SAFETY: CR3 supplies a live root and each preceding present,
+        // non-huge entry names a live table. The boot physmap covers them.
+        let table = unsafe { &*virtual_addr.as_ptr::<PageTable>() };
+        let entry = &table[index];
+        if !entry.flags().contains(required) {
+            return false;
+        }
+        if level != 3 {
+            if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+                return false;
+            }
+            physical = entry.addr().as_u64();
+        }
+    }
+    true
+}
+
 /// Zero exactly one 4 KiB physical frame through the boot physmap.
 ///
 /// # Panics

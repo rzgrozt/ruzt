@@ -77,6 +77,7 @@ pub(crate) fn launch(image: &'static [u8]) -> ! {
     })
     .expect("Failed to map rootsrv address space");
 
+    crate::ipc::bootstrap::init(root);
     crate::serial_println!("rootsrv process created, entering user mode...");
     #[allow(unsafe_code)]
     // SAFETY: The private root shares the supervisor mappings containing the

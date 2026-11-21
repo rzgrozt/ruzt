@@ -23,6 +23,8 @@ fn test_rootsrv_boots_in_ring_three() {
             "Breakpoint returned cleanly.",
             "rootsrv process created, entering user mode...",
             "Hello from ring 3, rootsrv alive.",
+            "rootsrv: bootstrap IPC request and reply verified",
+            "rootsrv: ungranted endpoint rejected on send and receive",
             ".",
         ],
     );

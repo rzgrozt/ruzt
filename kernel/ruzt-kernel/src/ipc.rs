@@ -1,6 +1,8 @@
 //! Rendezvous IPC primitives — synchronous endpoint send/recv and
 //! notification signal/wait.
 
+pub(crate) mod bootstrap;
+
 use ruzt_abi::{ErrorCode, IpcMessage, SyscallArgs};
 use ruzt_cap::{EndpointId, NotificationId};
 

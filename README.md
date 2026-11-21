@@ -4,9 +4,9 @@ Ruzt is an experimental, privacy-first operating system built around a Rust micr
 
 ## Development status
 
-The x86_64 kernel contains early boot code, serial diagnostics, interrupt handling, memory management, and a scheduler. The graphical x86_64 boot loads `rootsrv` into its own address space and starts it in ring 3. It reports its greeting and heartbeat through the debug syscall. The AArch64 boot path is a stub.
+The x86_64 kernel contains early boot code, serial diagnostics, interrupt handling, memory management, and a scheduler. The graphical x86_64 boot loads `rootsrv` into its own address space and starts it in ring 3. It checks a request and reply on its bootstrap endpoint and reports the outcome through the debug syscall. The AArch64 boot path is a stub.
 
-The next milestone is a capability-gated IPC round trip from user space.
+The bootstrap endpoint has a single pending reply and is served by a kernel echo handler. The next milestone is delivering keyboard events to a user-space display service.
 
 ## Repository layout
 
@@ -32,7 +32,7 @@ Run the kernel-only and ring-3 QEMU tests with the pinned Rust nightly and compo
 cargo test --locked -p boot-x86_64 --test boot_test -- --nocapture
 ```
 
-Each test builds a BIOS image in a fresh temporary directory. The kernel-only test checks breakpoint recovery. The ring-3 test also packages `rootsrv` as the bootloader ramdisk and checks its serial greeting and first heartbeat.
+Each test builds a BIOS image in a fresh temporary directory. The kernel-only test checks breakpoint recovery. The ring-3 test also packages `rootsrv` as the bootloader ramdisk and checks its serial greeting, IPC round trip, rejection of an ungranted endpoint, and first heartbeat.
 
 ## Graphical boot
 

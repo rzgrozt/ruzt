@@ -90,3 +90,48 @@ pub fn copy_to_user(kernel_buf: &[u8], user_ptr: u64) -> Result<(), ErrorCode> {
     }
     Ok(())
 }
+
+// The bootstrap process runs on one CPU and its mappings stay fixed after
+// launch. An interrupt gate keeps the syscall on that address space.
+fn validate_user_buffer(
+    root: ruzt_hal::mem::PhysFrame,
+    address: u64,
+    len: usize,
+    writable: bool,
+) -> Result<(), ErrorCode> {
+    if ruzt_hal_x86_64::mapper::active_user_range_accessible(root, address, len, writable) {
+        Ok(())
+    } else {
+        Err(ErrorCode::BadMessage)
+    }
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn read_user_buffer(
+    root: ruzt_hal::mem::PhysFrame,
+    address: u64,
+    buf: &mut [u8],
+) -> Result<(), ErrorCode> {
+    validate_user_buffer(root, address, buf.len(), false)?;
+    // SAFETY: The complete active user range is readable and disjoint from
+    // the higher-half kernel buffer. Its mappings are stable during the copy.
+    unsafe {
+        core::ptr::copy_nonoverlapping(address as *const u8, buf.as_mut_ptr(), buf.len());
+    }
+    Ok(())
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn write_user_buffer(
+    root: ruzt_hal::mem::PhysFrame,
+    address: u64,
+    buf: &[u8],
+) -> Result<(), ErrorCode> {
+    validate_user_buffer(root, address, buf.len(), true)?;
+    // SAFETY: The complete active user range is writable and disjoint from
+    // the higher-half kernel buffer. Its mappings are stable during the copy.
+    unsafe {
+        core::ptr::copy_nonoverlapping(buf.as_ptr(), address as *mut u8, buf.len());
+    }
+    Ok(())
+}
