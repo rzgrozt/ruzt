@@ -17,6 +17,12 @@ pub const SYS_SYSCALL: u32 = 0x80;
 /// Capability slot granted to the initial process for bootstrap IPC.
 pub const ROOTSRV_BOOTSTRAP_ENDPOINT: u64 = 0;
 
+/// Capability slot granted to the initial process for PS/2 keyboard interrupts.
+pub const ROOTSRV_KEYBOARD_IRQ: u64 = 1;
+
+/// Capability slot granted to the initial process for the PS/2 data port.
+pub const ROOTSRV_KEYBOARD_DATA: u64 = 2;
+
 /// System-call numbers.
 ///
 /// These values are loaded into `rax` (x86_64) or `x8` (AArch64)
@@ -58,7 +64,7 @@ pub enum CapOp {
     Recv = 1,
     /// Signal a notification object.
     Signal = 2,
-    /// Wait on a notification object.
+    /// Wait on a notification or poll a device interrupt.
     Wait = 3,
     /// Delete a capability.
     Delete = 4,
@@ -68,6 +74,8 @@ pub enum CapOp {
     Mint = 6,
     /// Move a capability between slots.
     Move = 7,
+    /// Read one byte from a port capability into the user pointer in `arg2`.
+    ReadPort8 = 8,
 }
 
 /// Rights that can be attached to a capability.
@@ -283,6 +291,7 @@ mod tests {
         assert_eq!(CapOp::Retype as u64, 5);
         assert_eq!(CapOp::Mint as u64, 6);
         assert_eq!(CapOp::Move as u64, 7);
+        assert_eq!(CapOp::ReadPort8 as u64, 8);
     }
 
     #[test]

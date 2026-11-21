@@ -1,6 +1,7 @@
 //! User memory copy helpers.
 
 use ruzt_abi::ErrorCode;
+#[cfg(not(test))]
 use ruzt_hal::mem::Mapper;
 
 #[cfg(not(test))]
@@ -127,7 +128,20 @@ pub(crate) fn write_user_buffer(
     address: u64,
     buf: &[u8],
 ) -> Result<(), ErrorCode> {
-    validate_user_buffer(root, address, buf.len(), true)?;
+    write_user_buffer_with(root, address, buf.len(), || buf)
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn write_user_buffer_with<T: AsRef<[u8]>>(
+    root: ruzt_hal::mem::PhysFrame,
+    address: u64,
+    len: usize,
+    produce: impl FnOnce() -> T,
+) -> Result<(), ErrorCode> {
+    validate_user_buffer(root, address, len, true)?;
+    let output = produce();
+    let buf = output.as_ref();
+    assert_eq!(buf.len(), len);
     // SAFETY: The complete active user range is writable and disjoint from
     // the higher-half kernel buffer. Its mappings are stable during the copy.
     unsafe {

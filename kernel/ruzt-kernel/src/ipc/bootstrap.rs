@@ -2,13 +2,18 @@
 
 use core::mem::{offset_of, size_of};
 
-use ruzt_abi::{CapOp, CapRights, ErrorCode, IpcMessage, SyscallArgs, ROOTSRV_BOOTSTRAP_ENDPOINT};
+use ruzt_abi::{
+    CapOp, CapRights, ErrorCode, IpcMessage, SyscallArgs, ROOTSRV_BOOTSTRAP_ENDPOINT,
+    ROOTSRV_KEYBOARD_DATA, ROOTSRV_KEYBOARD_IRQ,
+};
 use ruzt_cap::{CapSlot, CapType, EndpointId};
 use ruzt_hal::mem::PhysFrame;
 use spin::Mutex;
+use x86_64::instructions::port::PortReadOnly;
 
 use crate::cap::{cspace::CSpace, object};
-use crate::syscall::user_mem::{read_user_buffer, write_user_buffer};
+use crate::keyboard;
+use crate::syscall::user_mem::{read_user_buffer, write_user_buffer, write_user_buffer_with};
 
 type MessageBytes = [u8; size_of::<IpcMessage>()];
 
@@ -22,7 +27,7 @@ struct Bootstrap {
 static BOOTSTRAP: Mutex<Option<Bootstrap>> = Mutex::new(None);
 
 pub(crate) fn init(root: PhysFrame) {
-    let mut cspace = CSpace::new(1);
+    let mut cspace = CSpace::new(2);
     let endpoint = EndpointId(
         object::allocate(CapType::Endpoint(EndpointId(0)))
             .expect("Failed to allocate rootsrv endpoint")
@@ -38,6 +43,31 @@ pub(crate) fn init(root: PhysFrame) {
             },
         )
         .expect("Failed to grant rootsrv endpoint");
+    for (index, cap_type) in [
+        (
+            ROOTSRV_KEYBOARD_IRQ,
+            CapType::Irq {
+                irq_num: keyboard::IRQ,
+            },
+        ),
+        (
+            ROOTSRV_KEYBOARD_DATA,
+            CapType::IoPort {
+                port: keyboard::DATA_PORT,
+            },
+        ),
+    ] {
+        cspace
+            .insert(
+                index,
+                CapSlot {
+                    cap_type,
+                    rights: CapRights::READ,
+                    badge: 0,
+                },
+            )
+            .expect("Failed to grant keyboard capability");
+    }
 
     *BOOTSTRAP.lock() = Some(Bootstrap {
         root,
@@ -45,39 +75,71 @@ pub(crate) fn init(root: PhysFrame) {
         endpoint,
         reply: None,
     });
+    keyboard::enable_user_driver();
 }
 
 pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
     let mut guard = BOOTSTRAP.lock();
     let bootstrap = guard.as_mut().ok_or(ErrorCode::InvalidCap)?;
-    let slot = bootstrap.cspace.lookup(args.arg0)?;
-    if slot.cap_type != CapType::Endpoint(bootstrap.endpoint) {
-        return Err(ErrorCode::InvalidCap);
+    let slot = *bootstrap.cspace.lookup(args.arg0)?;
+    match slot.cap_type {
+        CapType::Endpoint(id) if id == bootstrap.endpoint => bootstrap.echo(args, slot.rights),
+        CapType::Irq {
+            irq_num: keyboard::IRQ,
+        } if args.arg1 == CapOp::Wait as u64 => {
+            require_read(slot.rights)?;
+            if keyboard::take_irq() {
+                Ok(())
+            } else {
+                Err(ErrorCode::WouldBlock)
+            }
+        }
+        CapType::IoPort { port } if args.arg1 == CapOp::ReadPort8 as u64 => {
+            require_read(slot.rights)?;
+            write_user_buffer_with(bootstrap.root, args.arg2, 1, || {
+                #[allow(unsafe_code)]
+                // SAFETY: The checked, kernel-issued capability names the
+                // port and grants read access. No caller controls the port.
+                let byte = unsafe { PortReadOnly::<u8>::new(port).read() };
+                [byte]
+            })
+        }
+        _ => Err(ErrorCode::InvalidCap),
     }
+}
 
-    match args.arg1 {
-        op if op == CapOp::Send as u64 => {
-            if !slot.rights.contains(CapRights::WRITE) {
-                return Err(ErrorCode::CapRightsViolation);
+impl Bootstrap {
+    fn echo(&mut self, args: &SyscallArgs, rights: CapRights) -> Result<(), ErrorCode> {
+        match args.arg1 {
+            op if op == CapOp::Send as u64 => {
+                if !rights.contains(CapRights::WRITE) {
+                    return Err(ErrorCode::CapRightsViolation);
+                }
+                if self.reply.is_some() {
+                    return Err(ErrorCode::WouldBlock);
+                }
+                let mut request = [0; size_of::<IpcMessage>()];
+                read_user_buffer(self.root, args.arg2, &mut request)?;
+                self.reply = Some(echo_reply(&request)?);
             }
-            if bootstrap.reply.is_some() {
-                return Err(ErrorCode::WouldBlock);
+            op if op == CapOp::Recv as u64 => {
+                require_read(rights)?;
+                let reply = self.reply.as_ref().ok_or(ErrorCode::WouldBlock)?;
+                write_user_buffer(self.root, args.arg2, reply)?;
+                self.reply = None;
             }
-            let mut request = [0; size_of::<IpcMessage>()];
-            read_user_buffer(bootstrap.root, args.arg2, &mut request)?;
-            bootstrap.reply = Some(echo_reply(&request)?);
+            _ => return Err(ErrorCode::NotImplemented),
         }
-        op if op == CapOp::Recv as u64 => {
-            if !slot.rights.contains(CapRights::READ) {
-                return Err(ErrorCode::CapRightsViolation);
-            }
-            let reply = bootstrap.reply.as_ref().ok_or(ErrorCode::WouldBlock)?;
-            write_user_buffer(bootstrap.root, args.arg2, reply)?;
-            bootstrap.reply = None;
-        }
-        _ => return Err(ErrorCode::NotImplemented),
+        Ok(())
     }
-    Ok(())
+}
+
+fn require_read(rights: CapRights) -> Result<(), ErrorCode> {
+    if rights.contains(CapRights::READ) {
+        Ok(())
+    } else {
+        Err(ErrorCode::CapRightsViolation)
+    }
 }
 
 fn echo_reply(request: &MessageBytes) -> Result<MessageBytes, ErrorCode> {

@@ -93,6 +93,11 @@ pub enum CapType {
         /// Hardware IRQ line number.
         irq_num: u32,
     },
+    /// Read or write access to a single I/O port.
+    IoPort {
+        /// Hardware port number.
+        port: u16,
+    },
 }
 
 /// A capability as it lives in a CNode slot.

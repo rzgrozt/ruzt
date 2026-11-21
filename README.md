@@ -6,7 +6,7 @@ Ruzt is an experimental, privacy-first operating system built around a Rust micr
 
 The x86_64 kernel contains early boot code, serial diagnostics, interrupt handling, memory management, and a scheduler. The graphical x86_64 boot loads `rootsrv` into its own address space and starts it in ring 3. It checks a request and reply on its bootstrap endpoint and reports the outcome through the debug syscall. The AArch64 boot path is a stub.
 
-The bootstrap endpoint has a single pending reply and is served by a kernel echo handler. The next milestone is delivering keyboard events to a user-space display service.
+The bootstrap endpoint has a single pending reply and is served by a kernel echo handler. The kernel forwards PS/2 interrupts to `rootsrv`. The server holds separate capabilities for the interrupt and data port and decodes the Space key in ring 3. Keyboard interrupts are currently polled while the scheduler supports only kernel threads.
 
 ## Repository layout
 
@@ -16,6 +16,7 @@ The bootstrap endpoint has a single pending reply and is served by a kernel echo
 | [`hal/`](hal) | Hardware abstraction traits and architecture-specific implementations |
 | [`boot/`](boot) | Architecture-specific boot programs and the x86_64 QEMU integration test |
 | [`crates/`](crates) | Shared ABI, capability types, IPC client, and user-space runtime |
+| [`crates/ruzt-driver-sdk`](crates/ruzt-driver-sdk) | User-space device access through capabilities |
 | [`servers/rootsrv`](servers/rootsrv) | First user-space server |
 
 ## Local checks
@@ -32,7 +33,7 @@ Run the kernel-only and ring-3 QEMU tests with the pinned Rust nightly and compo
 cargo test --locked -p boot-x86_64 --test boot_test -- --nocapture
 ```
 
-Each test builds a BIOS image in a fresh temporary directory. The kernel-only test checks breakpoint recovery. The ring-3 test also packages `rootsrv` as the bootloader ramdisk and checks its serial greeting, IPC round trip, rejection of an ungranted endpoint, and first heartbeat.
+Each test builds a BIOS image in a fresh temporary directory. The kernel-only test checks breakpoint recovery. The ring-3 test packages `rootsrv` as the bootloader ramdisk, checks its IPC round trip and rejection of an ungranted capability, injects Space with the QEMU monitor, and verifies that `rootsrv` receives it.
 
 ## Graphical boot
 
@@ -44,7 +45,7 @@ Run these commands from the repository root with QEMU's GTK display backend inst
 cargo run --locked -p boot-x86_64
 ```
 
-QEMU opens a window for the boot screen and streams serial diagnostics to the terminal. The screen marks each milestone as the kernel reaches it and stays visible until you close QEMU.
+QEMU opens a window for the boot screen and streams serial diagnostics to the terminal. With that window focused, press Space to see `rootsrv` report the key in the terminal.
 
 ## Design
 

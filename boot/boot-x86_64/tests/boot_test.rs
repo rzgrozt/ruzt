@@ -1,9 +1,13 @@
-use std::path::Path;
-use std::process::Command;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 #[test]
 fn test_kernel_boots() {
-    let serial = run_boot("qemu-smoke-test", false);
+    let temp = tempfile::tempdir().expect("Failed to create boot test directory");
+    let disk_image = build_image(temp.path(), "qemu-smoke-test", false);
+    let serial = run_smoke_test(&disk_image);
     assert_markers(
         &serial,
         &[
@@ -15,8 +19,39 @@ fn test_kernel_boots() {
 }
 
 #[test]
-fn test_rootsrv_boots_in_ring_three() {
-    let serial = run_boot("qemu-rootsrv-test", true);
+fn test_rootsrv_boots_and_reads_keyboard_in_ring_three() {
+    let temp = tempfile::tempdir().expect("Failed to create boot test directory");
+    let disk_image = build_image(temp.path(), "qemu-rootsrv-test", true);
+    let serial_path = temp.path().join("serial.log");
+    let mut vm = Guest(
+        Command::new("timeout")
+            .args(["35s", "qemu-system-x86_64", "-drive"])
+            .arg(format!("format=raw,file={}", disk_image.display()))
+            .arg("-serial")
+            .arg(format!("file:{}", serial_path.display()))
+            .args(["-display", "none", "-monitor", "stdio", "-no-reboot"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("Failed to run QEMU with a monitor"),
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    wait_for_serial(
+        &mut vm.0,
+        &serial_path,
+        "rootsrv: press Space to test keyboard input",
+        deadline,
+    );
+    monitor(&mut vm.0, "sendkey spc");
+    let serial = wait_for_serial(
+        &mut vm.0,
+        &serial_path,
+        "rootsrv: Space key received",
+        deadline,
+    );
+    monitor(&mut vm.0, "quit");
+    assert!(vm.0.wait().expect("Failed to wait for QEMU").success());
     assert_markers(
         &serial,
         &[
@@ -25,16 +60,16 @@ fn test_rootsrv_boots_in_ring_three() {
             "Hello from ring 3, rootsrv alive.",
             "rootsrv: bootstrap IPC request and reply verified",
             "rootsrv: ungranted endpoint rejected on send and receive",
-            ".",
+            "rootsrv: press Space to test keyboard input",
+            "rootsrv: Space key received",
         ],
     );
 }
 
-fn run_boot(kernel_feature: &str, with_rootsrv: bool) -> String {
+fn build_image(temp: &Path, kernel_feature: &str, with_rootsrv: bool) -> PathBuf {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let kernel_dir = workspace.join("kernel/ruzt-kernel");
-    let temp = tempfile::tempdir().expect("Failed to create boot test directory");
-    let build_dir = temp.path().join("target");
+    let build_dir = temp.join("target");
     let debug_dir = build_dir.join("x86_64-unknown-none/debug");
 
     if with_rootsrv {
@@ -69,14 +104,17 @@ fn run_boot(kernel_feature: &str, with_rootsrv: bool) -> String {
         .expect("Failed to build kernel");
     assert!(status.success(), "Kernel build failed: {status}");
 
-    let disk_image = temp.path().join("ruzt-test.img");
+    let disk_image = temp.join("ruzt-test.img");
     let mut boot = bootloader::BiosBoot::new(&debug_dir.join("ruzt-kernel"));
     if with_rootsrv {
         boot.set_ramdisk(&debug_dir.join("rootsrv"));
     }
     boot.create_disk_image(&disk_image)
         .expect("Failed to create disk image");
+    disk_image
+}
 
+fn run_smoke_test(disk_image: &Path) -> String {
     let output = Command::new("timeout")
         .args(["30s", "qemu-system-x86_64", "-drive"])
         .arg(format!("format=raw,file={}", disk_image.display()))
@@ -105,6 +143,36 @@ fn run_boot(kernel_feature: &str, with_rootsrv: bool) -> String {
     );
 
     serial.into_owned()
+}
+
+struct Guest(Child);
+
+impl Drop for Guest {
+    fn drop(&mut self) {
+        if let Some(mut monitor) = self.0.stdin.take() {
+            let _ = writeln!(monitor, "quit");
+        }
+        let _ = self.0.wait();
+    }
+}
+
+fn monitor(vm: &mut Child, command: &str) {
+    writeln!(vm.stdin.as_mut().expect("QEMU monitor stdin"), "{command}")
+        .expect("Failed to send QEMU monitor command");
+}
+
+fn wait_for_serial(vm: &mut Child, path: &Path, marker: &str, deadline: Instant) -> String {
+    loop {
+        let serial = std::fs::read_to_string(path).unwrap_or_default();
+        if serial.lines().any(|line| line == marker) {
+            return serial;
+        }
+        assert!(
+            vm.try_wait().expect("Failed to poll QEMU").is_none() && Instant::now() < deadline,
+            "QEMU did not reach {marker:?}:\n{serial}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn assert_markers(serial: &str, markers: &[&str]) {

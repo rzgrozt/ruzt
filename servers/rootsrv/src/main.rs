@@ -1,7 +1,10 @@
 #![no_std]
 #![no_main]
 
-use ruzt_abi::{CapRights, CapTransferSlot, ErrorCode, IpcMessage, ROOTSRV_BOOTSTRAP_ENDPOINT};
+use ruzt_abi::{
+    CapRights, CapTransferSlot, ErrorCode, IpcMessage, ROOTSRV_BOOTSTRAP_ENDPOINT,
+    ROOTSRV_KEYBOARD_DATA, ROOTSRV_KEYBOARD_IRQ,
+};
 use ruzt_runtime::{debug_putchar, runtime_init};
 
 #[no_mangle]
@@ -30,7 +33,7 @@ fn write_line(text: &str) {
 
 fn check_bootstrap_ipc() {
     let endpoint = ROOTSRV_BOOTSTRAP_ENDPOINT;
-    let ungranted = endpoint + 1;
+    let ungranted = u64::MAX;
     let payload = b"rootsrv bootstrap";
     let mut request = EMPTY_MESSAGE;
     request.label = 42;
@@ -69,13 +72,27 @@ fn main() -> ! {
     write_line("Hello from ring 3, rootsrv alive.");
     check_bootstrap_ipc();
 
-    let mut iterations = 0_u64;
+    assert_eq!(
+        ruzt_driver_sdk::poll_irq(u64::MAX),
+        Err(ErrorCode::InvalidCap)
+    );
+    assert_eq!(
+        ruzt_driver_sdk::read_port_u8(ROOTSRV_KEYBOARD_IRQ),
+        Err(ErrorCode::InvalidCap)
+    );
+    write_line("rootsrv: press Space to test keyboard input");
     loop {
-        iterations += 1;
-        if iterations == 10_000_000 {
-            debug_putchar(b'.');
-            iterations = 0;
+        match ruzt_driver_sdk::poll_irq(ROOTSRV_KEYBOARD_IRQ) {
+            Ok(()) => {
+                let scancode = ruzt_driver_sdk::read_port_u8(ROOTSRV_KEYBOARD_DATA)
+                    .expect("read PS/2 keyboard data");
+                // The boot firmware configures translated set-1 scancodes.
+                if scancode == 0x39 {
+                    write_line("rootsrv: Space key received");
+                }
+            }
+            Err(ErrorCode::WouldBlock) => core::hint::spin_loop(),
+            Err(error) => panic!("keyboard IRQ polling failed: {error:?}"),
         }
-        core::hint::spin_loop();
     }
 }

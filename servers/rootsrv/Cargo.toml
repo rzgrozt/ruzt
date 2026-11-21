@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+ruzt-driver-sdk = { path = "../../crates/ruzt-driver-sdk" }
 ruzt-runtime = { path = "../../crates/ruzt-runtime" }
 ruzt-abi = { path = "../../crates/ruzt-abi" }
 ruzt-ipc = { path = "../../crates/ruzt-ipc" }

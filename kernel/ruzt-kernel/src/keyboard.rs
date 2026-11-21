@@ -5,12 +5,35 @@ use x86_64::instructions::port::PortReadOnly;
 
 static SCANCODE_READY: AtomicBool = AtomicBool::new(false);
 static SCANCODE: AtomicU8 = AtomicU8::new(0);
+static USER_DRIVER: AtomicBool = AtomicBool::new(false);
+static IRQ_PENDING: AtomicBool = AtomicBool::new(false);
+
+pub(crate) const IRQ: u32 = 1;
+pub(crate) const DATA_PORT: u16 = 0x60;
+
+/// Route the keyboard interrupt to the initial user process.
+pub(crate) fn enable_user_driver() {
+    USER_DRIVER.store(true, Ordering::Relaxed);
+}
+
+/// Consume the pending interrupt so the driver can read the controller.
+pub(crate) fn take_irq() -> bool {
+    IRQ_PENDING.swap(false, Ordering::Relaxed)
+}
 
 /// Called from the keyboard ISR (vector 33).
-/// Reads the scancode from port 0x60 and stores it in a global buffer.
+/// For the boot-time user driver, only records the interrupt.
 #[allow(unsafe_code)]
 pub fn on_interrupt() {
-    let scancode: u8 = unsafe { PortReadOnly::new(0x60).read() };
+    if USER_DRIVER.load(Ordering::Relaxed) {
+        // The controller drops the IRQ line when the driver reads the byte.
+        // On the edge-triggered PIC, no other interrupt arrives for that byte.
+        IRQ_PENDING.store(true, Ordering::Relaxed);
+        return;
+    }
+
+    // SAFETY: The kernel echo task owns the PS/2 data port without a user driver.
+    let scancode: u8 = unsafe { PortReadOnly::new(DATA_PORT).read() };
 
     // Ignore release scancodes (bit 7 set).
     if scancode < 0x80 {

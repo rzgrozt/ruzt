@@ -10,6 +10,7 @@ members = [
     "crates/ruzt-cap",
     "crates/ruzt-runtime",
     "crates/ruzt-ipc",
+    "crates/ruzt-driver-sdk",
     "servers/rootsrv",
 ]
 resolver = "2"

@@ -256,6 +256,8 @@ fn kernel_object_from_cap_type(cap_type: CapType) -> Result<KernelObject, ErrorC
             size_bits,
         }),
         CapType::Irq { irq_num } => Ok(KernelObject::Irq { irq_num }),
+        // Port capabilities encode their resource directly.
+        CapType::IoPort { .. } => Err(ErrorCode::NotImplemented),
     }
 }
 

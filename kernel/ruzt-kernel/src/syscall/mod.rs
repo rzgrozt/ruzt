@@ -35,17 +35,6 @@ pub(crate) extern "C" fn syscall_dispatch(args: &SyscallArgs, caller_cs: u64) ->
                 ROOTSRV_STARTED.call_once(crate::boot_screen::rootsrv_started);
             }
             crate::serial::SERIAL1.lock().send(byte);
-            #[cfg(feature = "qemu-rootsrv-test")]
-            if from_user {
-                static GREETING_LINE_SENT: spin::Once<()> = spin::Once::new();
-                if byte == b'\n' {
-                    GREETING_LINE_SENT.call_once(|| {});
-                }
-                // A heartbeat after the greeting proves the earlier calls returned.
-                if byte == b'.' && GREETING_LINE_SENT.is_completed() {
-                    ruzt_hal_x86_64::cpu::qemu_shutdown();
-                }
-            }
             ErrorCode::Ok.as_u64()
         }
         SyscallNumber::NotImplemented | SyscallNumber::_Reply | SyscallNumber::_Yield => {

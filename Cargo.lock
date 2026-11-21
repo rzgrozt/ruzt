@@ -418,6 +418,7 @@ name = "rootsrv"
 version = "0.1.0"
 dependencies = [
  "ruzt-abi",
+ "ruzt-driver-sdk",
  "ruzt-ipc",
  "ruzt-runtime",
 ]
@@ -451,6 +452,14 @@ version = "0.1.0"
 dependencies = [
  "ruzt-abi",
  "ruzt-hal",
+]
+
+[[package]]
+name = "ruzt-driver-sdk"
+version = "0.1.0"
+dependencies = [
+ "ruzt-abi",
+ "ruzt-runtime",
 ]
 
 [[package]]
