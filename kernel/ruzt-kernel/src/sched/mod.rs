@@ -231,14 +231,14 @@ mod tests {
 
     #[test]
     fn scheduler_init_creates_idle_thread() {
-        init();
+        let _state = crate::isolated_kernel_state();
         let id = current_thread_id();
         assert_eq!(id, 0);
     }
 
     #[test]
     fn block_and_unblock() {
-        init();
+        let _state = crate::isolated_kernel_state();
         let id = current_thread_id();
         assert_eq!(id, 0);
 
@@ -273,7 +273,7 @@ mod tests {
 
     #[test]
     fn thread_message_buffer() {
-        init();
+        let _state = crate::isolated_kernel_state();
         let id = current_thread_id();
 
         let msg = ruzt_abi::IpcMessage {

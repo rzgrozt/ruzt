@@ -269,7 +269,7 @@ mod tests {
 
     #[test]
     fn deallocate_works() {
-        init();
+        let _state = crate::isolated_kernel_state();
         let id = allocate(CapType::Endpoint(EndpointId(0))).unwrap();
         assert!(get(id).is_some());
         deallocate(id);
@@ -278,6 +278,7 @@ mod tests {
 
     #[test]
     fn allocate_endpoint() {
+        let _state = crate::isolated_kernel_state();
         let id = allocate(CapType::Endpoint(EndpointId(0))).unwrap();
         let obj = get(id).unwrap();
         assert!(matches!(obj, KernelObject::Endpoint { blocked_sender: None, blocked_receiver: None }));
@@ -285,6 +286,7 @@ mod tests {
 
     #[test]
     fn deallocate_endpoint() {
+        let _state = crate::isolated_kernel_state();
         let id = allocate(CapType::Endpoint(EndpointId(0))).unwrap();
         deallocate(id);
         assert!(get(id).is_none());
@@ -292,6 +294,7 @@ mod tests {
 
     #[test]
     fn allocate_notification() {
+        let _state = crate::isolated_kernel_state();
         let id = allocate(CapType::Notification(NotificationId(0))).unwrap();
         let obj = get(id).unwrap();
         assert!(matches!(obj, KernelObject::Notification { state: false, blocked_waiter: None }));
@@ -299,11 +302,13 @@ mod tests {
 
     #[test]
     fn allocate_null_fails() {
+        let _state = crate::isolated_kernel_state();
         assert_eq!(allocate(CapType::Null), Err(ErrorCode::InvalidCap));
     }
 
     #[test]
     fn allocate_frame() {
+        let _state = crate::isolated_kernel_state();
         let frame = ruzt_hal::mem::PhysFrame::from_base(PhysAddr::new(0x1000)).unwrap();
         let id = allocate(CapType::Frame { phys: frame, size: ruzt_cap::FrameSize::Size4K }).unwrap();
         let obj = get(id).unwrap();
@@ -312,6 +317,7 @@ mod tests {
 
     #[test]
     fn allocate_untyped() {
+        let _state = crate::isolated_kernel_state();
         let frame = ruzt_hal::mem::PhysFrame::from_base(PhysAddr::new(0x2000)).unwrap();
         let id = allocate(CapType::Untyped { phys: frame, size_bits: 12 }).unwrap();
         let obj = get(id).unwrap();
@@ -320,6 +326,7 @@ mod tests {
 
     #[test]
     fn allocate_cnode() {
+        let _state = crate::isolated_kernel_state();
         let id = allocate(CapType::CNode { radix_bits: 4, ptr: 0 }).unwrap();
         let obj = get(id).unwrap();
         if let KernelObject::CNode { radix_bits, count, .. } = obj {
@@ -334,10 +341,7 @@ mod tests {
 
     #[test]
     fn allocate_and_deallocate_many() {
-        init();
-        for i in 0..256 {
-            deallocate(KObjectId(i as u64));
-        }
+        let _state = crate::isolated_kernel_state();
         let mut ids = Vec::with_capacity(16);
         for _ in 0..16 {
             ids.push(allocate(CapType::Endpoint(EndpointId(0))).unwrap());

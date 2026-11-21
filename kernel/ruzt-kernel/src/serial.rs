@@ -3,6 +3,7 @@
 use core::fmt;
 use spin::{Lazy, Mutex};
 use uart_16550::SerialPort;
+#[cfg(not(test))]
 use x86_64::instructions::interrupts;
 
 /// COM1 base I/O port address.
@@ -37,6 +38,7 @@ macro_rules! serial_println {
 
 /// Internal helper used by `serial_print!` / `serial_println!`.
 #[doc(hidden)]
+#[cfg(not(test))]
 pub fn _print(args: fmt::Arguments) {
     interrupts::without_interrupts(|| {
         let mut serial = SERIAL1.lock();
@@ -51,4 +53,11 @@ pub fn _print(args: fmt::Arguments) {
         }
         let _ = fmt::Write::write_fmt(&mut Writer(&mut serial), args);
     });
+}
+
+/// Route diagnostics through the test harness on the host.
+#[doc(hidden)]
+#[cfg(test)]
+pub fn _print(args: fmt::Arguments) {
+    std::print!("{args}");
 }

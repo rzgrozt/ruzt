@@ -165,8 +165,7 @@ mod tests {
 
     #[test]
     fn endpoint_send_recv_round_trip() {
-        crate::cap::object::init();
-        crate::sched::init();
+        let _state = crate::isolated_kernel_state();
 
         let id = crate::cap::object::allocate(ruzt_cap::CapType::Endpoint(EndpointId(0))).unwrap();
 
@@ -218,7 +217,7 @@ mod tests {
 
     #[test]
     fn notification_signal_wait() {
-        crate::cap::object::init();
+        let _state = crate::isolated_kernel_state();
         let id = crate::cap::object::allocate(ruzt_cap::CapType::Notification(ruzt_cap::NotificationId(0))).unwrap();
 
         let ret = notification_signal(ruzt_cap::NotificationId(id.0));

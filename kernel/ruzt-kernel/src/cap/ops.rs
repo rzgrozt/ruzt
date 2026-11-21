@@ -211,10 +211,7 @@ mod tests {
 
     #[test]
     fn cap_delete_deallocates_object() {
-        super::super::object::init();
-        for i in 0..256 {
-            super::super::object::deallocate(super::super::object::KObjectId(i));
-        }
+        let _state = crate::isolated_kernel_state();
         let mut cspace = CSpace::new(4);
         let id = super::super::object::allocate(CapType::Endpoint(EndpointId(0))).unwrap();
         let slot = CapSlot {
@@ -242,10 +239,7 @@ mod tests {
 
     #[test]
     fn cap_retype_untyped_to_frame() {
-        super::super::object::init();
-        for i in 0..256 {
-            super::super::object::deallocate(super::super::object::KObjectId(i));
-        }
+        let _state = crate::isolated_kernel_state();
         let mut cspace = CSpace::new(4);
         let frame = ruzt_hal::mem::PhysFrame::from_base(PhysAddr::new(0x4000)).unwrap();
         let untyped = CapSlot {

@@ -9,6 +9,8 @@
 //! Ruzt microkernel — Phase 2.
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 mod boot_screen;
 pub mod serial;
@@ -25,6 +27,15 @@ pub mod process;
 
 use ruzt_hal::boot::BootInfo;
 use ruzt_hal::cpu::CpuOps;
+
+#[cfg(test)]
+fn isolated_kernel_state() -> spin::MutexGuard<'static, ()> {
+    static TEST_STATE: spin::Mutex<()> = spin::Mutex::new(());
+    let guard = TEST_STATE.lock();
+    cap::object::init();
+    sched::init();
+    guard
+}
 
 /// Kernel main entry point.
 ///
