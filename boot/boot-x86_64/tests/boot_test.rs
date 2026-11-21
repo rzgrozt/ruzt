@@ -4,7 +4,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 #[test]
-fn test_kernel_boots() {
+fn test_kernel_boots_and_schedules_blocking_ipc() {
     let temp = tempfile::tempdir().expect("Failed to create boot test directory");
     let disk_image = build_image(temp.path(), "qemu-smoke-test", false);
     let serial = run_smoke_test(&disk_image);
@@ -14,6 +14,10 @@ fn test_kernel_boots() {
             "Ruzt booting...",
             "EXCEPTION: BREAKPOINT",
             "Breakpoint returned cleanly.",
+            "thread A ticking",
+            "thread B ticking",
+            "ipc_test_receiver: got message: Hello, IPC!",
+            "ipc_test_sender: message sent successfully",
         ],
     );
 }

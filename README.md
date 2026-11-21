@@ -33,7 +33,7 @@ Run the kernel-only and ring-3 QEMU tests with the pinned Rust nightly and compo
 cargo test --locked -p boot-x86_64 --test boot_test -- --nocapture
 ```
 
-Each test builds a BIOS image in a fresh temporary directory. The kernel-only test checks breakpoint recovery. The ring-3 test packages `rootsrv` as the bootloader ramdisk, checks its IPC round trip and rejection of an ungranted capability, then injects Space with the QEMU monitor and checks screenshots for the tile's color change.
+Each test builds a BIOS image in a fresh temporary directory. The kernel-only test checks breakpoint recovery, thread scheduling, and blocking IPC. The ring-3 test packages `rootsrv` as the bootloader ramdisk, checks its IPC round trip and rejection of an ungranted capability, then injects Space with the QEMU monitor and checks screenshots for the tile's color change.
 
 GitHub Actions runs both commands on pushes to `main` and on pull requests.
 

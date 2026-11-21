@@ -6,23 +6,23 @@ use crate::gdt::{USER_CODE_SELECTOR, USER_DATA_SELECTOR};
 /// "returns" into `entry`.
 ///
 /// The initial stack frame contains dummy callee-saved registers and the
-/// thread entry point as the return address. The resulting `rsp` is
-/// 16-byte aligned so the x86_64 ABI is satisfied when the thread function
-/// starts executing.
+/// thread entry point as the return address. After it is popped, the entry
+/// function sees the System V ABI's eight-byte stack bias.
+/// See [AMD64 psABI §3.2.2](https://gitlab.com/x86-psABIs/x86-64-ABI).
 ///
 /// # Safety
-/// `stack` must be at least 71 bytes long and must remain valid and
+/// `stack` must be at least 79 bytes long and must remain valid and
 /// exclusively owned by the thread until the thread exits.
 pub unsafe fn init_stack(stack: &mut [u8], entry: fn() -> !) -> u64 {
-    assert!(stack.len() >= 71, "stack too small (need at least 71 bytes)");
+    assert!(stack.len() >= 79, "stack too small (need at least 79 bytes)");
     let top = stack.as_mut_ptr() as u64 + stack.len() as u64;
     let aligned_top = top & !0xF;
-    let rsp = aligned_top - 56;
+    let rsp = aligned_top - 64;
 
     let slots = rsp as *mut u64;
     // SAFETY: [Categories 1/3/6/10 - Aliasing, dangling, alignment, bounds]
-    // `&mut stack` is exclusive, `rsp` is 8-byte aligned, and the 71-byte
-    // minimum leaves all seven u64 slots inside the allocation after aligning.
+    // `&mut stack` is exclusive, `rsp` is 16-byte aligned, and the 79-byte
+    // minimum leaves all seven u64 slots and the return bias inside the stack.
     let frame = unsafe { core::slice::from_raw_parts_mut(slots, 7) };
     frame.fill(0);
     frame[6] = entry as usize as u64;
@@ -39,7 +39,7 @@ pub unsafe fn init_stack(stack: &mut [u8], entry: fn() -> !) -> u64 {
 /// - `old_rsp` must point to a valid, writable `u64`.
 /// - `new_rsp` must be a valid stack pointer initialised by [`init_stack`].
 /// - Interrupts must be disabled by the caller.
-/// - This function never returns to its caller.
+/// - The current thread's stack must remain live until the thread is resumed.
 #[unsafe(naked)]
 pub unsafe extern "C" fn switch(_old_rsp: *mut u64, _new_rsp: u64) {
     // SAFETY: [Categories 3/6/10/13 - Dangling, alignment, bounds, library
@@ -119,4 +119,19 @@ pub unsafe extern "C" fn enter_user(_user_rip: u64, _user_rsp: u64, _user_cr3: u
         user_code = const USER_CODE_SELECTOR,
         user_data = const USER_DATA_SELECTOR,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    fn entry() -> ! {
+        panic!("test entry should never run")
+    }
+
+    #[test]
+    fn initial_context_has_system_v_entry_alignment() {
+        let mut stack = [0u8; 79];
+        // SAFETY: The frame is built and inspected in this stack allocation.
+        let rsp = unsafe { super::init_stack(&mut stack, entry) };
+        assert_eq!((rsp + 7 * size_of::<u64>() as u64) % 16, 8);
+    }
 }

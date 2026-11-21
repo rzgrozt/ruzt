@@ -95,10 +95,6 @@ pub fn main(boot_info: &'static mut BootInfo) -> ! {
     serial_println!("Breakpoint returned cleanly.");
     advance_screen();
 
-    if cfg!(feature = "qemu-smoke-test") {
-        ruzt_hal_x86_64::cpu::qemu_shutdown();
-    }
-
     mm::heap::smoke_test();
 
     #[allow(unsafe_code)]
@@ -203,18 +199,20 @@ fn ipc_test_init() {
     serial_println!("ipc_test_init: endpoint inserted at cptr 0");
 }
 
+const KERNEL_IPC_PROBE: &[u8] = b"Hello, IPC!";
+
 /// IPC self-test sender thread.
 #[allow(unsafe_code)]
 fn ipc_test_sender() -> ! {
+    ruzt_hal_x86_64::cpu::X86_64Cpu::enable_interrupts();
     let msg = ruzt_abi::IpcMessage {
         label: 42,
-        length: 13,
+        length: KERNEL_IPC_PROBE.len() as u16,
         cap_count: 0,
         flags: 0,
         data: {
             let mut d = [0u8; 56];
-            let s = b"Hello, IPC!";
-            d[..s.len()].copy_from_slice(s);
+            d[..KERNEL_IPC_PROBE.len()].copy_from_slice(KERNEL_IPC_PROBE);
             d
         },
         caps: [ruzt_abi::CapTransferSlot {
@@ -229,7 +227,7 @@ fn ipc_test_sender() -> ! {
         arg1: 0,
         arg2: &msg.data as *const _ as u64,
         arg3: 42,
-        arg4: 13,
+        arg4: u64::from(msg.length),
         arg5: 0,
     };
     serial_println!("ipc_test_sender: about to call int 0x80");
@@ -248,6 +246,9 @@ fn ipc_test_sender() -> ! {
     }
     if ret == ruzt_abi::ErrorCode::Ok.as_u64() {
         serial_println!("ipc_test_sender: message sent successfully");
+        if cfg!(feature = "qemu-smoke-test") {
+            ruzt_hal_x86_64::cpu::qemu_shutdown();
+        }
     } else {
         serial_println!("ipc_test_sender: syscall failed, ret={}", ret);
     }
@@ -257,6 +258,7 @@ fn ipc_test_sender() -> ! {
 /// IPC self-test receiver thread.
 #[allow(unsafe_code)]
 fn ipc_test_receiver() -> ! {
+    ruzt_hal_x86_64::cpu::X86_64Cpu::enable_interrupts();
     let mut buf = [0u8; 56];
     let args = ruzt_abi::SyscallArgs {
         number: ruzt_abi::SyscallNumber::Invoke as u64,
@@ -282,7 +284,7 @@ fn ipc_test_receiver() -> ! {
         );
     }
     if ret == ruzt_abi::ErrorCode::Ok.as_u64() {
-        let msg = core::str::from_utf8(&buf[..13]).unwrap_or("invalid utf8");
+        let msg = core::str::from_utf8(&buf[..KERNEL_IPC_PROBE.len()]).unwrap_or("invalid utf8");
         serial_println!("ipc_test_receiver: got message: {}", msg);
     } else {
         serial_println!("ipc_test_receiver: syscall failed, ret={}", ret);
