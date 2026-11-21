@@ -1,7 +1,5 @@
 //! Blocking endpoint rendezvous and one-bit notifications.
 
-pub(crate) mod bootstrap;
-
 use ruzt_abi::{ErrorCode, IpcMessage, SyscallArgs};
 use ruzt_cap::{EndpointId, NotificationId};
 

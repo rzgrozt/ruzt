@@ -1,0 +1,10 @@
+[package]
+name = "consoled"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ruzt-abi = { path = "../../crates/ruzt-abi" }
+ruzt-driver-sdk = { path = "../../crates/ruzt-driver-sdk" }
+ruzt-ipc = { path = "../../crates/ruzt-ipc" }
+ruzt-runtime = { path = "../../crates/ruzt-runtime" }

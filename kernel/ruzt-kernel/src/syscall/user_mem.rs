@@ -92,9 +92,9 @@ pub fn copy_to_user(kernel_buf: &[u8], user_ptr: u64) -> Result<(), ErrorCode> {
     Ok(())
 }
 
-// The bootstrap process runs on one CPU and its mappings stay fixed after
-// launch. An interrupt gate keeps the syscall on that address space.
-fn validate_user_buffer(
+// Boot processes run on one CPU and their mappings stay fixed after launch.
+// The scheduler restores the calling root before a blocked syscall resumes.
+pub(crate) fn validate_user_buffer(
     root: ruzt_hal::mem::PhysFrame,
     address: u64,
     len: usize,

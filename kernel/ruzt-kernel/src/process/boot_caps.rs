@@ -1,0 +1,77 @@
+//! Capabilities granted by the boot policy.
+
+use ruzt_abi::{
+    console, CapRights, ROOTSRV_CONSOLE_REPLY, ROOTSRV_CONSOLE_REQUEST, ROOTSRV_KEYBOARD_DATA,
+    ROOTSRV_KEYBOARD_IRQ,
+};
+use ruzt_cap::{CapSlot, CapType, EndpointId};
+
+use crate::cap::{cspace::CSpace, object};
+use crate::{keyboard, serial};
+
+pub(super) fn initial_services() -> (CSpace, CSpace) {
+    let request = endpoint();
+    let reply = endpoint();
+    let mut rootsrv = CSpace::new(3);
+    grant(
+        &mut rootsrv,
+        ROOTSRV_CONSOLE_REQUEST,
+        request,
+        CapRights::WRITE,
+    );
+    grant(&mut rootsrv, ROOTSRV_CONSOLE_REPLY, reply, CapRights::READ);
+    grant(
+        &mut rootsrv,
+        ROOTSRV_KEYBOARD_IRQ,
+        CapType::Irq {
+            irq_num: keyboard::IRQ,
+        },
+        CapRights::READ,
+    );
+    grant(
+        &mut rootsrv,
+        ROOTSRV_KEYBOARD_DATA,
+        CapType::IoPort {
+            port: keyboard::DATA_PORT,
+        },
+        CapRights::READ,
+    );
+
+    let mut consoled = CSpace::new(2);
+    grant(&mut consoled, console::REQUEST, request, CapRights::READ);
+    grant(&mut consoled, console::REPLY, reply, CapRights::WRITE);
+    grant(
+        &mut consoled,
+        console::UART_DATA,
+        CapType::IoPort { port: serial::COM1 },
+        CapRights::WRITE,
+    );
+    grant(
+        &mut consoled,
+        console::UART_STATUS,
+        CapType::IoPort {
+            port: serial::COM1 + 5,
+        },
+        CapRights::READ,
+    );
+    (rootsrv, consoled)
+}
+
+fn endpoint() -> CapType {
+    let id =
+        object::allocate(CapType::Endpoint(EndpointId(0))).expect("allocate boot service endpoint");
+    CapType::Endpoint(EndpointId(id.0))
+}
+
+pub(super) fn grant(cspace: &mut CSpace, index: u64, cap_type: CapType, rights: CapRights) {
+    cspace
+        .insert(
+            index,
+            CapSlot {
+                cap_type,
+                rights,
+                badge: 0,
+            },
+        )
+        .expect("grant boot service capability");
+}

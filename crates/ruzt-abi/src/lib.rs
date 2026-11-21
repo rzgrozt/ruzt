@@ -14,8 +14,8 @@
 /// Both kernel and userland must agree on this value.
 pub const SYS_SYSCALL: u32 = 0x80;
 
-/// Capability slot granted to the initial process for bootstrap IPC.
-pub const ROOTSRV_BOOTSTRAP_ENDPOINT: u64 = 0;
+/// Capability slot granted to the initial process to send console requests.
+pub const ROOTSRV_CONSOLE_REQUEST: u64 = 0;
 
 /// Capability slot granted to the initial process for PS/2 keyboard interrupts.
 pub const ROOTSRV_KEYBOARD_IRQ: u64 = 1;
@@ -25,6 +25,28 @@ pub const ROOTSRV_KEYBOARD_DATA: u64 = 2;
 
 /// Capability slot granted to the initial process when a framebuffer is available.
 pub const ROOTSRV_FRAMEBUFFER: u64 = 3;
+
+/// Capability slot granted to the initial process to receive console replies.
+pub const ROOTSRV_CONSOLE_REPLY: u64 = 4;
+
+/// Boot console service protocol and capability slots.
+pub mod console {
+    /// Receive requests from the initial process.
+    pub const REQUEST: u64 = 0;
+    /// Send replies to the initial process.
+    pub const REPLY: u64 = 1;
+    /// Write to the UART data register.
+    pub const UART_DATA: u64 = 2;
+    /// Read the UART line status register.
+    pub const UART_STATUS: u64 = 3;
+
+    /// Write the inline payload to the console.
+    pub const WRITE: u64 = 1;
+    /// The console wrote the requested bytes.
+    pub const WRITTEN: u64 = 2;
+    /// The console did not recognize the request.
+    pub const UNKNOWN_REQUEST: u64 = 3;
+}
 
 /// System-call numbers.
 ///
@@ -81,6 +103,8 @@ pub enum CapOp {
     ReadPort8 = 8,
     /// Copy a mapped framebuffer's layout into the user pointer in `arg2`.
     FramebufferInfo = 9,
+    /// Write the byte in `arg2` to a port capability.
+    WritePort8 = 10,
 }
 
 /// Byte layout of an RGB framebuffer.
@@ -346,6 +370,7 @@ mod tests {
         assert_eq!(CapOp::Move as u64, 7);
         assert_eq!(CapOp::ReadPort8 as u64, 8);
         assert_eq!(CapOp::FramebufferInfo as u64, 9);
+        assert_eq!(CapOp::WritePort8 as u64, 10);
     }
 
     #[test]

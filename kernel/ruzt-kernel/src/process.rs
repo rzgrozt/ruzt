@@ -1,8 +1,12 @@
 //! Construction of the trusted boot-time user process.
 
+mod boot_caps;
 mod framebuffer;
 mod initrd;
 
+use crate::cap::cspace::CSpace;
+use ruzt_abi::{CapRights, FramebufferInfo, ROOTSRV_FRAMEBUFFER};
+use ruzt_cap::CapType;
 use ruzt_hal::boot::Framebuffer;
 use ruzt_hal::mem::{MapError, PageFlags, PhysFrame, VirtAddr};
 use ruzt_hal_x86_64::mapper::{self, X86_64Mapper};
@@ -39,20 +43,31 @@ fn initial_stack_pointer() -> u64 {
 pub(crate) struct UserProcess {
     pub(crate) root: PhysFrame,
     entry: u64,
-    pub(crate) bootstrap: crate::ipc::bootstrap::Bootstrap,
+    name: &'static str,
+    pub(crate) cspace: CSpace,
+    pub(crate) framebuffer: Option<FramebufferInfo>,
 }
 
-/// Load the initial server and enqueue it on the boot CPU.
+/// Load the initial servers and enqueue them on the boot CPU.
 ///
-/// Any failure stops boot. These frames belong to the initial process for
+/// Any failure stops boot. These frames belong to the boot services for
 /// the lifetime of the system.
 pub(crate) fn enqueue_initial(archive: &'static [u8], framebuffer: Option<Framebuffer>) {
-    let image = if archive.starts_with(b"\x7fELF") {
-        archive
-    } else {
-        initrd::file(archive, b"rootsrv").expect("Unable to load rootsrv from the boot archive")
-    };
-    let elf = crate::elf::load_elf(image).expect("Invalid rootsrv ELF");
+    let rootsrv = initrd::file(archive, b"rootsrv").expect("unable to load rootsrv from initrd");
+    let consoled = initrd::file(archive, b"consoled").expect("unable to load consoled from initrd");
+    let (root_space, console_space) = boot_caps::initial_services();
+    enqueue("consoled", consoled, console_space, None);
+    let root = enqueue("rootsrv", rootsrv, root_space, framebuffer);
+    crate::keyboard::enable_user_driver(root);
+}
+
+fn enqueue(
+    name: &'static str,
+    image: &'static [u8],
+    mut cspace: CSpace,
+    framebuffer: Option<Framebuffer>,
+) -> crate::sched::ThreadId {
+    let elf = crate::elf::load_elf(image).unwrap_or_else(|e| panic!("invalid {name} ELF: {e:?}"));
     assert_eq!(elf.stack_size as u64, STACK_REGION.page_count * PAGE_SIZE);
     let (root, framebuffer) = mapper::with_mapper(|mapper| {
         let root = mapper.create_user_address_space()?;
@@ -94,23 +109,33 @@ pub(crate) fn enqueue_initial(archive: &'static [u8], framebuffer: Option<Frameb
             .flatten();
         Ok::<_, MapError>((root, framebuffer))
     })
-    .expect("Failed to map rootsrv address space");
+    .unwrap_or_else(|e| panic!("failed to map {name} address space: {e:?}"));
 
-    let thread = crate::sched::spawn_user(
+    if framebuffer.is_some() {
+        boot_caps::grant(
+            &mut cspace,
+            ROOTSRV_FRAMEBUFFER,
+            CapType::Framebuffer,
+            CapRights::WRITE,
+        );
+    }
+    crate::sched::spawn_user(
         UserProcess {
             root,
             entry: elf.entry_point,
-            bootstrap: crate::ipc::bootstrap::Bootstrap::new(framebuffer),
+            name,
+            cspace,
+            framebuffer,
         },
-        enter_initial_user,
-    );
-    crate::keyboard::enable_user_driver(thread);
+        enter_user,
+    )
 }
 
-fn enter_initial_user() -> ! {
-    let (entry, root) = crate::sched::with_current_user(|user| (user.entry, user.root))
-        .expect("scheduled initial user process");
-    crate::serial_println!("rootsrv process created, entering user mode...");
+fn enter_user() -> ! {
+    let (entry, root, name) =
+        crate::sched::with_current_user(|user| (user.entry, user.root, user.name))
+            .expect("scheduled user process");
+    crate::serial_println!("{name} process created, entering user mode...");
     #[allow(unsafe_code)]
     // SAFETY: The private root shares the supervisor mappings containing the
     // kernel and its initialized GDT, TSS and IDT. The scheduler installed

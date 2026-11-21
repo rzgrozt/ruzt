@@ -64,10 +64,11 @@ fn test_rootsrv_updates_the_framebuffer_from_keyboard_input() {
         &serial,
         &[
             "Breakpoint returned cleanly.",
+            "consoled process created, entering user mode...",
             "rootsrv process created, entering user mode...",
             "Hello from ring 3, rootsrv alive.",
-            "rootsrv: bootstrap IPC request and reply verified",
-            "rootsrv: ungranted endpoint rejected on send and receive",
+            "rootsrv: console write acknowledged over IPC",
+            "rootsrv: console endpoint rights verified",
             "rootsrv: framebuffer tile drawn",
             "rootsrv: press Space to test keyboard input",
             "rootsrv thread waiting for keyboard IRQ",
@@ -87,15 +88,19 @@ fn build_image(temp: &Path, kernel_feature: &str, with_rootsrv: bool) -> PathBuf
             .args([
                 "build",
                 "--locked",
+                "-p",
+                "rootsrv",
+                "-p",
+                "consoled",
                 "--target",
                 "x86_64-unknown-none",
                 "--target-dir",
             ])
             .arg(&build_dir)
-            .current_dir(workspace.join("servers/rootsrv"))
+            .current_dir(workspace.join("servers"))
             .status()
-            .expect("Failed to build rootsrv");
-        assert!(status.success(), "rootsrv build failed: {status}");
+            .expect("Failed to build boot services");
+        assert!(status.success(), "Boot services build failed: {status}");
     }
 
     let status = Command::new(env!("CARGO"))
@@ -115,7 +120,11 @@ fn build_image(temp: &Path, kernel_feature: &str, with_rootsrv: bool) -> PathBuf
     assert!(status.success(), "Kernel build failed: {status}");
 
     let disk_image = temp.join("ruzt-test.img");
-    let programs: &[&str] = if with_rootsrv { &["rootsrv"] } else { &[] };
+    let programs: &[&str] = if with_rootsrv {
+        &["rootsrv", "consoled"]
+    } else {
+        &[]
+    };
     boot_x86_64::create_image(&disk_image, &debug_dir.join("ruzt-kernel"), programs)
         .expect("Failed to create disk image");
     disk_image

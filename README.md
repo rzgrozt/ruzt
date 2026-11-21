@@ -4,9 +4,9 @@ Ruzt is an experimental, privacy-first operating system built around a Rust micr
 
 ## Development status
 
-The x86_64 kernel contains early boot code, serial diagnostics, interrupt handling, memory management, and a scheduler. The graphical x86_64 boot loads `rootsrv` into its own address space and starts it in ring 3. It checks a request and reply on its bootstrap endpoint and reports the outcome through the debug syscall. The AArch64 boot path is a stub.
+The x86_64 kernel contains early boot code, serial diagnostics, interrupt handling, memory management, and a scheduler. The graphical boot starts `rootsrv` and `consoled` in separate ring-3 address spaces. `rootsrv` sends its greeting over blocking IPC. `consoled` writes it to COM1 and acknowledges it on a separate reply endpoint. The AArch64 boot path is a stub.
 
-The bootstrap endpoint has a single pending reply and is served by a kernel echo handler. The kernel forwards PS/2 interrupts to `rootsrv` and hands it the boot framebuffer. The server holds separate capabilities for the interrupt, data port, and framebuffer. It sleeps while waiting for an interrupt, then decodes the Space key and draws a status tile in ring 3.
+Each service has its own capability space. The console endpoints grant send and receive rights separately. The kernel forwards PS/2 interrupts to `rootsrv` and hands it the boot framebuffer. The server sleeps while waiting for an interrupt, then decodes the Space key and draws a status tile in ring 3.
 
 ## Repository layout
 
@@ -18,6 +18,7 @@ The bootstrap endpoint has a single pending reply and is served by a kernel echo
 | [`crates/`](crates) | Shared ABI, capability types, IPC client, and user-space runtime |
 | [`crates/ruzt-driver-sdk`](crates/ruzt-driver-sdk) | User-space device access through capabilities |
 | [`servers/rootsrv`](servers/rootsrv) | First user-space server |
+| [`servers/consoled`](servers/consoled) | User-space COM1 console service |
 
 ## Local checks
 
@@ -33,7 +34,7 @@ Run the kernel-only and ring-3 QEMU tests with the pinned Rust nightly and compo
 cargo test --locked -p boot-x86_64 --test boot_test -- --nocapture
 ```
 
-Each test builds a BIOS image in a fresh temporary directory. The kernel-only test checks breakpoint recovery, thread scheduling, and blocking IPC. The ring-3 test packages `rootsrv` in a ustar boot archive, checks its IPC round trip and rejection of an ungranted capability, then injects Space with the QEMU monitor and checks screenshots for the tile's color change.
+Each test builds a BIOS image in a fresh temporary directory. The kernel-only test checks breakpoint recovery, scheduling, and blocking IPC. The ring-3 test packages both services in a ustar archive, checks a console write and acknowledgement, and checks capability rights. It then injects Space with the QEMU monitor and verifies the tile's color change in screenshots.
 
 GitHub Actions runs both commands on pushes to `main` and on pull requests.
 
@@ -42,7 +43,7 @@ GitHub Actions runs both commands on pushes to `main` and on pull requests.
 Run these commands from the repository root with QEMU's GTK display backend installed.
 
 ```sh
-(cd servers/rootsrv && cargo build --locked --target x86_64-unknown-none)
+(cd servers && cargo build --locked --target x86_64-unknown-none -p rootsrv -p consoled)
 (cd kernel/ruzt-kernel && cargo build --locked)
 cargo run --locked -p boot-x86_64
 ```

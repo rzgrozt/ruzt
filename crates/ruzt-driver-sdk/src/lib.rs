@@ -32,6 +32,23 @@ pub fn read_port_u8(cap: u64) -> Result<u8, ErrorCode> {
     Ok(byte)
 }
 
+/// Write one byte to the I/O port designated by the capability.
+pub fn write_port_u8(cap: u64, byte: u8) -> Result<(), ErrorCode> {
+    // SAFETY: This operation has no memory operands.
+    let status = unsafe {
+        syscall(
+            SyscallNumber::Invoke,
+            cap,
+            CapOp::WritePort8 as u64,
+            u64::from(byte),
+            0,
+            0,
+            0,
+        )
+    };
+    ErrorCode::from_u64(status)
+}
+
 /// Return the address and layout of the framebuffer mapped for this capability.
 pub fn framebuffer_info(cap: u64) -> Result<FramebufferInfo, ErrorCode> {
     let mut info = FramebufferInfo::default();

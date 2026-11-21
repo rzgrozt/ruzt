@@ -7,7 +7,7 @@ use uart_16550::SerialPort;
 use x86_64::instructions::interrupts;
 
 /// COM1 base I/O port address.
-const COM1: u16 = 0x3F8;
+pub(crate) const COM1: u16 = 0x3F8;
 
 /// Global serial port handle protected by a spinlock.
 ///

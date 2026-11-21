@@ -12,6 +12,7 @@ members = [
     "crates/ruzt-ipc",
     "crates/ruzt-driver-sdk",
     "servers/rootsrv",
+    "servers/consoled",
 ]
 resolver = "2"
 

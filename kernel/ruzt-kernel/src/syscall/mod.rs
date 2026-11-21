@@ -3,6 +3,7 @@
 #![allow(unsafe_code)]
 
 pub mod invoke;
+mod user;
 pub mod user_mem;
 
 use ruzt_abi::{ErrorCode, SyscallArgs, SyscallNumber};
@@ -25,7 +26,7 @@ pub(crate) extern "C" fn syscall_dispatch(args: &SyscallArgs, caller_cs: u64) ->
     let from_user = caller_cs & 3 == 3;
     match SyscallNumber::from(args.number) {
         // The shared kernel CSpace serves only the internal IPC self-test.
-        SyscallNumber::Invoke if from_user => crate::ipc::bootstrap::invoke(args)
+        SyscallNumber::Invoke if from_user => user::invoke(args)
             .map_or_else(ErrorCode::as_u64, |()| ErrorCode::Ok.as_u64()),
         SyscallNumber::Invoke => invoke::invoke(args),
         SyscallNumber::DebugPutChar => {
