@@ -1,7 +1,16 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
+
+// Firmware boot under TCG is sensitive to several guests competing on a
+// small CI runner. Keep independent image builds parallel.
+static QEMU_SLOT: Mutex<()> = Mutex::new(());
+
+fn qemu_slot() -> MutexGuard<'static, ()> {
+    QEMU_SLOT.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 #[test]
 fn test_kernel_boots_and_schedules_blocking_ipc() {
@@ -31,24 +40,24 @@ fn test_rootsrv_updates_the_framebuffer_from_keyboard_input() {
 
     let deadline = Instant::now() + Duration::from_secs(30);
     wait_for_serial(
-        &mut vm.0,
+        &mut vm.child,
         &serial_path,
         "rootsrv thread waiting for keyboard IRQ",
         deadline,
     );
     let initial_image = temp.path().join("before.ppm");
-    assert_tile_color(&mut vm.0, &initial_image, [0x8a, 0xb4, 0xff], deadline);
-    monitor(&mut vm.0, "sendkey spc");
+    assert_tile_color(&mut vm.child, &initial_image, [0x8a, 0xb4, 0xff], deadline);
+    monitor(&mut vm.child, "sendkey spc");
     let serial = wait_for_serial(
-        &mut vm.0,
+        &mut vm.child,
         &serial_path,
         "rootsrv: Space key received",
         deadline,
     );
     let updated_image = temp.path().join("after.ppm");
-    assert_tile_color(&mut vm.0, &updated_image, [0x7f, 0xe3, 0xc4], deadline);
-    monitor(&mut vm.0, "quit");
-    assert!(vm.0.wait().expect("Failed to wait for QEMU").success());
+    assert_tile_color(&mut vm.child, &updated_image, [0x7f, 0xe3, 0xc4], deadline);
+    monitor(&mut vm.child, "quit");
+    assert!(vm.child.wait().expect("Failed to wait for QEMU").success());
     assert_markers(
         &serial,
         &[
@@ -74,26 +83,26 @@ fn test_timer_preempts_cpu_bound_user_code() {
     let mut vm = start_guest(&disk_image, &serial_path);
     let deadline = Instant::now() + Duration::from_secs(30);
     wait_for_serial(
-        &mut vm.0,
+        &mut vm.child,
         &serial_path,
         "consoled: entering CPU-bound test loop",
         deadline,
     );
     wait_for_serial(
-        &mut vm.0,
+        &mut vm.child,
         &serial_path,
         "rootsrv thread waiting for keyboard IRQ",
         deadline,
     );
-    monitor(&mut vm.0, "sendkey spc");
+    monitor(&mut vm.child, "sendkey spc");
     wait_for_serial(
-        &mut vm.0,
+        &mut vm.child,
         &serial_path,
         "rootsrv: Space key received",
         deadline,
     );
-    monitor(&mut vm.0, "quit");
-    assert!(vm.0.wait().expect("Failed to wait for QEMU").success());
+    monitor(&mut vm.child, "quit");
+    assert!(vm.child.wait().expect("Failed to wait for QEMU").success());
 }
 
 #[derive(Clone, Copy)]
@@ -122,20 +131,20 @@ fn assert_console_shutdown_isolated(services: Services, reason: &str) {
     let mut vm = start_guest(&disk_image, &serial_path);
     let deadline = Instant::now() + Duration::from_secs(30);
     wait_for_serial(
-        &mut vm.0,
+        &mut vm.child,
         &serial_path,
         "rootsrv thread waiting for keyboard IRQ",
         deadline,
     );
-    monitor(&mut vm.0, "sendkey spc");
+    monitor(&mut vm.child, "sendkey spc");
     let serial = wait_for_serial(
-        &mut vm.0,
+        &mut vm.child,
         &serial_path,
         "rootsrv: Space key received",
         deadline,
     );
-    monitor(&mut vm.0, "quit");
-    assert!(vm.0.wait().expect("Failed to wait for QEMU").success());
+    monitor(&mut vm.child, "quit");
+    assert!(vm.child.wait().expect("Failed to wait for QEMU").success());
     assert_markers(
         &serial,
         &[
@@ -209,6 +218,7 @@ fn build_image(temp: &Path, kernel_feature: &str, services: Services) -> PathBuf
 }
 
 fn run_smoke_test(disk_image: &Path) -> String {
+    let _slot = qemu_slot();
     let output = Command::new("timeout")
         .args(["30s", "qemu-system-x86_64", "-drive"])
         .arg(format!("format=raw,file={}", disk_image.display()))
@@ -239,11 +249,15 @@ fn run_smoke_test(disk_image: &Path) -> String {
     serial.into_owned()
 }
 
-struct Guest(Child);
+struct Guest {
+    child: Child,
+    _slot: MutexGuard<'static, ()>,
+}
 
 fn start_guest(disk_image: &Path, serial_path: &Path) -> Guest {
-    Guest(
-        Command::new("timeout")
+    let slot = qemu_slot();
+    Guest {
+        child: Command::new("timeout")
             .args(["35s", "qemu-system-x86_64", "-drive"])
             .arg(format!("format=raw,file={}", disk_image.display()))
             .arg("-serial")
@@ -253,15 +267,16 @@ fn start_guest(disk_image: &Path, serial_path: &Path) -> Guest {
             .stdout(Stdio::null())
             .spawn()
             .expect("Failed to run QEMU with a monitor"),
-    )
+        _slot: slot,
+    }
 }
 
 impl Drop for Guest {
     fn drop(&mut self) {
-        if let Some(mut monitor) = self.0.stdin.take() {
+        if let Some(mut monitor) = self.child.stdin.take() {
             let _ = writeln!(monitor, "quit");
         }
-        let _ = self.0.wait();
+        let _ = self.child.wait();
     }
 }
 
