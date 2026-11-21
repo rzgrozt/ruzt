@@ -8,7 +8,6 @@ use ruzt_abi::{
 };
 use ruzt_cap::{CapSlot, CapType, EndpointId};
 use ruzt_hal::mem::PhysFrame;
-use spin::Mutex;
 use x86_64::instructions::port::PortReadOnly;
 
 use crate::cap::{cspace::CSpace, object};
@@ -17,123 +16,135 @@ use crate::syscall::user_mem::{read_user_buffer, write_user_buffer, write_user_b
 
 type MessageBytes = [u8; size_of::<IpcMessage>()];
 
-struct Bootstrap {
-    root: PhysFrame,
+pub(crate) struct Bootstrap {
     cspace: CSpace,
     endpoint: EndpointId,
     reply: Option<MessageBytes>,
     framebuffer: Option<FramebufferInfo>,
 }
 
-static BOOTSTRAP: Mutex<Option<Bootstrap>> = Mutex::new(None);
-
-pub(crate) fn init(root: PhysFrame, framebuffer: Option<FramebufferInfo>) {
-    let mut cspace = CSpace::new(2);
-    let endpoint = EndpointId(
-        object::allocate(CapType::Endpoint(EndpointId(0)))
-            .expect("Failed to allocate rootsrv endpoint")
-            .0,
-    );
-    cspace
-        .insert(
-            ROOTSRV_BOOTSTRAP_ENDPOINT,
-            CapSlot {
-                cap_type: CapType::Endpoint(endpoint),
-                rights: CapRights::READ.union(CapRights::WRITE),
-                badge: 0,
-            },
-        )
-        .expect("Failed to grant rootsrv endpoint");
-    for (index, cap_type) in [
-        (
-            ROOTSRV_KEYBOARD_IRQ,
-            CapType::Irq {
-                irq_num: keyboard::IRQ,
-            },
-        ),
-        (
-            ROOTSRV_KEYBOARD_DATA,
-            CapType::IoPort {
-                port: keyboard::DATA_PORT,
-            },
-        ),
-    ] {
-        cspace
-            .insert(
-                index,
-                CapSlot {
-                    cap_type,
-                    rights: CapRights::READ,
-                    badge: 0,
-                },
-            )
-            .expect("Failed to grant keyboard capability");
-    }
-    if framebuffer.is_some() {
-        cspace
-            .insert(
-                ROOTSRV_FRAMEBUFFER,
-                CapSlot {
-                    cap_type: CapType::Framebuffer,
-                    rights: CapRights::WRITE,
-                    badge: 0,
-                },
-            )
-            .expect("Failed to grant the framebuffer capability");
-    }
-
-    *BOOTSTRAP.lock() = Some(Bootstrap {
-        root,
-        cspace,
-        endpoint,
-        reply: None,
-        framebuffer,
-    });
-    keyboard::enable_user_driver();
+enum InvokeOutcome {
+    Complete,
+    WaitForKeyboard,
 }
 
 pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
-    let mut guard = BOOTSTRAP.lock();
-    let bootstrap = guard.as_mut().ok_or(ErrorCode::InvalidCap)?;
-    let slot = *bootstrap.cspace.lookup(args.arg0)?;
-    match slot.cap_type {
-        CapType::Endpoint(id) if id == bootstrap.endpoint => bootstrap.echo(args, slot.rights),
-        CapType::Irq {
-            irq_num: keyboard::IRQ,
-        } if args.arg1 == CapOp::Wait as u64 => {
-            require_read(slot.rights)?;
-            if keyboard::take_irq() {
-                Ok(())
-            } else {
-                Err(ErrorCode::WouldBlock)
-            }
-        }
-        CapType::IoPort { port } if args.arg1 == CapOp::ReadPort8 as u64 => {
-            require_read(slot.rights)?;
-            write_user_buffer_with(bootstrap.root, args.arg2, 1, || {
-                #[allow(unsafe_code)]
-                // SAFETY: The checked, kernel-issued capability names the
-                // port and grants read access. No caller controls the port.
-                let byte = unsafe { PortReadOnly::<u8>::new(port).read() };
-                [byte]
-            })
-        }
-        CapType::Framebuffer if args.arg1 == CapOp::FramebufferInfo as u64 => {
-            if !slot.rights.contains(CapRights::WRITE) {
-                return Err(ErrorCode::CapRightsViolation);
-            }
-            let info = bootstrap.framebuffer.ok_or(ErrorCode::InvalidCap)?;
-            #[allow(unsafe_code)]
-            // SAFETY: The C-layout integer fields occupy all 40 bytes.
-            let bytes: [u8; size_of::<FramebufferInfo>()] = unsafe { core::mem::transmute(info) };
-            write_user_buffer(bootstrap.root, args.arg2, &bytes)
-        }
-        _ => Err(ErrorCode::InvalidCap),
+    let outcome =
+        crate::sched::with_current_user(|process| process.bootstrap.invoke(process.root, args))
+            .ok_or(ErrorCode::InvalidCap)??;
+    // The scheduler lock used for capability lookup has been released.
+    if let InvokeOutcome::WaitForKeyboard = outcome {
+        keyboard::wait_irq();
     }
+    Ok(())
 }
 
 impl Bootstrap {
-    fn echo(&mut self, args: &SyscallArgs, rights: CapRights) -> Result<(), ErrorCode> {
+    pub(crate) fn new(framebuffer: Option<FramebufferInfo>) -> Self {
+        let mut cspace = CSpace::new(2);
+        let endpoint = EndpointId(
+            object::allocate(CapType::Endpoint(EndpointId(0)))
+                .expect("Failed to allocate rootsrv endpoint")
+                .0,
+        );
+        cspace
+            .insert(
+                ROOTSRV_BOOTSTRAP_ENDPOINT,
+                CapSlot {
+                    cap_type: CapType::Endpoint(endpoint),
+                    rights: CapRights::READ.union(CapRights::WRITE),
+                    badge: 0,
+                },
+            )
+            .expect("Failed to grant rootsrv endpoint");
+        for (index, cap_type) in [
+            (
+                ROOTSRV_KEYBOARD_IRQ,
+                CapType::Irq {
+                    irq_num: keyboard::IRQ,
+                },
+            ),
+            (
+                ROOTSRV_KEYBOARD_DATA,
+                CapType::IoPort {
+                    port: keyboard::DATA_PORT,
+                },
+            ),
+        ] {
+            cspace
+                .insert(
+                    index,
+                    CapSlot {
+                        cap_type,
+                        rights: CapRights::READ,
+                        badge: 0,
+                    },
+                )
+                .expect("Failed to grant keyboard capability");
+        }
+        if framebuffer.is_some() {
+            cspace
+                .insert(
+                    ROOTSRV_FRAMEBUFFER,
+                    CapSlot {
+                        cap_type: CapType::Framebuffer,
+                        rights: CapRights::WRITE,
+                        badge: 0,
+                    },
+                )
+                .expect("Failed to grant the framebuffer capability");
+        }
+
+        Self {
+            cspace,
+            endpoint,
+            reply: None,
+            framebuffer,
+        }
+    }
+
+    fn invoke(&mut self, root: PhysFrame, args: &SyscallArgs) -> Result<InvokeOutcome, ErrorCode> {
+        let slot = *self.cspace.lookup(args.arg0)?;
+        match slot.cap_type {
+            CapType::Endpoint(id) if id == self.endpoint => self.echo(root, args, slot.rights)?,
+            CapType::Irq {
+                irq_num: keyboard::IRQ,
+            } if args.arg1 == CapOp::Wait as u64 => {
+                require_read(slot.rights)?;
+                return Ok(InvokeOutcome::WaitForKeyboard);
+            }
+            CapType::IoPort { port } if args.arg1 == CapOp::ReadPort8 as u64 => {
+                require_read(slot.rights)?;
+                write_user_buffer_with(root, args.arg2, 1, || {
+                    #[allow(unsafe_code)]
+                    // SAFETY: The checked, kernel-issued capability names the
+                    // port and grants read access. No caller controls the port.
+                    let byte = unsafe { PortReadOnly::<u8>::new(port).read() };
+                    [byte]
+                })?;
+            }
+            CapType::Framebuffer if args.arg1 == CapOp::FramebufferInfo as u64 => {
+                if !slot.rights.contains(CapRights::WRITE) {
+                    return Err(ErrorCode::CapRightsViolation);
+                }
+                let info = self.framebuffer.ok_or(ErrorCode::InvalidCap)?;
+                #[allow(unsafe_code)]
+                // SAFETY: The C-layout integer fields occupy all 40 bytes.
+                let bytes: [u8; size_of::<FramebufferInfo>()] =
+                    unsafe { core::mem::transmute(info) };
+                write_user_buffer(root, args.arg2, &bytes)?;
+            }
+            _ => return Err(ErrorCode::InvalidCap),
+        }
+        Ok(InvokeOutcome::Complete)
+    }
+
+    fn echo(
+        &mut self,
+        root: PhysFrame,
+        args: &SyscallArgs,
+        rights: CapRights,
+    ) -> Result<(), ErrorCode> {
         match args.arg1 {
             op if op == CapOp::Send as u64 => {
                 if !rights.contains(CapRights::WRITE) {
@@ -143,13 +154,13 @@ impl Bootstrap {
                     return Err(ErrorCode::WouldBlock);
                 }
                 let mut request = [0; size_of::<IpcMessage>()];
-                read_user_buffer(self.root, args.arg2, &mut request)?;
+                read_user_buffer(root, args.arg2, &mut request)?;
                 self.reply = Some(echo_reply(&request)?);
             }
             op if op == CapOp::Recv as u64 => {
                 require_read(rights)?;
                 let reply = self.reply.as_ref().ok_or(ErrorCode::WouldBlock)?;
-                write_user_buffer(self.root, args.arg2, reply)?;
+                write_user_buffer(root, args.arg2, reply)?;
                 self.reply = None;
             }
             _ => return Err(ErrorCode::NotImplemented),

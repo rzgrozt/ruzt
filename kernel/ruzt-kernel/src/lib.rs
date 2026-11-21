@@ -117,24 +117,25 @@ pub fn main(boot_info: &'static mut BootInfo) -> ! {
 
     if let Some(image) = boot_info.initrd {
         let framebuffer = screen.map(boot_screen::BootScreen::hand_off).or(undrawn_framebuffer);
-        process::launch(image, framebuffer);
+        process::enqueue_initial(image, framebuffer);
+    } else {
+        assert!(!cfg!(feature = "qemu-rootsrv-test"), "rootsrv is missing from the boot image");
+
+        sched::spawn(thread_a);
+        sched::spawn(thread_b);
+        serial_println!("Threads spawned.");
+
+        sched::spawn(keyboard_echo);
+        serial_println!("keyboard_echo task started");
+
+        // Kernel-internal IPC self-test.
+        ipc_test_init();
+        sched::spawn(ipc_test_sender);
+        sched::spawn(ipc_test_receiver);
+        serial_println!("IPC self-test threads spawned");
+
+        boot_screen::attach(screen);
     }
-    assert!(!cfg!(feature = "qemu-rootsrv-test"), "rootsrv is missing from the boot image");
-
-    sched::spawn(thread_a);
-    sched::spawn(thread_b);
-    serial_println!("Threads spawned.");
-
-    sched::spawn(keyboard_echo);
-    serial_println!("keyboard_echo task started");
-
-    // Kernel-internal IPC self-test.
-    ipc_test_init();
-    sched::spawn(ipc_test_sender);
-    sched::spawn(ipc_test_receiver);
-    serial_println!("IPC self-test threads spawned");
-
-    boot_screen::attach(screen);
     serial_println!("Enabling interrupts...");
     ruzt_hal_x86_64::cpu::X86_64Cpu::enable_interrupts();
 

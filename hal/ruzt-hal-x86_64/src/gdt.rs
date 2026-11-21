@@ -48,8 +48,7 @@ impl Ring3TrapStack {
 }
 
 // SAFETY: [Category 2/9 - Data races and Send/Sync] The wrapper exposes only
-// the stack's one-past-end address. Rust never reads or writes the bytes, and
-// Phase 2.4 loads this stack into the single boot CPU's TSS exactly once.
+// the stack's one-past-end address. Rust never reads or writes the bytes.
 unsafe impl Sync for Ring3TrapStack {}
 
 struct GdtState {
@@ -60,17 +59,24 @@ struct GdtState {
 }
 
 static RING3_TRAP_STACK: Ring3TrapStack = Ring3TrapStack::new();
-static TASK_STATE_SEGMENT: Once<TaskStateSegment> = Once::new();
+
+struct CpuTss(UnsafeCell<TaskStateSegment>);
+
+// SAFETY: The boot CPU is the only CPU that reads or updates the TSS.
+unsafe impl Sync for CpuTss {}
+
+static TASK_STATE_SEGMENT: CpuTss = CpuTss(UnsafeCell::new(TaskStateSegment::new()));
 static GDT: Once<GdtState> = Once::new();
 static INIT: Once<()> = Once::new();
 
-fn build_gdt(tss: &'static TaskStateSegment) -> GdtState {
+unsafe fn build_gdt(tss: *const TaskStateSegment) -> GdtState {
     let mut table = GlobalDescriptorTable::<GDT_ENTRY_COUNT>::empty();
     let kernel_code = table.append(Descriptor::kernel_code_segment());
     let kernel_data = table.append(Descriptor::kernel_data_segment());
     let user_code = table.append(Descriptor::user_code_segment());
     let user_data = table.append(Descriptor::user_data_segment());
-    let tss = table.append(Descriptor::tss_segment(tss));
+    // SAFETY: The caller supplies the address of a static TSS.
+    let tss = table.append(unsafe { Descriptor::tss_segment_unchecked(tss) });
 
     assert_eq!(u64::from(kernel_code.0), KERNEL_CODE_SELECTOR);
     assert_eq!(u64::from(kernel_data.0), KERNEL_DATA_SELECTOR);
@@ -86,26 +92,24 @@ fn build_gdt(tss: &'static TaskStateSegment) -> GdtState {
     }
 }
 
-/// Install the Phase 2.4 GDT and TSS on the current CPU.
+/// Install the GDT and TSS on the current CPU.
 ///
 /// The GDT layout is fixed to kernel code/data, user code/data, then the
-/// two-entry TSS descriptor. The TSS RSP0 points to the exclusive top of a
-/// dedicated 64 KiB stack.
+/// two-entry TSS descriptor. The TSS starts with a dedicated 64 KiB stack,
+/// and the scheduler installs the active user thread's stack before entry.
 ///
 /// # Safety
 ///
 /// Call this exactly once from CPL0 on the boot CPU with interrupts disabled,
 /// before loading the IDT or entering ring 3. The kernel image containing the
 /// GDT, TSS, and trap stack must remain mapped in every installed CR3. No other
-/// CPU may concurrently use this single Phase 2.4 TSS or its trap stack.
+/// CPU may concurrently use this TSS or its trap stack.
 pub unsafe fn init() {
     INIT.call_once(|| {
-        let tss = TASK_STATE_SEGMENT.call_once(|| {
-            let mut tss = TaskStateSegment::new();
-            tss.privilege_stack_table[0] = RING3_TRAP_STACK.top();
-            tss
-        });
-        let gdt = GDT.call_once(|| build_gdt(tss));
+        // SAFETY: The boot CPU owns this TSS and interrupts are disabled.
+        unsafe { set_trap_stack(RING3_TRAP_STACK.top().as_u64()) };
+        // SAFETY: The TSS lives at a fixed address for the kernel's lifetime.
+        let gdt = GDT.call_once(|| unsafe { build_gdt(TASK_STATE_SEGMENT.0.get()) });
 
         gdt.table.load();
 
@@ -127,6 +131,23 @@ pub unsafe fn init() {
     });
 }
 
+/// Set the kernel stack used for the next privilege transition from ring 3.
+///
+/// # Safety
+/// Call on the boot CPU with interrupts disabled. The stack must be aligned,
+/// remain live while it is installed, and be mapped supervisor-only in every
+/// active address space.
+pub unsafe fn set_trap_stack(top: u64) {
+    let tss = TASK_STATE_SEGMENT.0.get();
+    // SAFETY: The caller owns this CPU's TSS. RSP0 is packed, so use an
+    // unaligned write through the raw pointer without borrowing the field.
+    unsafe {
+        core::ptr::addr_of_mut!((*tss).privilege_stack_table)
+            .cast::<VirtAddr>()
+            .write_unaligned(VirtAddr::new(top));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,7 +156,8 @@ mod tests {
 
     #[test]
     fn descriptor_insertion_order_produces_required_selectors() {
-        let gdt = build_gdt(&TEST_TSS);
+        // SAFETY: TEST_TSS is static for the whole test process.
+        let gdt = unsafe { build_gdt(&TEST_TSS) };
 
         assert_eq!(u64::from(gdt.kernel_code.0), KERNEL_CODE_SELECTOR);
         assert_eq!(u64::from(gdt.kernel_data.0), KERNEL_DATA_SELECTOR);
@@ -147,10 +169,7 @@ mod tests {
         let start = VirtAddr::from_ptr(RING3_TRAP_STACK.bytes.get()).as_u64();
         let top = RING3_TRAP_STACK.top().as_u64();
 
-        assert_eq!(
-            top - start,
-            u64::try_from(RING3_TRAP_STACK_SIZE).unwrap(),
-        );
+        assert_eq!(top - start, RING3_TRAP_STACK_SIZE as u64);
         assert_eq!(top & 0xF, 0);
     }
 }

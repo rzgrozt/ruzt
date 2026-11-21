@@ -5,8 +5,8 @@
 use ruzt_abi::{CapOp, ErrorCode, FramebufferInfo, SyscallNumber};
 use ruzt_runtime::syscall::syscall;
 
-/// Consume a pending interrupt, or return [`ErrorCode::WouldBlock`].
-pub fn poll_irq(cap: u64) -> Result<(), ErrorCode> {
+/// Sleep until an interrupt is pending, then consume the notification.
+pub fn wait_irq(cap: u64) -> Result<(), ErrorCode> {
     // SAFETY: This operation has no memory operands.
     let status = unsafe { syscall(SyscallNumber::Invoke, cap, CapOp::Wait as u64, 0, 0, 0, 0) };
     ErrorCode::from_u64(status)

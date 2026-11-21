@@ -44,7 +44,7 @@ fn test_rootsrv_updates_the_framebuffer_from_keyboard_input() {
     wait_for_serial(
         &mut vm.0,
         &serial_path,
-        "rootsrv: press Space to test keyboard input",
+        "rootsrv thread waiting for keyboard IRQ",
         deadline,
     );
     let initial_image = temp.path().join("before.ppm");
@@ -70,6 +70,7 @@ fn test_rootsrv_updates_the_framebuffer_from_keyboard_input() {
             "rootsrv: ungranted endpoint rejected on send and receive",
             "rootsrv: framebuffer tile drawn",
             "rootsrv: press Space to test keyboard input",
+            "rootsrv thread waiting for keyboard IRQ",
             "rootsrv: Space key received",
         ],
     );

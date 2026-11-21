@@ -1,10 +1,11 @@
 //! Round-robin scheduler.
 
+use crate::cap::object::KObjectId;
+use crate::process::UserProcess;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
-use crate::cap::object::KObjectId;
 
 /// Opaque handle for a scheduler thread.
 pub type ThreadId = usize;
@@ -20,22 +21,22 @@ pub enum ThreadState {
     BlockedRecv(KObjectId),
     /// Thread is blocked waiting on a notification.
     BlockedWait(KObjectId),
+    /// A user driver is blocked waiting for a device interrupt.
+    BlockedIrq(u32),
 }
 
 /// Per-thread state.
 struct Thread {
     /// Owned kernel stack (64 KiB).  `None` for the idle thread.
-    #[allow(dead_code)]
-    stack: Option<alloc::boxed::Box<[u8; 64 * 1024]>>,
+    stack: Option<alloc::boxed::Box<[u8]>>,
     /// Saved stack pointer from the last context switch.
     rsp: u64,
     /// Current scheduling state.
     state: ThreadState,
     /// IPC message buffer for rendezvous delivery.
     message: Option<ruzt_abi::IpcMessage>,
-    /// Per-thread capability space.
-    #[allow(dead_code)]
-    cspace: Option<alloc::boxed::Box<crate::cap::cspace::CSpace>>,
+    /// Address space and capabilities of a user-mode thread.
+    user: Option<UserProcess>,
 }
 
 /// Scheduler state.
@@ -44,6 +45,7 @@ struct Scheduler {
     threads: Vec<alloc::boxed::Box<Thread>>,
     run_queue: VecDeque<ThreadId>,
     current: ThreadId,
+    kernel_cr3: u64,
 }
 
 static SCHEDULER: Mutex<Option<Scheduler>> = Mutex::new(None);
@@ -64,18 +66,23 @@ pub fn should_switch() -> bool {
 /// Initialise the scheduler, registering the current execution context as the
 /// idle thread (thread 0).
 pub fn init() {
+    #[cfg(not(test))]
+    let kernel_cr3 = ruzt_hal_x86_64::context::current_cr3();
+    #[cfg(test)]
+    let kernel_cr3 = 0;
     let mut guard = SCHEDULER.lock();
     let mut sched = Scheduler {
         threads: Vec::with_capacity(16),
         run_queue: VecDeque::new(),
         current: 0,
+        kernel_cr3,
     };
     sched.threads.push(alloc::boxed::Box::new(Thread {
         stack: None,
         rsp: 0,
         state: ThreadState::Runnable,
         message: None,
-        cspace: None,
+        user: None,
     }));
     sched.run_queue.push_back(0);
     *guard = Some(sched);
@@ -84,9 +91,13 @@ pub fn init() {
 /// Block the current thread with the given reason and yield immediately.
 ///
 /// Must be called with interrupts disabled.
-#[allow(unsafe_code)]
 pub fn block_current(reason: ThreadState) {
-    crate::serial_println!("block_current: thread={} reason={:?}", current_thread_id(), reason);
+    #[cfg(feature = "qemu-smoke-test")]
+    crate::serial_println!(
+        "block_current: thread={} reason={:?}",
+        current_thread_id(),
+        reason
+    );
     let mut guard = SCHEDULER.lock();
     let sched = guard.as_mut().expect("scheduler not initialised");
     let current_id = sched.current;
@@ -98,17 +109,7 @@ pub fn block_current(reason: ThreadState) {
     // Switch to next runnable thread.
     let next_id = *sched.run_queue.front().unwrap_or(&0);
     if next_id != current_id {
-        let old_rsp = &mut sched.threads[current_id].rsp as *mut u64;
-        let new_rsp = sched.threads[next_id].rsp;
-        sched.current = next_id;
-        // Release the mutex before switching so the next thread can acquire it.
-        drop(guard);
-        // SAFETY: `old_rsp` points to valid writable memory in the scheduler.
-        // `new_rsp` was initialised by `init_stack` or a previous switch.
-        // Interrupts are disabled by the caller.
-        unsafe {
-            ruzt_hal_x86_64::context::switch(old_rsp, new_rsp);
-        }
+        switch_to(guard, next_id);
     }
 }
 
@@ -120,6 +121,22 @@ pub fn unblock(thread_id: ThreadId) {
         sched.threads[thread_id].state = ThreadState::Runnable;
         sched.run_queue.push_back(thread_id);
     }
+}
+
+pub(crate) fn wake_irq(thread_id: ThreadId, irq: u32) {
+    let mut guard = SCHEDULER.lock();
+    let sched = guard.as_mut().expect("scheduler not initialised");
+    if sched.threads[thread_id].state == ThreadState::BlockedIrq(irq) {
+        sched.threads[thread_id].state = ThreadState::Runnable;
+        sched.run_queue.push_back(thread_id);
+        request_switch();
+    }
+}
+
+pub(crate) fn with_current_user<T>(f: impl FnOnce(&mut UserProcess) -> T) -> Option<T> {
+    let mut guard = SCHEDULER.lock();
+    let sched = guard.as_mut()?;
+    sched.threads[sched.current].user.as_mut().map(f)
 }
 
 /// Return the current thread's ID.
@@ -156,23 +173,29 @@ pub fn take_thread_message(thread_id: ThreadId) -> Option<ruzt_abi::IpcMessage> 
 /// Allocates a 64 KiB stack, sets up an initial frame, and pushes the thread
 /// onto the run queue.
 pub fn spawn(f: fn() -> !) -> ThreadId {
+    spawn_thread(f, None)
+}
+
+pub(crate) fn spawn_user(user: UserProcess, entry: fn() -> !) -> ThreadId {
+    spawn_thread(entry, Some(user))
+}
+
+fn spawn_thread(f: fn() -> !, user: Option<UserProcess>) -> ThreadId {
     let mut guard = SCHEDULER.lock();
     let sched = guard.as_mut().expect("scheduler not initialised");
 
     let id = sched.threads.len();
-    let mut stack = alloc::boxed::Box::new([0u8; 64 * 1024]);
+    let mut stack = alloc::vec![0u8; 64 * 1024].into_boxed_slice();
 
     #[allow(unsafe_code)]
-    let rsp = unsafe {
-        ruzt_hal_x86_64::context::init_stack(&mut *stack, f)
-    };
+    let rsp = unsafe { ruzt_hal_x86_64::context::init_stack(&mut *stack, f) };
 
     sched.threads.push(alloc::boxed::Box::new(Thread {
         stack: Some(stack),
         rsp,
         state: ThreadState::Runnable,
         message: None,
-        cspace: None,
+        user,
     }));
     sched.run_queue.push_back(id);
 
@@ -183,7 +206,6 @@ pub fn spawn(f: fn() -> !) -> ThreadId {
 /// context switch.
 ///
 /// Must be called with interrupts disabled to prevent re-entrancy.
-#[allow(unsafe_code)]
 pub fn yield_thread() {
     let mut guard = SCHEDULER.lock();
     let sched = guard.as_mut().expect("scheduler not initialised");
@@ -211,18 +233,34 @@ pub fn yield_thread() {
     }
 
     if next_id != current_id {
-        let old_rsp = &mut sched.threads[current_id].rsp as *mut u64;
-        let new_rsp = sched.threads[next_id].rsp;
-        sched.current = next_id;
-        // Release the mutex before switching so the next thread can acquire it.
-        drop(guard);
-        // SAFETY: `old_rsp` points to valid writable memory in the scheduler.
-        // `new_rsp` was initialised by `init_stack` or a previous switch.
-        // Interrupts are disabled by the caller.
-        unsafe {
-            ruzt_hal_x86_64::context::switch(old_rsp, new_rsp);
-        }
+        switch_to(guard, next_id);
     }
+}
+
+#[allow(unsafe_code)]
+fn switch_to(mut guard: spin::MutexGuard<'_, Option<Scheduler>>, next_id: ThreadId) {
+    let sched = guard.as_mut().expect("scheduler not initialised");
+    let old_rsp = &mut sched.threads[sched.current].rsp as *mut u64;
+    let next = &sched.threads[next_id];
+    let new_rsp = next.rsp;
+    let new_cr3 = if let Some(user) = &next.user {
+        let stack = next
+            .stack
+            .as_ref()
+            .expect("user thread needs a kernel stack");
+        let stack_top = (stack.as_ptr() as u64 + stack.len() as u64) & !0xF;
+        // SAFETY: Interrupts are disabled, and this owned kernel stack lies in
+        // the common supervisor mapping of every supported page-table root.
+        unsafe { ruzt_hal_x86_64::gdt::set_trap_stack(stack_top) };
+        user.root.base.as_u64()
+    } else {
+        sched.kernel_cr3
+    };
+    sched.current = next_id;
+    drop(guard);
+    // SAFETY: The scheduler owns both live kernel stacks. The next root maps
+    // both stacks, the switch code and all other higher-half kernel mappings.
+    unsafe { ruzt_hal_x86_64::context::switch(old_rsp, new_rsp, new_cr3) };
 }
 
 #[cfg(test)]
@@ -255,7 +293,10 @@ mod tests {
         {
             let guard = SCHEDULER.lock();
             let sched = guard.as_ref().unwrap();
-            assert!(matches!(sched.threads[id].state, ThreadState::BlockedSend(_)));
+            assert!(matches!(
+                sched.threads[id].state,
+                ThreadState::BlockedSend(_)
+            ));
             assert!(!sched.run_queue.contains(&id));
         }
 

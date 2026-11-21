@@ -6,7 +6,7 @@ Ruzt is an experimental, privacy-first operating system built around a Rust micr
 
 The x86_64 kernel contains early boot code, serial diagnostics, interrupt handling, memory management, and a scheduler. The graphical x86_64 boot loads `rootsrv` into its own address space and starts it in ring 3. It checks a request and reply on its bootstrap endpoint and reports the outcome through the debug syscall. The AArch64 boot path is a stub.
 
-The bootstrap endpoint has a single pending reply and is served by a kernel echo handler. The kernel forwards PS/2 interrupts to `rootsrv` and hands it the boot framebuffer. The server holds separate capabilities for the interrupt, data port, and framebuffer. It decodes the Space key and draws a status tile in ring 3. Keyboard interrupts are currently polled while the scheduler supports only kernel threads.
+The bootstrap endpoint has a single pending reply and is served by a kernel echo handler. The kernel forwards PS/2 interrupts to `rootsrv` and hands it the boot framebuffer. The server holds separate capabilities for the interrupt, data port, and framebuffer. It sleeps while waiting for an interrupt, then decodes the Space key and draws a status tile in ring 3.
 
 ## Repository layout
 

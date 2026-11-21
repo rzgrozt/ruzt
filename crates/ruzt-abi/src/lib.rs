@@ -67,7 +67,7 @@ pub enum CapOp {
     Recv = 1,
     /// Signal a notification object.
     Signal = 2,
-    /// Wait on a notification or poll a device interrupt.
+    /// Wait on a notification or a device interrupt.
     Wait = 3,
     /// Delete a capability.
     Delete = 4,

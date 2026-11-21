@@ -75,7 +75,7 @@ fn main() -> ! {
     check_bootstrap_ipc();
 
     assert_eq!(
-        ruzt_driver_sdk::poll_irq(u64::MAX),
+        ruzt_driver_sdk::wait_irq(u64::MAX),
         Err(ErrorCode::InvalidCap)
     );
     assert_eq!(
@@ -96,20 +96,15 @@ fn main() -> ! {
     }
     write_line("rootsrv: press Space to test keyboard input");
     loop {
-        match ruzt_driver_sdk::poll_irq(ROOTSRV_KEYBOARD_IRQ) {
-            Ok(()) => {
-                let scancode = ruzt_driver_sdk::read_port_u8(ROOTSRV_KEYBOARD_DATA)
-                    .expect("read PS/2 keyboard data");
-                // The boot firmware configures translated set-1 scancodes.
-                if scancode == 0x39 {
-                    if let Some(tile) = &mut tile {
-                        tile.toggle();
-                    }
-                    write_line("rootsrv: Space key received");
-                }
+        ruzt_driver_sdk::wait_irq(ROOTSRV_KEYBOARD_IRQ).expect("wait for PS/2 keyboard IRQ");
+        let scancode =
+            ruzt_driver_sdk::read_port_u8(ROOTSRV_KEYBOARD_DATA).expect("read PS/2 keyboard data");
+        // The boot firmware configures translated set-1 scancodes.
+        if scancode == 0x39 {
+            if let Some(tile) = &mut tile {
+                tile.toggle();
             }
-            Err(ErrorCode::WouldBlock) => core::hint::spin_loop(),
-            Err(error) => panic!("keyboard IRQ polling failed: {error:?}"),
+            write_line("rootsrv: Space key received");
         }
     }
 }

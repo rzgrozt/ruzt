@@ -2,6 +2,12 @@
 
 use crate::gdt::{USER_CODE_SELECTOR, USER_DATA_SELECTOR};
 
+/// Read the active page-table root and its CR3 flags.
+pub fn current_cr3() -> u64 {
+    let (frame, flags) = x86_64::registers::control::Cr3::read_raw();
+    frame.start_address().as_u64() | u64::from(flags)
+}
+
 /// Set up a fresh kernel stack so that the first context switch into it
 /// "returns" into `entry`.
 ///
@@ -14,7 +20,10 @@ use crate::gdt::{USER_CODE_SELECTOR, USER_DATA_SELECTOR};
 /// `stack` must be at least 79 bytes long and must remain valid and
 /// exclusively owned by the thread until the thread exits.
 pub unsafe fn init_stack(stack: &mut [u8], entry: fn() -> !) -> u64 {
-    assert!(stack.len() >= 79, "stack too small (need at least 79 bytes)");
+    assert!(
+        stack.len() >= 79,
+        "stack too small (need at least 79 bytes)"
+    );
     let top = stack.as_mut_ptr() as u64 + stack.len() as u64;
     let aligned_top = top & !0xF;
     let rsp = aligned_top - 64;
@@ -38,10 +47,11 @@ pub unsafe fn init_stack(stack: &mut [u8], entry: fn() -> !) -> u64 {
 /// # Safety
 /// - `old_rsp` must point to a valid, writable `u64`.
 /// - `new_rsp` must be a valid stack pointer initialised by [`init_stack`].
+/// - `new_cr3` must be valid and map the kernel and both kernel stacks.
 /// - Interrupts must be disabled by the caller.
 /// - The current thread's stack must remain live until the thread is resumed.
 #[unsafe(naked)]
-pub unsafe extern "C" fn switch(_old_rsp: *mut u64, _new_rsp: u64) {
+pub unsafe extern "C" fn switch(_old_rsp: *mut u64, _new_rsp: u64, _new_cr3: u64) {
     // SAFETY: [Categories 3/6/10/13 - Dangling, alignment, bounds, library
     // contract] The caller provides writable `rdi`, a frame-aligned `rsi`
     // created by `init_stack` or `switch`, and disabled interrupts. Each push,
@@ -54,6 +64,11 @@ pub unsafe extern "C" fn switch(_old_rsp: *mut u64, _new_rsp: u64) {
         "push r14",
         "push r15",
         "mov [rdi], rsp",
+        "mov rax, cr3",
+        "cmp rax, rdx",
+        "je 2f",
+        "mov cr3, rdx",
+        "2:",
         "mov rsp, rsi",
         "pop r15",
         "pop r14",

@@ -5,30 +5,41 @@ use x86_64::instructions::port::PortReadOnly;
 
 static SCANCODE_READY: AtomicBool = AtomicBool::new(false);
 static SCANCODE: AtomicU8 = AtomicU8::new(0);
-static USER_DRIVER: AtomicBool = AtomicBool::new(false);
+static USER_DRIVER: spin::Once<crate::sched::ThreadId> = spin::Once::new();
 static IRQ_PENDING: AtomicBool = AtomicBool::new(false);
 
 pub(crate) const IRQ: u32 = 1;
 pub(crate) const DATA_PORT: u16 = 0x60;
 
 /// Route the keyboard interrupt to the initial user process.
-pub(crate) fn enable_user_driver() {
-    USER_DRIVER.store(true, Ordering::Relaxed);
+pub(crate) fn enable_user_driver(thread: crate::sched::ThreadId) {
+    USER_DRIVER.call_once(|| thread);
 }
 
-/// Consume the pending interrupt so the driver can read the controller.
-pub(crate) fn take_irq() -> bool {
-    IRQ_PENDING.swap(false, Ordering::Relaxed)
+/// Sleep until the driver has an interrupt to handle.
+/// Called from the syscall interrupt gate with interrupts disabled.
+pub(crate) fn wait_irq() {
+    while !IRQ_PENDING.swap(false, Ordering::Relaxed) {
+        // This check and the scheduler's blocked transition are atomic
+        // with respect to this CPU's keyboard IRQ.
+        #[cfg(feature = "qemu-rootsrv-test")]
+        {
+            static PROBE: spin::Once<()> = spin::Once::new();
+            PROBE.call_once(|| crate::serial_println!("rootsrv thread waiting for keyboard IRQ"));
+        }
+        crate::sched::block_current(crate::sched::ThreadState::BlockedIrq(IRQ));
+    }
 }
 
 /// Called from the keyboard ISR (vector 33).
 /// For the boot-time user driver, only records the interrupt.
 #[allow(unsafe_code)]
 pub fn on_interrupt() {
-    if USER_DRIVER.load(Ordering::Relaxed) {
+    if let Some(&thread) = USER_DRIVER.get() {
         // The controller drops the IRQ line when the driver reads the byte.
         // On the edge-triggered PIC, no other interrupt arrives for that byte.
         IRQ_PENDING.store(true, Ordering::Relaxed);
+        crate::sched::wake_irq(thread, IRQ);
         return;
     }
 

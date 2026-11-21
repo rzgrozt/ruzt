@@ -35,11 +35,17 @@ fn initial_stack_pointer() -> u64 {
     STACK_REGION.end().unwrap() - 8
 }
 
-/// Map the bootloader-provided ELF and enter it on the boot CPU.
+pub(crate) struct UserProcess {
+    pub(crate) root: PhysFrame,
+    entry: u64,
+    pub(crate) bootstrap: crate::ipc::bootstrap::Bootstrap,
+}
+
+/// Map the bootloader-provided ELF and enqueue it on the boot CPU.
 ///
 /// Any failure stops boot. These frames belong to the initial process for
 /// the lifetime of the system.
-pub(crate) fn launch(image: &'static [u8], framebuffer: Option<Framebuffer>) -> ! {
+pub(crate) fn enqueue_initial(image: &'static [u8], framebuffer: Option<Framebuffer>) {
     let elf = crate::elf::load_elf(image).expect("Invalid rootsrv ELF");
     assert_eq!(elf.stack_size as u64, STACK_REGION.page_count * PAGE_SIZE);
     let (root, framebuffer) = mapper::with_mapper(|mapper| {
@@ -84,18 +90,28 @@ pub(crate) fn launch(image: &'static [u8], framebuffer: Option<Framebuffer>) -> 
     })
     .expect("Failed to map rootsrv address space");
 
-    crate::ipc::bootstrap::init(root, framebuffer);
+    let thread = crate::sched::spawn_user(
+        UserProcess {
+            root,
+            entry: elf.entry_point,
+            bootstrap: crate::ipc::bootstrap::Bootstrap::new(framebuffer),
+        },
+        enter_initial_user,
+    );
+    crate::keyboard::enable_user_driver(thread);
+}
+
+fn enter_initial_user() -> ! {
+    let (entry, root) = crate::sched::with_current_user(|user| (user.entry, user.root))
+        .expect("scheduled initial user process");
     crate::serial_println!("rootsrv process created, entering user mode...");
     #[allow(unsafe_code)]
     // SAFETY: The private root shares the supervisor mappings containing the
-    // kernel and its initialized GDT, TSS and IDT. The ELF entry and initial
-    // stack are mapped with the permissions required by enter_user.
+    // kernel and its initialized GDT, TSS and IDT. The scheduler installed
+    // this thread's kernel stack for traps. The mapped entry and user stack
+    // have the permissions required by enter_user.
     unsafe {
-        ruzt_hal_x86_64::context::enter_user(
-            elf.entry_point,
-            initial_stack_pointer(),
-            root.base.as_u64(),
-        )
+        ruzt_hal_x86_64::context::enter_user(entry, initial_stack_pointer(), root.base.as_u64())
     }
 }
 
