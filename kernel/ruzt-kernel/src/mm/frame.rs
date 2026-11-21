@@ -9,7 +9,7 @@ use ruzt_hal::mem::{FrameAllocator, PhysAddr, PhysFrame};
 use spin::{Mutex, Once};
 
 /// Size of a physical frame in bytes.
-const FRAME_SIZE: usize = 4096;
+const FRAME_SIZE: usize = PhysFrame::SIZE;
 
 /// Maximum number of frames we can track.  4 M frames = 16 GiB of RAM.
 const MAX_FRAMES: usize = 4 * 1024 * 1024;
@@ -20,6 +20,7 @@ const BITMAP_WORDS: usize = MAX_FRAMES / 64;
 /// 0 bit = free, 1 bit = allocated.
 pub struct BitmapAllocator {
     bitmap: [u64; BITMAP_WORDS],
+    // Lower bound for the first free frame.
     next_hint: usize,
     max_frame: usize,
 }
@@ -41,8 +42,12 @@ impl BitmapAllocator {
 
         for region in boot_info.memory_map {
             if matches!(region.kind, MemoryRegionKind::Usable) {
-                let start = (region.start.as_u64() as usize) / FRAME_SIZE;
-                let end = ((region.end.as_u64() as usize) / FRAME_SIZE).min(MAX_FRAMES);
+                let start = region.start.as_u64().div_ceil(FRAME_SIZE as u64);
+                let end = (region.end.as_u64() / FRAME_SIZE as u64).min(MAX_FRAMES as u64);
+                if start >= end {
+                    continue;
+                }
+                let (start, end) = (start as usize, end as usize);
 
                 for frame in start..end {
                     let word = frame / 64;
@@ -108,26 +113,24 @@ impl FrameAllocator for BitmapAllocator {
             return None;
         }
 
-        for start in self.next_hint..self.max_frame {
-            if start + count > self.max_frame {
-                return None;
+        let last_start = self.max_frame.checked_sub(count)?;
+        let mut start = self.next_hint;
+        while start <= last_start {
+            let end = start + count;
+            if let Some(used) = (start..end).find(|&frame| !self.is_free(frame)) {
+                // Every start through this occupied frame would intersect it.
+                start = used + 1;
+                continue;
             }
 
-            let mut all_free = true;
-            for i in 0..count {
-                if !self.is_free(start + i) {
-                    all_free = false;
-                    break;
-                }
+            for frame in start..end {
+                self.alloc_specific(frame);
             }
-
-            if all_free {
-                for i in 0..count {
-                    self.alloc_specific(start + i);
-                }
-                self.next_hint = start + count;
-                return PhysFrame::from_base(PhysAddr::new((start * FRAME_SIZE) as u64));
+            // A skipped prefix may contain smaller free runs.
+            if self.next_hint == start {
+                self.next_hint = end;
             }
+            return PhysFrame::from_base(PhysAddr::new((start * FRAME_SIZE) as u64));
         }
 
         None
@@ -238,6 +241,7 @@ mod tests {
         a.init(&info);
 
         let _ = a.allocate().expect("first");
+        assert!(a.allocate_contiguous(usize::MAX).is_none());
         let _ = a.allocate().expect("second");
         assert!(a.allocate().is_none(), "third allocate should fail (only 2 frames)");
     }
@@ -279,5 +283,43 @@ mod tests {
             a.allocate_contiguous(2).is_none(),
             "should fail when no 2 contiguous free frames exist"
         );
+    }
+
+    #[test]
+    fn contiguous_allocation_preserves_smaller_free_runs() {
+        static REGIONS: [MemoryRegion; 2] = [
+            MemoryRegion {
+                start: PhysAddr::new(0x0010_0000),
+                end: PhysAddr::new(0x0010_2000),
+                kind: MemoryRegionKind::Usable,
+            },
+            MemoryRegion {
+                start: PhysAddr::new(0x0014_0000),
+                end: PhysAddr::new(0x0014_4000),
+                kind: MemoryRegionKind::Usable,
+            },
+        ];
+        let mut allocator = BitmapAllocator::new();
+        allocator.init(&boot_info_from(&REGIONS));
+
+        let large = allocator.allocate_contiguous(4).unwrap();
+        let small = allocator.allocate_contiguous(2).unwrap();
+        assert_eq!(large.base.as_u64(), 0x0014_0000);
+        assert_eq!(small.base.as_u64(), 0x0010_0000);
+        assert!(allocator.allocate().is_none());
+    }
+
+    #[test]
+    fn only_whole_usable_frames_are_allocated() {
+        static REGIONS: [MemoryRegion; 1] = [MemoryRegion {
+            start: PhysAddr::new(0x0010_0001),
+            end: PhysAddr::new(0x0010_2fff),
+            kind: MemoryRegionKind::Usable,
+        }];
+        let mut allocator = BitmapAllocator::new();
+        allocator.init(&boot_info_from(&REGIONS));
+
+        assert_eq!(allocator.allocate().unwrap().base.as_u64(), 0x0010_1000);
+        assert!(allocator.allocate().is_none());
     }
 }
