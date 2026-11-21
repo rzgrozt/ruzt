@@ -106,7 +106,6 @@ pub fn init() {
         message: None,
         user: None,
     }));
-    sched.run_queue.push_back(0);
     *guard = Some(sched);
 }
 
@@ -129,10 +128,7 @@ pub fn block_current(reason: ThreadState) {
     sched.mark_blocked(current_id, reason);
 
     // Switch to next runnable thread.
-    let next_id = *sched
-        .run_queue
-        .front()
-        .expect("the idle thread is runnable");
+    let next_id = sched.run_queue.front().copied().unwrap_or(0);
     switch_to(guard, next_id);
 }
 
@@ -242,25 +238,11 @@ pub fn yield_thread() {
 
     let current_id = sched.current;
 
-    // Rotate the run queue, skipping blocked threads.
-    if let Some(id) = sched.run_queue.pop_front() {
-        if matches!(sched.threads[id].state, ThreadState::Runnable) {
-            sched.run_queue.push_back(id);
-        }
+    // Idle stays outside the run queue and runs only when no task is ready.
+    if sched.run_queue.front() == Some(&current_id) {
+        sched.run_queue.rotate_left(1);
     }
-
-    // Find the next runnable thread.
-    let mut next_id = current_id;
-    for _ in 0..sched.run_queue.len() {
-        if let Some(&id) = sched.run_queue.front() {
-            if matches!(sched.threads[id].state, ThreadState::Runnable) {
-                next_id = id;
-                break;
-            }
-            // Skip blocked thread and rotate.
-            sched.run_queue.pop_front();
-        }
-    }
+    let next_id = sched.run_queue.front().copied().unwrap_or(0);
 
     if next_id != current_id {
         switch_to(guard, next_id);
@@ -334,7 +316,7 @@ mod tests {
         assert_eq!(first_waiter(reason), None);
         let guard = SCHEDULER.lock();
         let sched = guard.as_ref().unwrap();
-        assert_eq!(sched.run_queue, [0, later_spawned, earlier_spawned]);
+        assert_eq!(sched.run_queue, [later_spawned, earlier_spawned]);
         assert_eq!(sched.wait_queue, [unrelated]);
     }
 

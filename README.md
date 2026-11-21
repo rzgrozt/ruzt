@@ -36,6 +36,8 @@ cargo test --locked -p boot-x86_64 --test boot_test -- --nocapture
 
 Each test builds a BIOS image in a fresh temporary directory. The kernel-only test checks breakpoint recovery, scheduling, and blocking IPC. The ring-3 test packages both services in a ustar archive, checks a console write and acknowledgement, and checks capability rights. It then injects Space with the QEMU monitor and verifies the tile's color change in screenshots.
 
+A separate guest keeps the console service CPU-bound after its first reply. It verifies that timer preemption still lets `rootsrv` handle keyboard input.
+
 GitHub Actions runs both commands on pushes to `main` and on pull requests.
 
 ## Graphical boot

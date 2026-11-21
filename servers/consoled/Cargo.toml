@@ -3,6 +3,9 @@ name = "consoled"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+qemu-preemption-test = []
+
 [dependencies]
 ruzt-abi = { path = "../../crates/ruzt-abi" }
 ruzt-driver-sdk = { path = "../../crates/ruzt-driver-sdk" }

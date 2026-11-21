@@ -92,7 +92,7 @@ extern "x86-interrupt" fn page_fault_handler(
 }
 
 #[allow(unsafe_code)]
-extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn timer_handler(stack_frame: InterruptStackFrame) {
     ruzt_hal_x86_64::time::increment_tick();
     TIMER_TICK_PRINTED.call_once(|| {
         crate::boot_screen::timer_started();
@@ -101,8 +101,13 @@ extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
             ruzt_hal_x86_64::time::X86_64Timer::now_monotonic_ns()
         );
     });
-    crate::sched::request_switch();
     ruzt_hal_x86_64::pic::send_eoi(0);
+    // Kernel execution can hold locks and schedules at its own safe points.
+    if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
+        crate::sched::yield_thread();
+    } else {
+        crate::sched::request_switch();
+    }
 }
 
 #[allow(unsafe_code)]
