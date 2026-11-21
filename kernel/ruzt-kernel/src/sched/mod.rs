@@ -203,9 +203,14 @@ pub(crate) fn cancel_endpoint_waiters(endpoint: KObjectId) {
     });
 }
 
-pub(crate) fn cancel_revoked_waiters() {
+pub(crate) fn apply_capability_removals() {
     let mut guard = SCHEDULER.lock();
     let Some(sched) = guard.as_mut() else { return };
+    for thread in &mut sched.threads {
+        if let Some(user) = &mut thread.user {
+            user.unmap_revoked_frames();
+        }
+    }
     sched.fail_waiters(ErrorCode::InvalidCap, |thread| {
         thread
             .wait_capability
@@ -502,7 +507,7 @@ mod tests {
             scheduler.mark_blocked(revoked, ThreadState::BlockedWait(id));
         }
         caps.revoke(0).unwrap();
-        cancel_revoked_waiters();
+        apply_capability_removals();
         let guard = SCHEDULER.lock();
         let scheduler = guard.as_ref().unwrap();
         assert_eq!(

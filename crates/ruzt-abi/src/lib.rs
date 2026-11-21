@@ -31,6 +31,11 @@ pub const ROOTSRV_CONSOLE_REPLY: u64 = 4;
 
 /// Notification that the console signals after receiving an initial write.
 pub const ROOTSRV_CONSOLE_NOTIFICATION: u64 = 8;
+/// Initial RAM frame that the root process can share with the console.
+pub const ROOTSRV_CONSOLE_FRAME: u64 = 9;
+
+/// Byte length of a frame supported by the user mapping ABI.
+pub const FRAME_BYTES: usize = 4096;
 
 /// Boot console service protocol and capability slots.
 pub mod console {
@@ -44,6 +49,8 @@ pub mod console {
     pub const UART_STATUS: u64 = 3;
     /// Empty slot where the console accepts its boot notification.
     pub const RECEIVED_NOTIFICATION: u64 = 4;
+    /// Following slot where the console accepts its read-only frame.
+    pub const RECEIVED_FRAME: u64 = 5;
 
     /// Write the inline payload to the console.
     pub const WRITE: u64 = 1;
@@ -51,10 +58,12 @@ pub mod console {
     pub const WRITTEN: u64 = 2;
     /// The console did not recognize the request.
     pub const UNKNOWN_REQUEST: u64 = 3;
-    /// Check whether the transferred notification was revoked.
+    /// Check that the boot grants were revoked and that a fresh frame cap can remap the page.
     pub const CHECK_REVOCATION: u64 = 4;
-    /// The transferred notification is no longer valid.
+    /// Both boot grants were revoked and the old mapping was removed.
     pub const REVOKED: u64 = 5;
+    /// Write bytes from the transferred frame. The inline payload is a little-endian u16 byte count.
+    pub const WRITE_SHARED: u64 = 6;
 }
 
 /// System-call numbers.
@@ -99,6 +108,7 @@ pub enum CapOp {
     Send = 0,
     /// Receive an IPC message through an endpoint. For capability transfer,
     /// `arg3` is the first receiving slot and `arg4` is the slot capacity.
+    /// The output buffer must be in a non-revocable mapping.
     Recv = 1,
     /// Signal a notification object.
     Signal = 2,
@@ -120,6 +130,10 @@ pub enum CapOp {
     WritePort8 = 10,
     /// Remove all capabilities derived from the invoked capability.
     Revoke = 11,
+    /// Map the invoked frame at `arg2`. In `arg3`, 0 requests read-only and 1 requests read-write.
+    MapFrame = 12,
+    /// Remove the caller's mapping created with this frame capability.
+    UnmapFrame = 13,
 }
 
 /// Byte layout of an RGB framebuffer.
@@ -309,6 +323,8 @@ pub enum ErrorCode {
     NotImplemented = 7,
     /// The destination capability slot is already occupied.
     SlotOccupied = 8,
+    /// The requested virtual address or frame capability already has a mapping.
+    MappingExists = 9,
 }
 
 impl ErrorCode {
@@ -321,7 +337,7 @@ impl ErrorCode {
     ///
     /// # Errors
     ///
-    /// Returns the corresponding error for codes 1 through 8. Unknown values
+    /// Returns the corresponding error for codes 1 through 9. Unknown values
     /// are reported as [`ErrorCode::NotImplemented`].
     pub const fn from_u64(value: u64) -> Result<(), ErrorCode> {
         match value {
@@ -334,6 +350,7 @@ impl ErrorCode {
             6 => Err(Self::WouldBlock),
             7 => Err(Self::NotImplemented),
             8 => Err(Self::SlotOccupied),
+            9 => Err(Self::MappingExists),
             _ => Err(Self::NotImplemented),
         }
     }
@@ -407,6 +424,8 @@ mod tests {
         assert_eq!(CapOp::FramebufferInfo as u64, 9);
         assert_eq!(CapOp::WritePort8 as u64, 10);
         assert_eq!(CapOp::Revoke as u64, 11);
+        assert_eq!(CapOp::MapFrame as u64, 12);
+        assert_eq!(CapOp::UnmapFrame as u64, 13);
     }
 
     #[test]
@@ -419,6 +438,8 @@ mod tests {
         assert_eq!(ErrorCode::NotFound.as_u64(), 5);
         assert_eq!(ErrorCode::WouldBlock.as_u64(), 6);
         assert_eq!(ErrorCode::NotImplemented.as_u64(), 7);
+        assert_eq!(ErrorCode::SlotOccupied.as_u64(), 8);
+        assert_eq!(ErrorCode::MappingExists.as_u64(), 9);
     }
 
     #[test]
@@ -434,6 +455,8 @@ mod tests {
         assert_eq!(ErrorCode::from_u64(5), Err(ErrorCode::NotFound));
         assert_eq!(ErrorCode::from_u64(6), Err(ErrorCode::WouldBlock));
         assert_eq!(ErrorCode::from_u64(7), Err(ErrorCode::NotImplemented));
+        assert_eq!(ErrorCode::from_u64(8), Err(ErrorCode::SlotOccupied));
+        assert_eq!(ErrorCode::from_u64(9), Err(ErrorCode::MappingExists));
     }
 
     #[test]

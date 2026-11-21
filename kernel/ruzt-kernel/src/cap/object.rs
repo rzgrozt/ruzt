@@ -15,11 +15,6 @@ const _: () = assert!(MAX_OBJECTS.is_power_of_two());
 #[repr(transparent)]
 pub struct KObjectId(pub u64);
 
-/// Opaque handle for an address space.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(transparent)]
-pub struct AddressSpaceId(pub u64);
-
 /// A kernel object stored in the global table.
 ///
 /// All variants are `Copy` so the table can be initialised with `[None; N]`.
@@ -52,14 +47,12 @@ pub enum KernelObject {
         /// Physical frame holding the top-level page table.
         root_page_table: PhysFrame,
     },
-    /// Mapped physical frame.
+    /// Physical frame.
     Frame {
         /// Physical frame backing this mapping.
         phys: PhysFrame,
-        /// Address spaces that have this frame mapped.
-        mapped_in: [AddressSpaceId; 4],
-        /// Number of valid entries in `mapped_in`.
-        mapped_count: u8,
+        /// Whether the object owns one 4 KiB allocator frame.
+        owned: bool,
     },
     /// Capability table node.
     CNode {
@@ -137,13 +130,31 @@ pub fn init() {
 
 /// Allocate a kernel object and return its generation-qualified identity.
 pub fn allocate(cap_type: CapType) -> Result<KObjectId, ErrorCode> {
+    allocate_with(|| kernel_object_from_cap_type(cap_type))
+}
+
+pub(super) fn allocate_shared_frame() -> Result<(KObjectId, PhysFrame), ErrorCode> {
+    let phys = crate::mm::frame::allocate().ok_or(ErrorCode::NoMemory)?;
+    // SAFETY: The fresh allocator frame is exclusive and in the physmap.
+    unsafe { ruzt_hal_x86_64::mapper::zero_frame(phys) };
+    let frame = KernelObject::Frame { phys, owned: true };
+    let result = allocate_with(|| Ok(frame)).map(|id| (id, phys));
+    if result.is_err() {
+        crate::mm::frame::deallocate(phys);
+    }
+    result
+}
+
+fn allocate_with(
+    build: impl FnOnce() -> Result<KernelObject, ErrorCode>,
+) -> Result<KObjectId, ErrorCode> {
     let mut table = TABLE.lock();
     let (index, entry) = table
         .iter_mut()
         .enumerate()
         .find(|(_, entry)| entry.object.is_none() && entry.generation < MAX_GENERATION)
         .ok_or(ErrorCode::NoMemory)?;
-    entry.object = Some(kernel_object_from_cap_type(cap_type)?);
+    entry.object = Some(build()?);
     entry.generation += 1;
     Ok(KObjectId((entry.generation << INDEX_BITS) | index as u64))
 }
@@ -210,14 +221,47 @@ pub(super) fn release(id: KObjectId) {
     }
 }
 
-fn destroy(object: KernelObject) {
-    if let KernelObject::CNode { slots, count, .. } = object {
-        // SAFETY: This is the unique boxed slice from CNode allocation.
-        unsafe {
-            drop(alloc::boxed::Box::from_raw(
-                core::ptr::slice_from_raw_parts_mut(slots, count),
-            ))
+/// Keeps mapped RAM alive until after its last page table alias is removed.
+pub(crate) struct FramePin {
+    id: KObjectId,
+    pub(crate) phys: PhysFrame,
+}
+
+impl FramePin {
+    pub(super) fn new(id: KObjectId) -> Result<Self, ErrorCode> {
+        // The caller holds the derivation lock and already has a reference
+        // through the live capability, so the object cannot disappear here.
+        let Some(KernelObject::Frame { phys, owned: true }) = get(id) else {
+            return Err(ErrorCode::InvalidCap);
         };
+        retain(id)?;
+        Ok(Self { id, phys })
+    }
+}
+
+impl Drop for FramePin {
+    fn drop(&mut self) {
+        release(self.id);
+    }
+}
+
+fn destroy(object: KernelObject) {
+    match object {
+        KernelObject::CNode { slots, count, .. } => {
+            // SAFETY: This is the unique boxed slice from CNode allocation.
+            unsafe {
+                drop(alloc::boxed::Box::from_raw(
+                    core::ptr::slice_from_raw_parts_mut(slots, count),
+                ))
+            };
+        }
+        KernelObject::Frame { phys, owned: true } => {
+            // SAFETY: The final reference is gone, including every mapping,
+            // and the frame still belongs to this object until deallocation.
+            unsafe { ruzt_hal_x86_64::mapper::zero_frame(phys) };
+            crate::mm::frame::deallocate(phys);
+        }
+        _ => {}
     }
 }
 
@@ -252,11 +296,7 @@ fn kernel_object_from_cap_type(cap_type: CapType) -> Result<KernelObject, ErrorC
         CapType::AddressSpace(_) => Ok(KernelObject::AddressSpace {
             root_page_table: crate::mm::frame::allocate().ok_or(ErrorCode::NoMemory)?,
         }),
-        CapType::Frame { phys, size: _ } => Ok(KernelObject::Frame {
-            phys,
-            mapped_in: [AddressSpaceId(0); 4],
-            mapped_count: 0,
-        }),
+        CapType::Frame { phys, size: _ } => Ok(KernelObject::Frame { phys, owned: false }),
         CapType::CNode { radix_bits, .. } => {
             let count = 1usize
                 .checked_shl(u32::from(radix_bits))

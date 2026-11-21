@@ -4,11 +4,15 @@
 mod tile;
 
 use ruzt_abi::{
-    console, CapRights, CapTransferSlot, ErrorCode, IpcMessage, ROOTSRV_CONSOLE_NOTIFICATION,
-    ROOTSRV_CONSOLE_REPLY, ROOTSRV_CONSOLE_REQUEST, ROOTSRV_FRAMEBUFFER, ROOTSRV_KEYBOARD_DATA,
-    ROOTSRV_KEYBOARD_IRQ,
+    console, CapRights, CapTransferSlot, ErrorCode, IpcMessage, FRAME_BYTES, ROOTSRV_CONSOLE_FRAME,
+    ROOTSRV_CONSOLE_NOTIFICATION, ROOTSRV_CONSOLE_REPLY, ROOTSRV_CONSOLE_REQUEST,
+    ROOTSRV_FRAMEBUFFER, ROOTSRV_KEYBOARD_DATA, ROOTSRV_KEYBOARD_IRQ,
 };
 use ruzt_runtime::{debug_putchar, runtime_init};
+
+const CONSOLE_BUFFER: u64 = 0x5000_0000;
+const GREETING: &[u8] = b"Hello from ring 3, rootsrv alive.\n";
+const _: () = assert!(GREETING.len() <= FRAME_BYTES);
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
@@ -23,17 +27,22 @@ fn write_line(text: &str) {
 
 fn greet_via_console() -> Result<(), ErrorCode> {
     let ungranted = u64::MAX;
-    let payload = b"Hello from ring 3, rootsrv alive.\n";
     let mut request = IpcMessage::default();
-    request.label = console::WRITE;
-    request.length = payload.len() as u16;
-    request.cap_count = 1;
+    let payload_len = (GREETING.len() as u16).to_le_bytes();
+    request.label = console::WRITE_SHARED;
+    request.length = payload_len.len() as u16;
+    request.data[..payload_len.len()].copy_from_slice(&payload_len);
+    request.cap_count = 2;
     request.caps[0] = CapTransferSlot {
         cptr: ROOTSRV_CONSOLE_NOTIFICATION,
         rights: CapRights::WRITE,
         badge: 0,
     };
-    request.data[..payload.len()].copy_from_slice(payload);
+    request.caps[1] = CapTransferSlot {
+        cptr: ROOTSRV_CONSOLE_FRAME,
+        rights: CapRights::READ,
+        badge: 0,
+    };
 
     let mut reply = IpcMessage::default();
     assert_eq!(
@@ -53,6 +62,23 @@ fn greet_via_console() -> Result<(), ErrorCode> {
         Err(ErrorCode::CapRightsViolation)
     );
 
+    let stack_page = (&raw const reply as u64) & !(FRAME_BYTES as u64 - 1);
+    assert_eq!(
+        ruzt_ipc::map_frame(ROOTSRV_CONSOLE_FRAME, stack_page, true),
+        Err(ErrorCode::MappingExists)
+    );
+    ruzt_ipc::map_frame(ROOTSRV_CONSOLE_FRAME, CONSOLE_BUFFER, true)?;
+    // SAFETY: The writable mapping is live and large enough for this payload.
+    // The peer has not received a grant yet, and we never create a reference
+    // into the shared page.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            GREETING.as_ptr(),
+            CONSOLE_BUFFER as *mut u8,
+            GREETING.len(),
+        );
+    }
+
     ruzt_ipc::send(ROOTSRV_CONSOLE_REQUEST, &request)?;
     ruzt_ipc::recv(ROOTSRV_CONSOLE_REPLY, &mut reply)?;
     assert_eq!(reply.label, console::WRITTEN);
@@ -62,14 +88,22 @@ fn greet_via_console() -> Result<(), ErrorCode> {
     write_line("rootsrv: console endpoint rights verified");
 
     ruzt_ipc::revoke(ROOTSRV_CONSOLE_NOTIFICATION)?;
-    let request = IpcMessage {
+    ruzt_ipc::revoke(ROOTSRV_CONSOLE_FRAME)?;
+    let mut request = IpcMessage {
         label: console::CHECK_REVOCATION,
+        cap_count: 1,
         ..IpcMessage::default()
+    };
+    request.caps[0] = CapTransferSlot {
+        cptr: ROOTSRV_CONSOLE_FRAME,
+        rights: CapRights::READ,
+        badge: 0,
     };
     ruzt_ipc::send(ROOTSRV_CONSOLE_REQUEST, &request)?;
     ruzt_ipc::recv(ROOTSRV_CONSOLE_REPLY, &mut reply)?;
     assert_eq!(reply.label, console::REVOKED);
     write_line("rootsrv: notification transferred and revoked across capability spaces");
+    write_line("rootsrv: shared frame mapped read-only by console and unmapped on revocation");
     Ok(())
 }
 
@@ -93,7 +127,9 @@ fn check_revocation() {
 
 fn main() -> ! {
     check_revocation();
-    match greet_via_console() {
+    let result = greet_via_console();
+    ruzt_ipc::delete(ROOTSRV_CONSOLE_FRAME).expect("release boot console frame");
+    match result {
         Ok(()) => {}
         Err(ErrorCode::NotFound) => write_line("rootsrv: console disconnected"),
         Err(error) => panic!("console IPC failed: {error:?}"),

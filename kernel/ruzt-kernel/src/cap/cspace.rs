@@ -2,10 +2,10 @@
 
 use alloc::{collections::BTreeMap, vec, vec::Vec};
 use ruzt_abi::{ErrorCode, IPC_CAP_SLOTS};
-use ruzt_cap::{CapRights, CapSlot, CapType, NULL_SLOT};
+use ruzt_cap::{CapRights, CapSlot, CapType, FrameSize, NULL_SLOT};
 use spin::Mutex;
 
-use super::object::{self, KObjectId};
+use super::object::{self, FramePin, KObjectId};
 
 /// A capability identity that survives moves between slots.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -172,6 +172,46 @@ impl CSpace {
             .get(&id)
             .map(|node| node.slot)
             .ok_or(ErrorCode::InvalidCap)
+    }
+
+    pub(crate) fn shared_frame(
+        &self,
+        cptr: u64,
+        rights: CapRights,
+    ) -> Result<(CapabilityId, FramePin), ErrorCode> {
+        let id = self.slots[self.index(cptr)?].ok_or(ErrorCode::InvalidCap)?;
+        let tree = DERIVATIONS.lock();
+        let node = tree.nodes.get(&id).ok_or(ErrorCode::InvalidCap)?;
+        let object = node.object.ok_or(ErrorCode::InvalidCap)?;
+        if !matches!(node.slot.cap_type, CapType::Frame { .. }) {
+            return Err(ErrorCode::InvalidCap);
+        }
+        if !node.slot.rights.contains(rights) {
+            return Err(ErrorCode::CapRightsViolation);
+        }
+        Ok((id, FramePin::new(object)?))
+    }
+
+    pub(crate) fn provision_shared_frame(&mut self, cptr: u64) -> Result<(), ErrorCode> {
+        let (object, phys) = object::allocate_shared_frame()?;
+        let result = self.install(
+            cptr,
+            CapSlot {
+                cap_type: CapType::Frame {
+                    phys,
+                    size: FrameSize::Size4K,
+                },
+                rights: CapRights::READ
+                    .union(CapRights::WRITE)
+                    .union(CapRights::GRANT),
+                badge: 0,
+            },
+            Some(object),
+        );
+        if result.is_err() {
+            object::deallocate(object);
+        }
+        result
     }
 
     /// Install a capability issued by the kernel at boot.

@@ -4,11 +4,11 @@ Ruzt is an experimental, privacy-first operating system built around a Rust micr
 
 ## Development status
 
-The x86_64 kernel contains early boot code, serial diagnostics, interrupt handling, memory management, and a scheduler. The graphical boot starts `rootsrv` and `consoled` in separate ring-3 address spaces. `rootsrv` sends its greeting over blocking IPC. `consoled` writes it to COM1 and acknowledges it on a separate reply endpoint. The AArch64 boot path is a stub.
+The x86_64 kernel contains early boot code, serial diagnostics, interrupt handling, memory management, and a scheduler. The graphical boot starts `rootsrv` and `consoled` in separate ring-3 address spaces. `rootsrv` writes its greeting into a shared page and transfers a read-only frame capability over blocking IPC. `consoled` writes the greeting to COM1 and acknowledges it on a separate reply endpoint. The AArch64 boot path is a stub.
 
 Each service has its own capability space. The console endpoints grant send and receive rights separately. The kernel forwards PS/2 interrupts to `rootsrv` and hands it the boot framebuffer. The server sleeps while waiting for an interrupt, then decodes the Space key and draws a status tile in ring 3.
 
-Capabilities keep kernel objects alive while copies exist. A caller with grant rights can derive a capability with reduced rights. Moving a capability preserves its ancestry, and revoking it removes all its descendants and wakes waiters that lost their authority. IPC transfers install capabilities only in empty slots designated by the receiver.
+Capabilities keep kernel objects alive while copies exist. A caller with grant rights can derive a capability with reduced rights. Moving a capability preserves its ancestry, and revoking it removes all its descendants, unmaps their shared pages, and wakes waiters that lost their authority. IPC transfers install capabilities only in empty slots designated by the receiver. Each frame capability can establish one non-executable mapping in the caller, and mapped memory stays allocated until the final page-table alias is removed.
 
 When a boot service exits or takes a user-mode fault, the kernel closes its console channels, wakes blocked peers, and reclaims its stack and private address-space memory after switching away.
 
@@ -38,7 +38,7 @@ Run the kernel-only and ring-3 QEMU tests with the pinned Rust nightly and compo
 cargo test --locked -p boot-x86_64 --test boot_test -- --nocapture
 ```
 
-Each test builds a BIOS image in a fresh temporary directory. The kernel-only test checks breakpoint recovery, scheduling, and blocking IPC. The ring-3 test packages both services in a ustar archive and checks a console write, notification transfer, rights attenuation, and revocation across capability spaces. It then injects Space with the QEMU monitor and verifies the tile's color change in screenshots.
+Each test builds a BIOS image in a fresh temporary directory. The kernel-only test checks breakpoint recovery, scheduling, and blocking IPC. The ring-3 test packages both services in a ustar archive and checks a console write from shared memory, notification transfer, rights attenuation, and removal of the console mapping on revocation. It then injects Space with the QEMU monitor and verifies the tile's color change in screenshots.
 
 A separate guest keeps the console service CPU-bound after its first reply. It verifies that timer preemption still lets `rootsrv` handle keyboard input.
 

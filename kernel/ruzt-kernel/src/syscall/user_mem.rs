@@ -92,8 +92,8 @@ pub fn copy_to_user(kernel_buf: &[u8], user_ptr: u64) -> Result<(), ErrorCode> {
     Ok(())
 }
 
-// Boot processes run on one CPU and their mappings stay fixed after launch.
-// The scheduler restores the calling root before a blocked syscall resumes.
+// User processes run on one CPU. The scheduler restores the calling root
+// before a blocked syscall resumes, and buffer copies do not reschedule.
 pub(crate) fn validate_user_buffer(
     root: ruzt_hal::mem::PhysFrame,
     address: u64,

@@ -29,6 +29,8 @@ pub fn recv(endpoint_cptr: u64, message: &mut IpcMessage) -> Result<(), ErrorCod
 }
 
 /// Receive a message and accept up to `capacity` caps in slots starting at `first`.
+///
+/// The message buffer must be in a non-revocable mapping.
 pub fn recv_with_caps(
     endpoint_cptr: u64,
     message: &mut IpcMessage,
@@ -90,6 +92,19 @@ pub fn delete(cptr: u64) -> Result<(), ErrorCode> {
 /// Revoke all descendants while keeping the invoked capability.
 pub fn revoke(cptr: u64) -> Result<(), ErrorCode> {
     control(cptr, CapOp::Revoke, 0, 0, 0)
+}
+
+/// Map a shared frame into the caller at a page-aligned user address.
+///
+/// A capability has at most one mapping. Revoking or deleting it removes
+/// that mapping. Callers must coordinate access with the other frame holders.
+pub fn map_frame(cptr: u64, address: u64, writable: bool) -> Result<(), ErrorCode> {
+    control(cptr, CapOp::MapFrame, address, u64::from(writable), 0)
+}
+
+/// Remove the caller's mapping made through this capability.
+pub fn unmap_frame(cptr: u64) -> Result<(), ErrorCode> {
+    control(cptr, CapOp::UnmapFrame, 0, 0, 0)
 }
 
 #[allow(unsafe_code)]

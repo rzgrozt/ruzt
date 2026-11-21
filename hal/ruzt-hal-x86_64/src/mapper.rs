@@ -10,9 +10,9 @@ use spin::{Mutex, Once};
 use x86_64::{
     registers::control::Cr3,
     structures::paging::{
-        mapper::{MapToError, Translate, TranslateResult, UnmapError},
-        FrameAllocator as X64FrameAllocator, Mapper as X64Mapper, OffsetPageTable,
-        Page, PageTable, PageTableFlags, PhysFrame as X64PhysFrame, Size4KiB,
+        mapper::{CleanUp, MapToError, Translate, TranslateResult, UnmapError},
+        FrameAllocator as X64FrameAllocator, FrameDeallocator, Mapper as X64Mapper,
+        OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame as X64PhysFrame, Size4KiB,
     },
     PhysAddr as X64PhysAddr, VirtAddr as X64VirtAddr,
 };
@@ -32,6 +32,18 @@ unsafe impl X64FrameAllocator<Size4KiB> for CallbackFrameAlloc {
         Some(X64PhysFrame::containing_address(X64PhysAddr::new(
             hal_frame.base.as_u64(),
         )))
+    }
+}
+
+struct CallbackFrameDealloc(fn(PhysFrame));
+
+impl FrameDeallocator<Size4KiB> for CallbackFrameDealloc {
+    unsafe fn deallocate_frame(&mut self, frame: X64PhysFrame<Size4KiB>) {
+        let frame = PhysFrame::from_base(PhysAddr::new(frame.start_address().as_u64()))
+            .expect("aligned page-table frame");
+        // SAFETY: The mapper just detached an empty, private page table.
+        unsafe { zero_frame(frame) };
+        (self.0)(frame);
     }
 }
 
@@ -179,7 +191,7 @@ impl X86_64Mapper {
         Ok(root)
     }
 
-    /// Map one 4 KiB page in an inactive PML4 without flushing the active TLB.
+    /// Map one 4 KiB page in a private, lower-half user address space.
     ///
     /// # Errors
     ///
@@ -188,11 +200,9 @@ impl X86_64Mapper {
     ///
     /// # Safety
     ///
-    /// `root` must be a uniquely borrowed, inactive PML4 returned by
-    /// [`Self::create_user_address_space`]. `virt` must name an unused page in
-    /// that address space, and `phys` must remain valid for the mapping's
-    /// lifetime. Mapping a shared higher-half page is forbidden because those
-    /// page-table branches are shared with the active kernel address space.
+    /// `root` must be an exclusively managed PML4 from
+    /// [`Self::create_user_address_space`]. It can be active only on the
+    /// calling CPU. `phys` must remain valid for the mapping's lifetime.
     pub unsafe fn map_in_address_space(
         &mut self,
         root: PhysFrame,
@@ -200,28 +210,84 @@ impl X86_64Mapper {
         phys: PhysFrame,
         flags: PageFlags,
     ) -> Result<(), MapError> {
-        let (page, frame, page_table_flags) = mapping_parts(virt, phys, flags)?;
-        let root_pointer = frame_pointer(root).cast::<PageTable>();
-
-        // SAFETY: [Categories 1/3/5/6/11 - Aliasing, dangling, validity,
-        // alignment, provenance] The caller guarantees `root` uniquely names
-        // an initialized inactive PML4, and `init` guarantees its physmap span.
-        let root_table = unsafe { &mut *root_pointer };
-        // SAFETY: [Category 13 - Library contract] `root_table` is the valid
-        // PML4 proven above and the offset is the complete boot physmap.
-        let mut mapper = unsafe { OffsetPageTable::new(root_table, physical_memory_offset()) };
-        let mut allocator = CallbackFrameAlloc { alloc: self.alloc };
-
-        // SAFETY: [Categories 1/5/13 - Aliasing, validity, library contract]
-        // The caller owns the unused page and mapped frame; the callback gives
-        // the crate fresh intermediate-table frames, which it zeroes itself.
-        let flush = unsafe {
-            mapper.map_to(page, frame, page_table_flags, &mut allocator)
+        if virt.as_u64() >= 1 << 47 {
+            return Err(MapError::InvalidAlignment);
         }
-        .map_err(convert_map_error)?;
-        flush.ignore();
+        let (page, frame, page_table_flags) = mapping_parts(virt, phys, flags)?;
+        // SAFETY: The caller owns the user root and serializes its updates.
+        let mut mapper = unsafe { user_mapper(root) };
+        let mut allocator = CallbackFrameAlloc { alloc: self.alloc };
+        let active = root_is_active(root);
 
+        // SAFETY: The destination is in the private half and the mapped frame
+        // stays live. The allocator supplies exclusive intermediate tables.
+        let result = unsafe { mapper.map_to(page, frame, page_table_flags, &mut allocator) };
+        match result {
+            Ok(flush) if active => flush.flush(),
+            Ok(flush) => flush.ignore(),
+            Err(error) => {
+                if matches!(error, MapToError::FrameAllocationFailed) {
+                    // SAFETY: Only tables on the requested private path can
+                    // have been allocated on failure.
+                    unsafe { self.reclaim_user_tables(&mut mapper, page, active) };
+                }
+                return Err(convert_map_error(error));
+            }
+        }
         Ok(())
+    }
+
+    /// Remove a tracked user mapping and reclaim empty intermediate tables.
+    ///
+    /// # Safety
+    /// The root must obey the same ownership and CPU constraints as for
+    /// [`Self::map_in_address_space`]. The page must be a live 4 KiB mapping
+    /// that the caller owns in the private half of that root.
+    pub unsafe fn unmap_in_address_space(&mut self, root: PhysFrame, virt: VirtAddr) -> PhysFrame {
+        assert!(virt.as_u64() < 1 << 47 && virt.as_u64() % PhysFrame::SIZE as u64 == 0);
+        let page: Page<Size4KiB> = Page::containing_address(X64VirtAddr::new(virt.as_u64()));
+        // SAFETY: The caller serializes this private root's updates.
+        let mut mapper = unsafe { user_mapper(root) };
+        let (frame, flush) = mapper
+            .unmap(page)
+            .expect("tracked user page must be mapped");
+        flush.ignore();
+        // SAFETY: The caller owns the private tables on this path.
+        unsafe { self.reclaim_user_tables(&mut mapper, page, root_is_active(root)) };
+        PhysFrame::from_base(PhysAddr::new(frame.start_address().as_u64()))
+            .expect("aligned user frame")
+    }
+
+    unsafe fn reclaim_user_tables(
+        &mut self,
+        mapper: &mut OffsetPageTable<'_>,
+        page: Page<Size4KiB>,
+        active: bool,
+    ) {
+        let mut deallocator = CallbackFrameDealloc(self.dealloc);
+        // SAFETY: The range is a single lower-half page. All intermediate
+        // tables for that address are owned exclusively by this user root.
+        unsafe { mapper.clean_up_addr_range(Page::range_inclusive(page, page), &mut deallocator) };
+        if active {
+            // Also discard cached intermediate entries after detaching tables.
+            x86_64::instructions::tlb::flush_all();
+        }
+        // Inactive user roots have non-global mappings and are flushed on load.
+    }
+}
+
+fn root_is_active(root: PhysFrame) -> bool {
+    Cr3::read().0.start_address().as_u64() == root.base.as_u64()
+}
+
+unsafe fn user_mapper<'root>(root: PhysFrame) -> OffsetPageTable<'root> {
+    // SAFETY: The caller owns this initialized PML4 for the borrow and the
+    // boot physmap covers it and all its descendants.
+    unsafe {
+        OffsetPageTable::new(
+            &mut *frame_pointer(root).cast::<PageTable>(),
+            physical_memory_offset(),
+        )
     }
 }
 
@@ -323,7 +389,7 @@ pub fn active_user_range_accessible(
     if len == 0 || address == 0 || last >= 1 << 47 {
         return false;
     }
-    if Cr3::read().0.start_address().as_u64() != root.base.as_u64() {
+    if !root_is_active(root) {
         return false;
     }
 

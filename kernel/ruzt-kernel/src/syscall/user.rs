@@ -24,6 +24,21 @@ const BADGE_OFFSET: usize = offset_of!(CapTransferSlot, badge);
 
 pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
     let operation = args.arg1;
+    if operation == CapOp::MapFrame as u64 {
+        let writable = match args.arg3 {
+            0 => false,
+            1 => true,
+            _ => return Err(ErrorCode::BadMessage),
+        };
+        return sched::with_current_user(|process| {
+            process.map_shared_frame(args.arg0, args.arg2, writable)
+        })
+        .ok_or(ErrorCode::InvalidCap)?;
+    }
+    if operation == CapOp::UnmapFrame as u64 {
+        return sched::with_current_user(|process| process.unmap_shared_frame(args.arg0))
+            .ok_or(ErrorCode::InvalidCap)?;
+    }
     if operation == CapOp::Mint as u64
         || operation == CapOp::Move as u64
         || operation == CapOp::Delete as u64
@@ -45,7 +60,7 @@ pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
         if result.is_ok()
             && (operation == CapOp::Revoke as u64 || operation == CapOp::Delete as u64)
         {
-            sched::cancel_revoked_waiters();
+            sched::apply_capability_removals();
         }
         return result;
     }
@@ -74,7 +89,17 @@ pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
         CapType::Endpoint(id) if args.arg1 == CapOp::Recv as u64 => {
             require(capability.rights, CapRights::READ)?;
             // Reject bad buffers before consuming a pending sender or blocking.
-            user_mem::validate_user_buffer(root, args.arg2, size_of::<IpcMessage>(), true)?;
+            let length = size_of::<IpcMessage>();
+            user_mem::validate_user_buffer(root, args.arg2, length, true)?;
+            // Grant delivery can finish before the waiter resumes. Its
+            // output cannot live in a frame another task can revoke.
+            if !sched::with_current_user(|process| {
+                process.receive_buffer_is_stable(args.arg2, length)
+            })
+            .ok_or(ErrorCode::InvalidCap)?
+            {
+                return Err(ErrorCode::BadMessage);
+            }
             let capacity = usize::try_from(args.arg4).map_err(|_| ErrorCode::BadMessage)?;
             if capacity > IPC_CAP_SLOTS {
                 return Err(ErrorCode::BadMessage);

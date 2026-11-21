@@ -3,6 +3,7 @@
 mod boot_caps;
 mod framebuffer;
 mod initrd;
+mod shared_frames;
 
 use crate::cap::cspace::CSpace;
 use alloc::vec::Vec;
@@ -13,6 +14,7 @@ use ruzt_hal::mem::{MapError, PageFlags, PhysFrame, VirtAddr};
 use ruzt_hal_x86_64::mapper::{self, X86_64Mapper};
 
 const PAGE_SIZE: u64 = PhysFrame::SIZE as u64;
+const _: () = assert!(ruzt_abi::FRAME_BYTES == PhysFrame::SIZE);
 
 struct Region {
     start: u64,
@@ -59,6 +61,8 @@ impl UserProcess {
 struct UserAddressSpace {
     root: PhysFrame,
     ram: Vec<PhysFrame>,
+    // Dropped only after Drop destroys the private page tables.
+    shared_frames: Vec<shared_frames::Mapping>,
 }
 
 impl Drop for UserAddressSpace {
@@ -97,7 +101,7 @@ pub(crate) fn terminate_current(reason: core::fmt::Arguments<'_>) -> ! {
         (user.name, user.boot_channels)
     })
     .expect("termination requires a user task");
-    crate::sched::cancel_revoked_waiters();
+    crate::sched::apply_capability_removals();
     crate::serial_println!("user process {name} terminated: {reason}");
     for channel in channels {
         crate::ipc::close_boot_channel(channel);
@@ -147,6 +151,7 @@ fn map_image(
     let mut space = UserAddressSpace {
         root,
         ram: Vec::new(),
+        shared_frames: Vec::new(),
     };
     let framebuffer = mapper::with_mapper(|mapper| {
         for segment in &elf.segments {

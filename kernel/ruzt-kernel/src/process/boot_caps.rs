@@ -1,7 +1,7 @@
 //! Capabilities granted by the boot policy.
 
 use ruzt_abi::{
-    console, CapRights, ROOTSRV_CONSOLE_NOTIFICATION, ROOTSRV_CONSOLE_REPLY,
+    console, CapRights, ROOTSRV_CONSOLE_FRAME, ROOTSRV_CONSOLE_NOTIFICATION, ROOTSRV_CONSOLE_REPLY,
     ROOTSRV_CONSOLE_REQUEST, ROOTSRV_KEYBOARD_DATA, ROOTSRV_KEYBOARD_IRQ,
 };
 use ruzt_cap::{CapSlot, CapType, EndpointId, NotificationId};
@@ -50,6 +50,9 @@ pub(super) fn initial_services() -> ([EndpointId; 2], CSpace, CSpace) {
             .union(CapRights::WRITE)
             .union(CapRights::GRANT),
     );
+    rootsrv
+        .provision_shared_frame(ROOTSRV_CONSOLE_FRAME)
+        .expect("allocate boot console frame");
 
     let mut consoled = CSpace::new(3);
     grant(&mut consoled, console::REQUEST, request, CapRights::READ);
