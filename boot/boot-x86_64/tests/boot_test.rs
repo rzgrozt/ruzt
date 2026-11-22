@@ -70,7 +70,9 @@ fn test_rootsrv_updates_the_framebuffer_from_keyboard_input() {
             "rootsrv: console endpoint rights verified",
             "rootsrv: notification transferred and revoked across capability spaces",
             "rootsrv: shared frame mapped read-only by console and unmapped on revocation",
+            "rootsrv: console allocation and mapping revoked through its Untyped budget",
             "rootsrv: Untyped budget enforced and reclaimed after revocation",
+            "rootsrv: both delegated budgets reclaimed",
             "rootsrv: framebuffer tile drawn",
             "rootsrv: press Space to test keyboard input",
             "rootsrv thread waiting for keyboard IRQ",
@@ -152,8 +154,10 @@ fn assert_console_shutdown_isolated(services: Services, reason: &str) {
     assert_markers(
         &serial,
         &[
+            "consoled: delegated scratch mapped",
             &format!("user process consoled terminated: {reason}"),
             "reaped user process consoled",
+            "rootsrv: both delegated budgets reclaimed",
             "rootsrv: console disconnected",
             "rootsrv thread waiting for keyboard IRQ",
             "rootsrv: Space key received",

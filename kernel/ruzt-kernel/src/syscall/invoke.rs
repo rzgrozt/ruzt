@@ -44,11 +44,12 @@ pub fn invoke(args: &SyscallArgs) -> u64 {
             src_cptr,
             dest_cptr,
             kind,
+            size_bits,
         } => {
             let mut guard = crate::cap::cspace::kernel_cspace();
             let cspace = guard.as_mut().expect("kernel cspace not initialised");
             match RetypeKind::try_from(kind)
-                .and_then(|kind| cspace.retype(src_cptr, dest_cptr, kind))
+                .and_then(|kind| cspace.retype(src_cptr, dest_cptr, kind, size_bits))
             {
                 Ok(()) => AbiErrorCode::Ok.as_u64(),
                 Err(e) => e.as_u64(),

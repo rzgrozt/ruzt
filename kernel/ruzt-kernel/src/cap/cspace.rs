@@ -214,6 +214,7 @@ impl CSpace {
         cptr: u64,
         destination: u64,
         kind: RetypeKind,
+        size_bits: u64,
     ) -> Result<(), ErrorCode> {
         let source = self.slots[self.index(cptr)?].ok_or(ErrorCode::InvalidCap)?;
         let dest = self.index(destination)?;
@@ -228,13 +229,15 @@ impl CSpace {
         let region = node.object.ok_or(ErrorCode::InvalidCap)?;
         self.vacant(dest, &tree)?;
 
-        let (object, cap_type) = object::retype(region, kind)?;
+        let (object, cap_type) = object::retype(region, kind, size_bits)?;
+        let mut rights = CapRights::WRITE.union(CapRights::GRANT);
+        if kind != RetypeKind::Untyped {
+            rights = rights.union(CapRights::READ);
+        }
         let installed = tree.install(Node {
             slot: CapSlot {
                 cap_type,
-                rights: CapRights::READ
-                    .union(CapRights::WRITE)
-                    .union(CapRights::GRANT),
+                rights,
                 badge: 0,
             },
             object: Some(object),

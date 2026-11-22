@@ -40,6 +40,8 @@ pub enum CapOp {
         dest_cptr: u64,
         /// Wire tag for the kind of object to create.
         kind: u64,
+        /// Size exponent for an Untyped child.
+        size_bits: u64,
     },
     /// Revoke the derived capabilities of the invoked slot.
     Revoke {
@@ -74,6 +76,7 @@ impl CapOp {
                 src_cptr: _args.arg0,
                 dest_cptr: _args.arg2,
                 kind: _args.arg3,
+                size_bits: _args.arg4,
             },
             6 => Self::Mint {
                 src_cptr: _args.arg2,

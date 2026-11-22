@@ -53,6 +53,8 @@ pub mod console {
     pub const RECEIVED_NOTIFICATION: u64 = 4;
     /// Following slot where the console accepts its read-only frame.
     pub const RECEIVED_FRAME: u64 = 5;
+    /// Slot where the console accepts an independently sized RAM budget.
+    pub const RECEIVED_UNTYPED: u64 = 6;
 
     /// Write the inline payload to the console.
     pub const WRITE: u64 = 1;
@@ -62,9 +64,11 @@ pub mod console {
     pub const UNKNOWN_REQUEST: u64 = 3;
     /// Check that the boot grants were revoked and that a fresh frame cap can remap the page.
     pub const CHECK_REVOCATION: u64 = 4;
-    /// Both boot grants were revoked and the old mapping was removed.
+    /// Boot grants and mappings derived from the console budget were revoked.
     pub const REVOKED: u64 = 5;
-    /// Write bytes from the transferred frame. The inline payload is a little-endian u16 byte count.
+    /// Write bytes from the transferred frame. The grants are a notification,
+    /// a read-only frame, and an Untyped budget. The inline payload is a
+    /// little-endian u16 byte count.
     pub const WRITE_SHARED: u64 = 6;
 }
 
@@ -119,7 +123,8 @@ pub enum CapOp {
     /// Delete a capability.
     Delete = 4,
     /// Create a child object from an Untyped capability. `arg2` is the
-    /// empty destination slot and `arg3` is a [`RetypeKind`].
+    /// empty destination slot and `arg3` is a [`RetypeKind`]. For an Untyped
+    /// child, `arg4` is the base-two exponent of its size in bytes.
     Retype = 5,
     /// Mint a derived capability.
     Mint = 6,
@@ -149,6 +154,8 @@ pub enum RetypeKind {
     Endpoint = 1,
     /// An initially unsignalled notification.
     Notification = 2,
+    /// A smaller, naturally aligned Untyped RAM region.
+    Untyped = 3,
 }
 
 impl TryFrom<u64> for RetypeKind {
@@ -159,6 +166,7 @@ impl TryFrom<u64> for RetypeKind {
             0 => Ok(Self::Frame),
             1 => Ok(Self::Endpoint),
             2 => Ok(Self::Notification),
+            3 => Ok(Self::Untyped),
             _ => Err(ErrorCode::BadMessage),
         }
     }
@@ -461,7 +469,8 @@ mod tests {
         assert_eq!(RetypeKind::try_from(0), Ok(RetypeKind::Frame));
         assert_eq!(RetypeKind::try_from(1), Ok(RetypeKind::Endpoint));
         assert_eq!(RetypeKind::try_from(2), Ok(RetypeKind::Notification));
-        assert_eq!(RetypeKind::try_from(3), Err(ErrorCode::BadMessage));
+        assert_eq!(RetypeKind::try_from(3), Ok(RetypeKind::Untyped));
+        assert_eq!(RetypeKind::try_from(4), Err(ErrorCode::BadMessage));
     }
 
     #[test]

@@ -95,8 +95,22 @@ pub fn revoke(cptr: u64) -> Result<(), ErrorCode> {
 }
 
 /// Create a child object in an empty slot, charging the invoked Untyped budget.
+/// Use [`split_untyped`] to create a child budget with an explicit size.
 pub fn retype(untyped: u64, destination: u64, kind: RetypeKind) -> Result<(), ErrorCode> {
     control(untyped, CapOp::Retype, destination, kind as u64, 0)
+}
+
+/// Reserve a smaller Untyped budget in an empty slot.
+///
+/// Its size is `2^size_bits` bytes and must be at least one page.
+pub fn split_untyped(untyped: u64, destination: u64, size_bits: u8) -> Result<(), ErrorCode> {
+    control(
+        untyped,
+        CapOp::Retype,
+        destination,
+        RetypeKind::Untyped as u64,
+        u64::from(size_bits),
+    )
 }
 
 /// Map a shared frame into the caller at a page-aligned user address.

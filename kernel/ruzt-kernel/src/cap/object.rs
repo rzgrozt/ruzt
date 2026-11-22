@@ -89,9 +89,9 @@ const INDEX_MASK: u64 = MAX_OBJECTS as u64 - 1;
 const MAX_GENERATION: u64 = u64::MAX >> INDEX_BITS;
 
 #[derive(Clone, Copy)]
-struct UntypedPage {
+struct UntypedAllocation {
     region: KObjectId,
-    index: u32,
+    mask: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -99,7 +99,7 @@ struct Entry {
     generation: u64,
     object: Option<KernelObject>,
     references: usize,
-    backing: Option<UntypedPage>,
+    backing: Option<UntypedAllocation>,
 }
 
 impl Entry {
@@ -114,7 +114,7 @@ impl Entry {
         self.generation == id.0 >> INDEX_BITS
     }
 
-    fn take(&mut self) -> Option<(KernelObject, Option<UntypedPage>)> {
+    fn take(&mut self) -> Option<(KernelObject, Option<UntypedAllocation>)> {
         self.object
             .take()
             .map(|object| (object, self.backing.take()))
@@ -155,6 +155,21 @@ pub fn allocate(cap_type: CapType) -> Result<KObjectId, ErrorCode> {
 const PAGE_BITS: u8 = PhysFrame::SIZE.trailing_zeros() as u8;
 const MAX_UNTYPED_BITS: u8 = PAGE_BITS + 6;
 
+fn available_page_mask(size_bits: u8) -> u64 {
+    let pages = 1 << (size_bits - PAGE_BITS);
+    u64::MAX >> (u64::BITS - pages)
+}
+
+fn find_aligned_run(free: u64, size_bits: u8, parent_bits: u8) -> Option<(u32, u64)> {
+    let pages = 1 << (size_bits - PAGE_BITS);
+    let extent = available_page_mask(size_bits);
+    let parent_pages = 1 << (parent_bits - PAGE_BITS);
+    (0..parent_pages).step_by(pages).find_map(|index| {
+        let mask = extent << index;
+        (free & mask == mask).then_some((index as u32, mask))
+    })
+}
+
 pub(super) fn allocate_untyped(size_bits: u8) -> Result<(KObjectId, CapType), ErrorCode> {
     if !(PAGE_BITS..=MAX_UNTYPED_BITS).contains(&size_bits) {
         return Err(ErrorCode::BadMessage);
@@ -165,7 +180,7 @@ pub(super) fn allocate_untyped(size_bits: u8) -> Result<(KObjectId, CapType), Er
         Ok(KernelObject::Untyped {
             phys,
             size_bits,
-            free_pages: u64::MAX >> (u64::BITS as usize - pages),
+            free_pages: available_page_mask(size_bits),
         })
     })?;
     let Some(KernelObject::Untyped { phys, .. }) = get(id) else {
@@ -197,6 +212,7 @@ fn vacant_id(table: &[Entry]) -> Result<KObjectId, ErrorCode> {
 pub(super) fn retype(
     region: KObjectId,
     kind: RetypeKind,
+    requested_size_bits: u64,
 ) -> Result<(KObjectId, CapType), ErrorCode> {
     let mut table = TABLE.lock();
     let id = vacant_id(&table[..])?;
@@ -205,23 +221,34 @@ pub(super) fn retype(
         return Err(ErrorCode::InvalidCap);
     }
     let Some(KernelObject::Untyped {
-        phys, free_pages, ..
+        phys,
+        size_bits: parent_bits,
+        free_pages,
     }) = &mut parent.object
     else {
         return Err(ErrorCode::InvalidCap);
     };
-    if *free_pages == 0 {
-        return Err(ErrorCode::NoMemory);
-    }
+    let size_bits = match kind {
+        RetypeKind::Untyped => {
+            let bits = u8::try_from(requested_size_bits).map_err(|_| ErrorCode::BadMessage)?;
+            if !(PAGE_BITS..*parent_bits).contains(&bits) {
+                return Err(ErrorCode::BadMessage);
+            }
+            bits
+        }
+        _ if requested_size_bits == 0 => PAGE_BITS,
+        _ => return Err(ErrorCode::BadMessage),
+    };
+    let (index, mask) =
+        find_aligned_run(*free_pages, size_bits, *parent_bits).ok_or(ErrorCode::NoMemory)?;
     let references = parent
         .references
         .checked_add(1)
         .ok_or(ErrorCode::NoMemory)?;
-    let index = free_pages.trailing_zeros();
+    let addr = phys.base.as_u64() + (u64::from(index) << PAGE_BITS);
+    let phys = PhysFrame::from_base(PhysAddr::new(addr)).expect("aligned Untyped page");
     let (object, cap_type) = match kind {
         RetypeKind::Frame => {
-            let addr = phys.base.as_u64() + (u64::from(index) << PAGE_BITS);
-            let phys = PhysFrame::from_base(PhysAddr::new(addr)).expect("aligned Untyped page");
             // SAFETY: The page belongs to the region and has no live objects or aliases.
             unsafe { ruzt_hal_x86_64::mapper::zero_frame(phys) };
             (
@@ -240,12 +267,22 @@ pub(super) fn retype(
             KernelObject::Notification { state: false },
             CapType::Notification(NotificationId(id.0)),
         ),
+        RetypeKind::Untyped => (
+            KernelObject::Untyped {
+                phys,
+                size_bits,
+                free_pages: available_page_mask(size_bits),
+            },
+            CapType::Untyped { phys, size_bits },
+        ),
     };
-    *free_pages &= !(1 << index);
+    *free_pages &= !mask;
     parent.references = references;
     let entry = &mut table[id.index()];
     entry.object = Some(object);
-    entry.backing = Some(UntypedPage { region, index });
+    // This reference keeps the whole parent extent reserved until the child
+    // object, including any mappings through it, has been destroyed.
+    entry.backing = Some(UntypedAllocation { region, mask });
     entry.generation += 1;
     Ok((id, cap_type))
 }
@@ -336,7 +373,7 @@ impl Drop for FramePin {
     }
 }
 
-fn destroy(object: KernelObject, backing: Option<UntypedPage>) {
+fn destroy(object: KernelObject, backing: Option<UntypedAllocation>) {
     match object {
         KernelObject::CNode { slots, count, .. } => {
             // SAFETY: This is the unique boxed slice from CNode allocation.
@@ -356,22 +393,22 @@ fn destroy(object: KernelObject, backing: Option<UntypedPage>) {
             size_bits,
             free_pages,
         } => {
-            let pages = 1 << (size_bits - PAGE_BITS);
-            assert_eq!(free_pages.count_ones() as usize, pages);
-            frame::deallocate_contiguous(phys, pages);
+            assert_eq!(free_pages, available_page_mask(size_bits));
+            if backing.is_none() {
+                frame::deallocate_contiguous(phys, 1 << (size_bits - PAGE_BITS));
+            }
         }
         _ => {}
     }
-    if let Some(page) = backing {
-        update(page.region, |region| {
+    if let Some(allocation) = backing {
+        update(allocation.region, |region| {
             let KernelObject::Untyped { free_pages, .. } = region else {
                 unreachable!("object backing is Untyped");
             };
-            let bit = 1 << page.index;
-            assert_eq!(*free_pages & bit, 0);
-            *free_pages |= bit;
+            assert_eq!(*free_pages & allocation.mask, 0);
+            *free_pages |= allocation.mask;
         });
-        release(page.region);
+        release(allocation.region);
     }
 }
 
@@ -432,6 +469,13 @@ fn kernel_object_from_cap_type(cap_type: CapType) -> Result<KernelObject, ErrorC
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delegated_region_uses_only_naturally_aligned_free_pages() {
+        assert_eq!(find_aligned_run(0b0110, 13, 14), None);
+        assert_eq!(find_aligned_run(0b1110, 13, 14), Some((2, 0b1100)));
+        assert_eq!(find_aligned_run(1 << 63, 12, 18), Some((63, 1 << 63)));
+    }
 
     #[test]
     fn deallocate_works() {

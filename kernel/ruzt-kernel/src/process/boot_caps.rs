@@ -9,7 +9,7 @@ use ruzt_cap::{CapSlot, CapType, EndpointId};
 use crate::cap::{cspace::CSpace, object};
 use crate::{keyboard, serial};
 
-const ROOTSRV_UNTYPED_BITS: u8 = 13;
+const ROOTSRV_UNTYPED_BITS: u8 = 14;
 
 pub(super) fn initial_services() -> ([EndpointId; 2], CSpace, CSpace) {
     let request = endpoint();

@@ -12,6 +12,9 @@ use ruzt_abi::{
 use ruzt_runtime::{debug_putchar, runtime_init};
 
 const CONSOLE_BUFFER: u64 = 0x5000_0000;
+const LOCAL_BUDGET: u64 = 11;
+const CONSOLE_BUDGET: u64 = 12;
+const SERVICE_BUDGET_BITS: u8 = 13;
 const GREETING: &[u8] = b"Hello from ring 3, rootsrv alive.\n";
 const _: () = assert!(GREETING.len() <= FRAME_BYTES);
 
@@ -33,7 +36,7 @@ fn greet_via_console() -> Result<(), ErrorCode> {
     request.label = console::WRITE_SHARED;
     request.length = payload_len.len() as u16;
     request.data[..payload_len.len()].copy_from_slice(&payload_len);
-    request.cap_count = 2;
+    request.cap_count = 3;
     request.caps[0] = CapTransferSlot {
         cptr: ROOTSRV_CONSOLE_NOTIFICATION,
         rights: CapRights::WRITE,
@@ -42,6 +45,11 @@ fn greet_via_console() -> Result<(), ErrorCode> {
     request.caps[1] = CapTransferSlot {
         cptr: ROOTSRV_CONSOLE_FRAME,
         rights: CapRights::READ,
+        badge: 0,
+    };
+    request.caps[2] = CapTransferSlot {
+        cptr: CONSOLE_BUDGET,
+        rights: CapRights::WRITE,
         badge: 0,
     };
 
@@ -90,6 +98,7 @@ fn greet_via_console() -> Result<(), ErrorCode> {
 
     ruzt_ipc::revoke(ROOTSRV_CONSOLE_NOTIFICATION)?;
     ruzt_ipc::revoke(ROOTSRV_CONSOLE_FRAME)?;
+    ruzt_ipc::revoke(CONSOLE_BUDGET)?;
     let mut request = IpcMessage {
         label: console::CHECK_REVOCATION,
         cap_count: 1,
@@ -105,6 +114,7 @@ fn greet_via_console() -> Result<(), ErrorCode> {
     assert_eq!(reply.label, console::REVOKED);
     write_line("rootsrv: notification transferred and revoked across capability spaces");
     write_line("rootsrv: shared frame mapped read-only by console and unmapped on revocation");
+    write_line("rootsrv: console allocation and mapping revoked through its Untyped budget");
     Ok(())
 }
 
@@ -129,7 +139,7 @@ fn check_revocation() {
 fn create_console_objects() {
     const COPY: u64 = 5;
     const PROBE: u64 = 6;
-    let budget = ROOTSRV_UNTYPED;
+    let budget = LOCAL_BUDGET;
     assert_eq!(
         ruzt_ipc::retype(budget, ROOTSRV_CONSOLE_REQUEST, RetypeKind::Frame),
         Err(ErrorCode::SlotOccupied)
@@ -154,7 +164,7 @@ fn create_console_objects() {
 }
 
 fn reclaim_console_objects() {
-    let budget = ROOTSRV_UNTYPED;
+    let budget = LOCAL_BUDGET;
     let frame = ROOTSRV_CONSOLE_FRAME;
     let notification = ROOTSRV_CONSOLE_NOTIFICATION;
     ruzt_ipc::revoke(budget).expect("revoke all console objects");
@@ -181,9 +191,15 @@ fn reclaim_console_objects() {
 
 fn main() -> ! {
     check_revocation();
+    split_service_budgets();
     create_console_objects();
     let result = greet_via_console();
     reclaim_console_objects();
+    ruzt_ipc::revoke(ROOTSRV_UNTYPED).expect("reclaim delegated budgets");
+    split_service_budgets();
+    ruzt_ipc::delete(LOCAL_BUDGET).expect("release the reclaimed local budget");
+    ruzt_ipc::delete(CONSOLE_BUDGET).expect("release the reclaimed console budget");
+    write_line("rootsrv: both delegated budgets reclaimed");
     match result {
         Ok(()) => {}
         Err(ErrorCode::NotFound) => write_line("rootsrv: console disconnected"),
@@ -227,4 +243,19 @@ fn main() -> ! {
             write_line("rootsrv: Space key received");
         }
     }
+}
+
+fn split_service_budgets() {
+    assert_eq!(
+        ruzt_ipc::split_untyped(ROOTSRV_UNTYPED, LOCAL_BUDGET, SERVICE_BUDGET_BITS + 1),
+        Err(ErrorCode::BadMessage)
+    );
+    for budget in [LOCAL_BUDGET, CONSOLE_BUDGET] {
+        ruzt_ipc::split_untyped(ROOTSRV_UNTYPED, budget, SERVICE_BUDGET_BITS)
+            .expect("reserve a service RAM budget");
+    }
+    assert_eq!(
+        ruzt_ipc::retype(ROOTSRV_UNTYPED, ROOTSRV_CONSOLE_FRAME, RetypeKind::Frame),
+        Err(ErrorCode::NoMemory)
+    );
 }

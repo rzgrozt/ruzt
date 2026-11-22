@@ -1,12 +1,16 @@
 #![no_std]
 #![no_main]
 
-use ruzt_abi::{console, CapRights, ErrorCode, IpcMessage, FRAME_BYTES, ROOTSRV_FRAMEBUFFER};
+use ruzt_abi::{
+    console, CapRights, ErrorCode, IpcMessage, RetypeKind, FRAME_BYTES, ROOTSRV_FRAMEBUFFER,
+};
 use ruzt_driver_sdk::{read_port_u8, write_port_u8};
 
 // TL16C550D §7.6.3, transmitter holding register empty.
 const TRANSMITTER_READY: u8 = 1 << 5;
 const CONSOLE_BUFFER: u64 = 0x6000_0000;
+const SCRATCH_BUFFER: u64 = CONSOLE_BUFFER + FRAME_BYTES as u64;
+const SCRATCH_FRAME: u64 = 7;
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
@@ -24,7 +28,7 @@ fn main() -> ! {
             console::REQUEST,
             &mut request,
             console::RECEIVED_NOTIFICATION,
-            2,
+            3,
         ) {
             Ok(()) => {}
             Err(ErrorCode::NotFound) => ruzt_runtime::syscall::exit(0),
@@ -36,26 +40,19 @@ fn main() -> ! {
             ) => continue,
             Err(error) => panic!("console receive failed: {error:?}"),
         }
-        #[cfg(feature = "qemu-fault-test")]
-        if request.label == console::WRITE_SHARED {
-            // SAFETY: This test deliberately raises an instruction fault in
-            // the guest's user mode. The task must never resume at this site.
-            unsafe { core::arch::asm!("ud2", options(noreturn, nomem, nostack)) }
-        }
-        #[cfg(feature = "qemu-exit-test")]
-        if request.label == console::WRITE_SHARED {
-            ruzt_runtime::syscall::exit(23);
-        }
         let label = match (request.label, request.cap_count) {
             (console::WRITE, 0) => {
                 uart_write(&request.data[..usize::from(request.length)]);
                 Ok(console::WRITTEN)
             }
-            (console::WRITE_SHARED, 2) => write_shared(&request).map(|()| console::WRITTEN),
+            (console::WRITE_SHARED, 3) => write_shared(&request).map(|()| console::WRITTEN),
             (console::CHECK_REVOCATION, 1) => check_revocation().map(|()| console::REVOKED),
             _ => Err(ErrorCode::BadMessage),
         };
         if label.is_err() {
+            if (request.label, request.cap_count) == (console::WRITE_SHARED, 3) {
+                ruzt_ipc::delete(SCRATCH_FRAME).expect("discard scratch frame");
+            }
             for cap in &request.caps[..usize::from(request.cap_count)] {
                 ruzt_ipc::delete(cap.cptr).expect("discard unused grant");
             }
@@ -86,20 +83,43 @@ fn write_shared(request: &IpcMessage) -> Result<(), ErrorCode> {
         || length > FRAME_BYTES
         || request.caps[0].rights != CapRights::WRITE
         || request.caps[1].rights != CapRights::READ
+        || request.caps[2].rights != CapRights::WRITE
         || ruzt_ipc::wait(notification) != Err(ErrorCode::CapRightsViolation)
         || ruzt_ipc::map_frame(frame, CONSOLE_BUFFER, true) != Err(ErrorCode::CapRightsViolation)
     {
         return Err(ErrorCode::BadMessage);
     }
     ruzt_ipc::map_frame(frame, CONSOLE_BUFFER, false)?;
+    ruzt_ipc::retype(console::RECEIVED_UNTYPED, SCRATCH_FRAME, RetypeKind::Frame)?;
+    ruzt_ipc::map_frame(SCRATCH_FRAME, SCRATCH_BUFFER, true)?;
+    run_shutdown_test();
     for offset in 0..length {
-        // SAFETY: The address is inside the page mapped above. The boot
-        // protocol keeps it mapped and the sender leaves the bytes untouched
-        // until we reply. Volatile reads do not borrow the shared allocation.
-        let byte = unsafe { ((CONSOLE_BUFFER as usize + offset) as *const u8).read_volatile() };
-        uart_write_byte(byte);
+        // SAFETY: Both pages were mapped above. The boot sender waits for
+        // our reply before changing the shared page or revoking either cap.
+        unsafe {
+            let byte = ((CONSOLE_BUFFER as usize + offset) as *const u8).read_volatile();
+            ((SCRATCH_BUFFER as usize + offset) as *mut u8).write_volatile(byte);
+        }
+    }
+    for offset in 0..length {
+        // SAFETY: This is the same initialized scratch page and byte range.
+        uart_write_byte(unsafe {
+            ((SCRATCH_BUFFER as usize + offset) as *const u8).read_volatile()
+        });
     }
     ruzt_ipc::signal(notification)
+}
+
+fn run_shutdown_test() {
+    #[cfg(any(feature = "qemu-fault-test", feature = "qemu-exit-test"))]
+    uart_write(b"consoled: delegated scratch mapped\n");
+    #[cfg(feature = "qemu-fault-test")]
+    // SAFETY: This test deliberately raises a user instruction exception.
+    unsafe {
+        core::arch::asm!("ud2", options(noreturn, nomem, nostack))
+    };
+    #[cfg(all(feature = "qemu-exit-test", not(feature = "qemu-fault-test")))]
+    ruzt_runtime::syscall::exit(23);
 }
 
 fn check_revocation() -> Result<(), ErrorCode> {
@@ -107,13 +127,15 @@ fn check_revocation() -> Result<(), ErrorCode> {
     // The old frame capability must be gone, and the old virtual address
     // must be available for the new capability to map.
     let fresh_frame = console::RECEIVED_NOTIFICATION;
-    if ruzt_ipc::map_frame(console::RECEIVED_FRAME, CONSOLE_BUFFER, false)
-        != Err(ErrorCode::InvalidCap)
+    if ruzt_ipc::unmap_frame(console::RECEIVED_FRAME) != Err(ErrorCode::InvalidCap)
+        || ruzt_ipc::unmap_frame(SCRATCH_FRAME) != Err(ErrorCode::InvalidCap)
     {
         return Err(ErrorCode::BadMessage);
     }
-    ruzt_ipc::map_frame(fresh_frame, CONSOLE_BUFFER, false)?;
-    ruzt_ipc::unmap_frame(fresh_frame)?;
+    for address in [CONSOLE_BUFFER, SCRATCH_BUFFER] {
+        ruzt_ipc::map_frame(fresh_frame, address, false)?;
+        ruzt_ipc::unmap_frame(fresh_frame)?;
+    }
     ruzt_ipc::delete(fresh_frame)
 }
 

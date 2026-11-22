@@ -10,7 +10,7 @@ Each service has its own capability space. The console endpoints grant send and 
 
 Capabilities keep kernel objects alive while copies exist. A caller with grant rights can derive a capability with reduced rights. Moving a capability preserves its ancestry, and revoking it removes all its descendants, unmaps their shared pages, and wakes waiters that lost their authority. IPC transfers install capabilities only in empty slots designated by the receiver. Each frame capability can establish one non-executable mapping in the caller, and mapped memory stays allocated until the final page-table alias is removed.
 
-The root server receives an 8 KiB Untyped RAM budget at boot. It creates its shared frame and notification with `Retype`. A frame, endpoint, or notification currently costs one 4 KiB page. Copies of an Untyped capability draw from the same budget, and each page becomes reusable when the last reference to its object is gone.
+The root server receives a 16 KiB Untyped RAM budget at boot. It reserves two separate 8 KiB regions and delegates one to the console service. The console uses that budget for its scratch buffer. A frame, endpoint, or notification currently costs one 4 KiB page. Copies of an Untyped capability draw from the same budget. A reserved region returns to its parent after the region cap and its last live object are gone.
 
 When a boot service exits or takes a user-mode fault, the kernel closes its console channels, wakes blocked peers, and reclaims its stack and private address-space memory after switching away.
 
@@ -44,7 +44,7 @@ Each test builds a BIOS image in a fresh temporary directory. The kernel-only te
 
 A separate guest keeps the console service CPU-bound after its first reply. It verifies that timer preemption still lets `rootsrv` handle keyboard input.
 
-The exit and fault guests verify that `rootsrv` sees the console disconnect and can still handle input after the kernel reaps the console process.
+The exit and fault guests terminate the console while its scratch frame is mapped. They verify that `rootsrv` sees the disconnect, can reclaim both delegated budgets, and can still handle input after the kernel reaps the console process.
 
 GitHub Actions runs both commands on pushes to `main` and on pull requests.
 

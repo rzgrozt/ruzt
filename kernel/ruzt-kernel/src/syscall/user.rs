@@ -27,7 +27,7 @@ pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
     if operation == CapOp::Retype as u64 {
         let kind = RetypeKind::try_from(args.arg3)?;
         return sched::with_current_user(|process| {
-            process.cspace.retype(args.arg0, args.arg2, kind)
+            process.cspace.retype(args.arg0, args.arg2, kind, args.arg4)
         })
         .ok_or(ErrorCode::InvalidCap)?;
     }
