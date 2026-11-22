@@ -12,6 +12,8 @@ Capabilities keep kernel objects alive while copies exist. A caller with grant r
 
 The root server receives an 8 MiB Untyped RAM budget at boot. Each process's image, user stack, heap, and private page tables draw from its address-space budget. `rootsrv` reserves 2 MiB for the console address space and delegates a separate 8 KiB region to the service for its scratch buffer. Copies of an Untyped capability draw from the same budget. A reserved region returns to its parent after the region cap and its last live allocation are gone.
 
+Each process has a self address-space capability for mapping zeroed anonymous pages at a chosen virtual address. These pages draw from its address-space budget and may be read-only or writable. Unmapping returns the pages to the budget. A failed range operation preserves existing mappings.
+
 When a service exits or takes a user-mode fault, the kernel closes endpoints designated at launch, wakes blocked peers, and reclaims its stack and private address-space memory after switching away. `rootsrv` uses the process status capability to distinguish exit from fault and retries a failed console instance once with fresh endpoints.
 
 ## Repository layout
@@ -44,7 +46,7 @@ Each test builds a BIOS image in a fresh temporary directory. The kernel-only te
 
 A separate guest keeps the console service CPU-bound after its first reply. It verifies that timer preemption still lets `rootsrv` handle keyboard input.
 
-The exit and fault guests terminate the console while its scratch frame is mapped. After reaping each instance, `rootsrv` checks that it can reserve the full address-space budget again and that both scratch budgets are reclaimed. It restarts the service with fresh endpoints and continues handling input when the replacement also fails.
+The exit and fault guests terminate the console while its scratch frame and an anonymous page are mapped. After reaping each instance, `rootsrv` checks that it can reserve the full address-space budget again and that both scratch budgets are reclaimed. It restarts the service with fresh endpoints and continues handling input when the replacement also fails.
 
 GitHub Actions runs both commands on pushes to `main` and on pull requests.
 

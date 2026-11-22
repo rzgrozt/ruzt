@@ -5,10 +5,10 @@ mod tile;
 
 use ruzt_abi::{
     console, CapRights, CapTransferSlot, ErrorCode, IpcMessage, RetypeKind, FRAME_BYTES,
-    PROCESS_EXITED, PROCESS_FAULTED, ROOTSRV_CONSOLE_FRAME, ROOTSRV_CONSOLE_NOTIFICATION,
-    ROOTSRV_CONSOLE_PROCESS, ROOTSRV_CONSOLE_PROGRAM, ROOTSRV_CONSOLE_REPLY,
-    ROOTSRV_CONSOLE_REQUEST, ROOTSRV_FRAMEBUFFER, ROOTSRV_KEYBOARD_DATA, ROOTSRV_KEYBOARD_IRQ,
-    ROOTSRV_UART_DATA, ROOTSRV_UART_STATUS, ROOTSRV_UNTYPED,
+    PROCESS_ADDRESS_SPACE, PROCESS_EXITED, PROCESS_FAULTED, ROOTSRV_CONSOLE_FRAME,
+    ROOTSRV_CONSOLE_NOTIFICATION, ROOTSRV_CONSOLE_PROCESS, ROOTSRV_CONSOLE_PROGRAM,
+    ROOTSRV_CONSOLE_REPLY, ROOTSRV_CONSOLE_REQUEST, ROOTSRV_FRAMEBUFFER, ROOTSRV_KEYBOARD_DATA,
+    ROOTSRV_KEYBOARD_IRQ, ROOTSRV_UART_DATA, ROOTSRV_UART_STATUS, ROOTSRV_UNTYPED,
 };
 use ruzt_runtime::{debug_print, runtime_init};
 
@@ -16,7 +16,7 @@ const CONSOLE_BUFFER: u64 = 0x5000_0000;
 const LOCAL_BUDGET: u64 = 11;
 const CONSOLE_BUDGET: u64 = 12;
 const SERVICE_BUDGET_BITS: u8 = 13;
-const SESSION_BUDGET: u64 = 15;
+const SESSION_BUDGET: u64 = 23;
 const REQUEST_ENDPOINT: u64 = 16;
 const REPLY_ENDPOINT: u64 = 17;
 const PROGRAM_BUDGET: u64 = 20;
@@ -386,6 +386,7 @@ fn verify_program_budget_reclaimed() {
 
 fn main() -> ! {
     run_console();
+    check_anonymous_memory();
 
     assert_eq!(
         ruzt_driver_sdk::wait_irq(u64::MAX),
@@ -424,6 +425,32 @@ fn main() -> ! {
             write_line("rootsrv: Space key received");
         }
     }
+}
+
+fn check_anonymous_memory() {
+    const BASE: u64 = 0x5a00_0000;
+    const SECOND: u64 = BASE + FRAME_BYTES as u64;
+    let space = PROCESS_ADDRESS_SPACE;
+    ruzt_ipc::map_anonymous(space, SECOND, 1, true).expect("map one private page");
+    // SAFETY: The page was mapped writable and belongs to this process.
+    unsafe { (SECOND as *mut u8).write_volatile(0xa5) };
+    assert_eq!(
+        ruzt_ipc::map_anonymous(space, BASE, 2, true),
+        Err(ErrorCode::MappingExists),
+    );
+    ruzt_ipc::map_anonymous(space, BASE, 1, true).expect("reuse address from rolled-back mapping");
+    assert_eq!(
+        ruzt_ipc::unmap_anonymous(space, BASE, 3),
+        Err(ErrorCode::NotFound),
+    );
+    // SAFETY: The failed range operations preserved this existing mapping.
+    assert_eq!(unsafe { (SECOND as *const u8).read_volatile() }, 0xa5);
+    ruzt_ipc::unmap_anonymous(space, SECOND, 1).expect("unmap part of the private range");
+    ruzt_ipc::map_anonymous(space, SECOND, 1, false).expect("remap as read-only");
+    // SAFETY: The second page is mapped readable after remapping.
+    assert_eq!(unsafe { (SECOND as *const u8).read_volatile() }, 0);
+    ruzt_ipc::unmap_anonymous(space, BASE, 2).expect("return both private pages");
+    write_line("rootsrv: anonymous memory rolled back and reused zeroed");
 }
 
 fn split_service_budgets() {

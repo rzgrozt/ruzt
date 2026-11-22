@@ -43,6 +43,8 @@ pub const ROOTSRV_CONSOLE_PROGRAM: u64 = 14;
 pub const ROOTSRV_UART_DATA: u64 = 18;
 /// Delegable authority for the console's UART status port.
 pub const ROOTSRV_UART_STATUS: u64 = 19;
+/// Self address-space capability installed at process startup.
+pub const PROCESS_ADDRESS_SPACE: u64 = 15;
 
 /// Byte length of a frame supported by the user mapping ABI.
 pub const FRAME_BYTES: usize = 4096;
@@ -162,6 +164,12 @@ pub enum CapOp {
     /// authority on the source endpoint. `arg5` is a writable Untyped slot
     /// that funds the child's private address-space pages.
     SpawnProgram = 15,
+    /// Map zeroed private pages at `arg2` in the invoked address space.
+    /// `arg3` is the page count and `arg4` selects read-only (0) or read-write (1).
+    MapAnonymous = 16,
+    /// Unmap a range of private pages created by `MapAnonymous`.
+    /// `arg2` is the start address and `arg3` is the page count.
+    UnmapAnonymous = 17,
 }
 
 /// The process invoked `Exit`.
@@ -501,6 +509,8 @@ mod tests {
         assert_eq!(CapOp::UnmapFrame as u64, 13);
         assert_eq!(CapOp::WaitProcess as u64, 14);
         assert_eq!(CapOp::SpawnProgram as u64, 15);
+        assert_eq!(CapOp::MapAnonymous as u64, 16);
+        assert_eq!(CapOp::UnmapAnonymous as u64, 17);
     }
 
     #[test]

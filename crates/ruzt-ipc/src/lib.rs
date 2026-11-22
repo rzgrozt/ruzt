@@ -126,6 +126,33 @@ pub fn unmap_frame(cptr: u64) -> Result<(), ErrorCode> {
     control(cptr, CapOp::UnmapFrame, 0, 0, 0)
 }
 
+/// Map zeroed private memory at a page-aligned address using the process budget.
+pub fn map_anonymous(
+    address_space: u64,
+    address: u64,
+    pages: usize,
+    writable: bool,
+) -> Result<(), ErrorCode> {
+    control(
+        address_space,
+        CapOp::MapAnonymous,
+        address,
+        pages as u64,
+        u64::from(writable),
+    )
+}
+
+/// Unmap each page in a range of previously allocated anonymous memory.
+pub fn unmap_anonymous(address_space: u64, address: u64, pages: usize) -> Result<(), ErrorCode> {
+    control(
+        address_space,
+        CapOp::UnmapAnonymous,
+        address,
+        pages as u64,
+        0,
+    )
+}
+
 /// Wait for a process to terminate and return its status after cleanup.
 pub fn wait_process(cptr: u64) -> Result<ProcessStatus, ErrorCode> {
     process_status(cptr, false)

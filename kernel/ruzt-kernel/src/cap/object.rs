@@ -2,7 +2,9 @@
 
 use alloc::vec::Vec;
 use ruzt_abi::{ErrorCode, ProcessStatus, RetypeKind};
-use ruzt_cap::{CapType, EndpointId, FrameSize, NotificationId, ProcessId, NULL_SLOT};
+use ruzt_cap::{
+    AddressSpaceId, CapType, EndpointId, FrameSize, NotificationId, ProcessId, NULL_SLOT,
+};
 use ruzt_hal::mem::{PhysAddr, PhysFrame};
 use ruzt_hal_x86_64::mapper::{self, UserPageFrames};
 use spin::Mutex;
@@ -173,6 +175,16 @@ pub(crate) fn allocate_program(
     image: &'static [u8],
 ) -> Result<KObjectId, ErrorCode> {
     allocate_with(|| Ok(KernelObject::Program { name, image }))
+}
+
+/// Register a descriptor for a user-owned page table root.
+pub(crate) fn register_address_space(root: PhysFrame) -> Result<AddressSpaceId, ErrorCode> {
+    allocate_with(|| {
+        Ok(KernelObject::AddressSpace {
+            root_page_table: root,
+        })
+    })
+    .map(|id| AddressSpaceId(id.0))
 }
 
 const PAGE_BITS: u8 = PhysFrame::SIZE.trailing_zeros() as u8;
@@ -403,6 +415,13 @@ impl UntypedBudget {
         retain(id)?;
         Ok(Self(id))
     }
+
+    pub(crate) fn page_count(&self) -> usize {
+        let Some(KernelObject::Untyped { size_bits, .. }) = get(self.0) else {
+            unreachable!("budget retains its source Untyped object");
+        };
+        1 << (size_bits - PAGE_BITS)
+    }
 }
 
 // SAFETY: The region owns exclusive allocator frames held under the object
@@ -548,9 +567,7 @@ fn kernel_object_from_cap_type(cap_type: CapType) -> Result<KernelObject, ErrorC
         CapType::Thread(thread_id) => Ok(KernelObject::Thread {
             thread_id: thread_id.0 as usize,
         }),
-        CapType::AddressSpace(_) => Ok(KernelObject::AddressSpace {
-            root_page_table: crate::mm::frame::allocate().ok_or(ErrorCode::NoMemory)?,
-        }),
+        CapType::AddressSpace(_) => Err(ErrorCode::InvalidCap),
         CapType::Frame { .. } | CapType::Untyped { .. } => Err(ErrorCode::InvalidCap),
         CapType::Process(_) | CapType::Program(_) => Err(ErrorCode::InvalidCap),
         CapType::CNode { radix_bits, .. } => {

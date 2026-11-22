@@ -85,6 +85,7 @@ fn test_rootsrv_updates_the_framebuffer_from_keyboard_input() {
             "rootsrv: console allocation and mapping revoked through its Untyped budget",
             "rootsrv: Untyped budget enforced and reclaimed after revocation",
             "rootsrv: both delegated budgets reclaimed",
+            "rootsrv: anonymous memory rolled back and reused zeroed",
             "rootsrv: framebuffer tile drawn",
             "rootsrv: press Space to test keyboard input",
             "rootsrv thread waiting for keyboard IRQ",
@@ -169,7 +170,7 @@ fn assert_console_shutdown_isolated(services: Services, reason: &str, observed_s
     assert_markers(
         &serial,
         &[
-            "consoled: delegated scratch mapped",
+            "consoled: delegated scratch and anonymous page mapped",
             &format!("user process consoled terminated: {reason}"),
             "reaped user process consoled",
             "rootsrv: both delegated budgets reclaimed",
@@ -179,7 +180,7 @@ fn assert_console_shutdown_isolated(services: Services, reason: &str, observed_s
             "rootsrv: restarting console with fresh endpoints",
             "consoled process created, entering user mode...",
             "rootsrv: restarted console acknowledged IPC",
-            "consoled: delegated scratch mapped",
+            "consoled: delegated scratch and anonymous page mapped",
             &format!("user process consoled terminated: {reason}"),
             "reaped user process consoled",
             &format!("rootsrv: reaped console reported {observed_status}"),

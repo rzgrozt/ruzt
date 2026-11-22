@@ -112,7 +112,12 @@ fn write_shared(request: &IpcMessage) -> Result<(), ErrorCode> {
 
 fn run_shutdown_test() {
     #[cfg(any(feature = "qemu-fault-test", feature = "qemu-exit-test"))]
-    uart_write(b"consoled: delegated scratch mapped\n");
+    {
+        let private_page = SCRATCH_BUFFER + FRAME_BYTES as u64;
+        ruzt_ipc::map_anonymous(ruzt_abi::PROCESS_ADDRESS_SPACE, private_page, 1, true)
+            .expect("map private memory to be reclaimed on exit");
+        uart_write(b"consoled: delegated scratch and anonymous page mapped\n");
+    }
     #[cfg(feature = "qemu-fault-test")]
     // SAFETY: This test deliberately raises a user instruction exception.
     unsafe {

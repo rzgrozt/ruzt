@@ -1,5 +1,6 @@
 //! User process construction, launch, and termination.
 
+mod anonymous;
 mod boot_caps;
 mod framebuffer;
 mod initrd;
@@ -12,8 +13,8 @@ use crate::cap::{
 use crate::sched::{self, ThreadState};
 use alloc::vec::Vec;
 use ruzt_abi::{
-    CapRights, ErrorCode, FramebufferInfo, ProcessStatus, IPC_CAP_SLOTS, ROOTSRV_FRAMEBUFFER,
-    ROOTSRV_UNTYPED,
+    CapRights, ErrorCode, FramebufferInfo, ProcessStatus, IPC_CAP_SLOTS, PROCESS_ADDRESS_SPACE,
+    ROOTSRV_FRAMEBUFFER, ROOTSRV_UNTYPED,
 };
 use ruzt_cap::{CapType, EndpointId, ProcessId};
 use ruzt_hal::boot::Framebuffer;
@@ -69,6 +70,7 @@ impl UserProcess {
 struct UserAddressSpace {
     root: PhysFrame,
     ram: Vec<PhysFrame>,
+    anonymous: Vec<anonymous::AnonymousPage>,
     // Dropped only after Drop destroys the private page tables.
     shared_frames: Vec<shared_frames::Mapping>,
     budget: UntypedBudget,
@@ -82,7 +84,8 @@ impl Drop for UserAddressSpace {
             // construction or after the scheduler permanently switches away.
             unsafe { mapper.destroy_user_address_space(self.root, &self.budget) };
         });
-        for frame in self.ram.drain(..) {
+        let anonymous = self.anonymous.drain(..).map(|page| page.frame);
+        for frame in self.ram.drain(..).chain(anonymous) {
             // SAFETY: These are owned allocator frames. No user table maps
             // them after destroying the root. Device pages are never tracked.
             unsafe { self.budget.deallocate(frame) };
@@ -243,6 +246,18 @@ fn load(
             CapRights::WRITE,
         );
     }
+    let address_space = object::register_address_space(space.root)?;
+    if let Err(error) = cspace.insert(
+        PROCESS_ADDRESS_SPACE,
+        ruzt_cap::CapSlot {
+            cap_type: CapType::AddressSpace(address_space),
+            rights: CapRights::WRITE,
+            badge: 0,
+        },
+    ) {
+        object::deallocate(KObjectId(address_space.0));
+        return Err(error);
+    }
     Ok(UserProcess {
         space,
         entry: elf.entry_point,
@@ -263,6 +278,7 @@ fn map_image(
     let mut space = UserAddressSpace {
         root,
         ram: Vec::new(),
+        anonymous: Vec::new(),
         shared_frames: Vec::new(),
         budget,
     };
@@ -324,7 +340,6 @@ fn enter_user() -> ! {
     }
 }
 
-#[allow(unsafe_code)]
 fn map_page(
     mapper: &mut X86_64Mapper,
     space: &mut UserAddressSpace,
@@ -337,31 +352,50 @@ fn map_page(
         .ram
         .try_reserve(1)
         .map_err(|_| MapError::FrameAllocationFailed)?;
-    let frame = space
-        .budget
-        .allocate()
-        .ok_or(MapError::FrameAllocationFailed)?;
+    let frame = map_owned_page(
+        mapper,
+        space.root,
+        &space.budget,
+        page,
+        flags,
+        offset,
+        bytes,
+    )?;
+    space.ram.push(frame);
+    Ok(())
+}
+
+#[allow(unsafe_code)]
+fn map_owned_page(
+    mapper: &mut X86_64Mapper,
+    root: PhysFrame,
+    budget: &UntypedBudget,
+    page: u64,
+    flags: PageFlags,
+    offset: usize,
+    bytes: &[u8],
+) -> Result<PhysFrame, MapError> {
+    let frame = budget.allocate().ok_or(MapError::FrameAllocationFailed)?;
     // SAFETY: The budget gives exclusive ownership of this physmapped
-    // frame, and root is the inactive address space under construction.
+    // frame. The caller serializes updates to the private root.
     let result = unsafe {
         mapper::zero_frame(frame);
         mapper::copy_to_frame(frame, offset, bytes).and_then(|()| {
             mapper.map_in_address_space(
-                space.root,
+                root,
                 VirtAddr::new(page),
                 frame,
                 flags | PageFlags::USER,
-                &space.budget,
+                budget,
             )
         })
     };
-    if result.is_err() {
+    if let Err(error) = result {
         // SAFETY: A failed mapping leaves this leaf exclusively owned here.
-        unsafe { space.budget.deallocate(frame) };
-    } else {
-        space.ram.push(frame);
+        unsafe { budget.deallocate(frame) };
+        return Err(error);
     }
-    result
+    Ok(frame)
 }
 
 #[cfg(test)]

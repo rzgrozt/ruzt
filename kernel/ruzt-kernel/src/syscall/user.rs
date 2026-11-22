@@ -138,6 +138,23 @@ pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
                 args.arg5,
             )
         }
+        CapType::AddressSpace(id) if operation == CapOp::MapAnonymous as u64 => {
+            require(capability.rights, CapRights::WRITE)?;
+            let writable = match args.arg4 {
+                0 => false,
+                1 => true,
+                _ => return Err(ErrorCode::BadMessage),
+            };
+            sched::with_current_user(|process| {
+                process.map_anonymous(id, args.arg2, args.arg3, writable)
+            })
+            .ok_or(ErrorCode::InvalidCap)?
+        }
+        CapType::AddressSpace(id) if operation == CapOp::UnmapAnonymous as u64 => {
+            require(capability.rights, CapRights::WRITE)?;
+            sched::with_current_user(|process| process.unmap_anonymous(id, args.arg2, args.arg3))
+                .ok_or(ErrorCode::InvalidCap)?
+        }
         CapType::Notification(id) if args.arg1 == CapOp::Signal as u64 => {
             require(capability.rights, CapRights::WRITE)?;
             ErrorCode::from_u64(ipc::notification_signal(id))
