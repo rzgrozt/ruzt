@@ -6,7 +6,7 @@ pub mod invoke;
 mod user;
 pub mod user_mem;
 
-use ruzt_abi::{ErrorCode, SyscallArgs, SyscallNumber};
+use ruzt_abi::{ErrorCode, ProcessStatus, SyscallArgs, SyscallNumber, PROCESS_EXITED};
 
 /// Initialise the syscall entry point.
 ///
@@ -35,7 +35,14 @@ pub(crate) extern "C" fn syscall_dispatch(args: &SyscallArgs, caller_cs: u64) ->
             ErrorCode::Ok.as_u64()
         }
         SyscallNumber::Exit if from_user => {
-            crate::process::terminate_current(format_args!("exit status {}", args.arg0 as u32))
+            let code = args.arg0 as u32;
+            crate::process::terminate_current(
+                ProcessStatus {
+                    kind: PROCESS_EXITED,
+                    code,
+                },
+                format_args!("exit status {code}"),
+            )
         }
         SyscallNumber::Exit
         | SyscallNumber::NotImplemented

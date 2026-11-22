@@ -35,6 +35,8 @@ pub const ROOTSRV_CONSOLE_NOTIFICATION: u64 = 8;
 pub const ROOTSRV_CONSOLE_FRAME: u64 = 9;
 /// RAM budget initially granted to the root process.
 pub const ROOTSRV_UNTYPED: u64 = 10;
+/// Read authority for the console service's termination status.
+pub const ROOTSRV_CONSOLE_PROCESS: u64 = 13;
 
 /// Byte length of a frame supported by the user mapping ABI.
 pub const FRAME_BYTES: usize = 4096;
@@ -142,7 +144,28 @@ pub enum CapOp {
     MapFrame = 12,
     /// Remove the caller's mapping created with this frame capability.
     UnmapFrame = 13,
+    /// Read a process's terminal status into the buffer in `arg2`. With
+    /// `arg3` set to 0 this blocks until cleanup, or with 1 it polls.
+    /// A blocking wait requires an output buffer in a non-revocable mapping.
+    WaitProcess = 14,
 }
+
+/// The process invoked `Exit`.
+pub const PROCESS_EXITED: u32 = 0;
+/// The kernel terminated the process on a user-mode exception.
+pub const PROCESS_FAULTED: u32 = 1;
+
+/// Termination status published after the process's resources are reclaimed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(C)]
+pub struct ProcessStatus {
+    /// One of the `PROCESS_*` termination kinds.
+    pub kind: u32,
+    /// Process exit code or architecture exception number.
+    pub code: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<ProcessStatus>() == 8);
 
 /// Objects that can be created by invoking an Untyped capability.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -462,6 +485,7 @@ mod tests {
         assert_eq!(CapOp::Revoke as u64, 11);
         assert_eq!(CapOp::MapFrame as u64, 12);
         assert_eq!(CapOp::UnmapFrame as u64, 13);
+        assert_eq!(CapOp::WaitProcess as u64, 14);
     }
 
     #[test]

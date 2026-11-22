@@ -44,7 +44,7 @@ Each test builds a BIOS image in a fresh temporary directory. The kernel-only te
 
 A separate guest keeps the console service CPU-bound after its first reply. It verifies that timer preemption still lets `rootsrv` handle keyboard input.
 
-The exit and fault guests terminate the console while its scratch frame is mapped. They verify that `rootsrv` sees the disconnect, can reclaim both delegated budgets, and can still handle input after the kernel reaps the console process.
+The exit and fault guests terminate the console while its scratch frame is mapped. After the kernel reaps the process, `rootsrv` can read its exit code or exception vector through a process capability. The tests also verify that `rootsrv` reclaims both delegated budgets and continues handling input.
 
 GitHub Actions runs both commands on pushes to `main` and on pull requests.
 

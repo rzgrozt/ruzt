@@ -5,10 +5,14 @@ mod framebuffer;
 mod initrd;
 mod shared_frames;
 
-use crate::cap::cspace::CSpace;
+use crate::cap::{
+    cspace::{self, CSpace, CapabilityId},
+    object::{self, KObjectId, KernelObject, ProcessExitPublisher},
+};
+use crate::sched::{self, ThreadState};
 use alloc::vec::Vec;
-use ruzt_abi::{CapRights, FramebufferInfo, ROOTSRV_FRAMEBUFFER};
-use ruzt_cap::{CapType, EndpointId};
+use ruzt_abi::{CapRights, ErrorCode, FramebufferInfo, ProcessStatus, ROOTSRV_FRAMEBUFFER};
+use ruzt_cap::{CapType, EndpointId, ProcessId};
 use ruzt_hal::boot::Framebuffer;
 use ruzt_hal::mem::{MapError, PageFlags, PhysFrame, VirtAddr};
 use ruzt_hal_x86_64::mapper::{self, X86_64Mapper};
@@ -50,6 +54,7 @@ pub(crate) struct UserProcess {
     pub(crate) cspace: CSpace,
     pub(crate) framebuffer: Option<FramebufferInfo>,
     pub(crate) boot_channels: [EndpointId; 2],
+    pub(crate) exit_publisher: Option<ProcessExitPublisher>,
 }
 
 impl UserProcess {
@@ -89,13 +94,20 @@ impl Drop for UserAddressSpace {
 pub(crate) fn enqueue_initial(archive: &'static [u8], framebuffer: Option<Framebuffer>) {
     let rootsrv = initrd::file(archive, b"rootsrv").expect("unable to load rootsrv from initrd");
     let consoled = initrd::file(archive, b"consoled").expect("unable to load consoled from initrd");
-    let (channels, root_space, console_space) = boot_caps::initial_services();
-    enqueue("consoled", consoled, console_space, None, channels);
-    let root = enqueue("rootsrv", rootsrv, root_space, framebuffer, channels);
+    let (channels, root_space, console_space, console_exit) = boot_caps::initial_services();
+    enqueue(
+        "consoled",
+        consoled,
+        console_space,
+        None,
+        channels,
+        Some(console_exit),
+    );
+    let root = enqueue("rootsrv", rootsrv, root_space, framebuffer, channels, None);
     crate::keyboard::enable_user_driver(root);
 }
 
-pub(crate) fn terminate_current(reason: core::fmt::Arguments<'_>) -> ! {
+pub(crate) fn terminate_current(status: ProcessStatus, reason: core::fmt::Arguments<'_>) -> ! {
     let (name, channels) = crate::sched::with_current_user(|user| {
         user.cspace.revoke_all_descendants();
         (user.name, user.boot_channels)
@@ -107,7 +119,38 @@ pub(crate) fn terminate_current(reason: core::fmt::Arguments<'_>) -> ! {
         crate::ipc::close_boot_channel(channel);
     }
     crate::keyboard::detach_user_driver(crate::sched::current_thread_id());
-    crate::sched::retire_current_user()
+    crate::sched::retire_current_user(status)
+}
+
+pub(crate) fn wait_for_status(
+    process: ProcessId,
+    authority: Option<CapabilityId>,
+    nonblocking: bool,
+) -> Result<ProcessStatus, ErrorCode> {
+    let id = KObjectId(process.0);
+    loop {
+        match object::get(id) {
+            Some(KernelObject::Process {
+                status: Some(status),
+            }) => return Ok(status),
+            Some(KernelObject::Process { status: None }) if nonblocking => {
+                return Err(ErrorCode::WouldBlock);
+            }
+            Some(KernelObject::Process { status: None }) => {}
+            _ => return Err(ErrorCode::InvalidCap),
+        }
+        // The syscall gate keeps local interrupts disabled from the status
+        // check through blocking on the boot CPU, so publication cannot race.
+        sched::block_with_authority(
+            ThreadState::BlockedProcess(id),
+            authority,
+            Default::default(),
+        );
+        sched::check_ipc_completion()?;
+        if authority.is_some_and(|capability| !cspace::is_live(capability)) {
+            return Err(ErrorCode::InvalidCap);
+        }
+    }
 }
 
 fn enqueue(
@@ -116,6 +159,7 @@ fn enqueue(
     mut cspace: CSpace,
     framebuffer: Option<Framebuffer>,
     boot_channels: [EndpointId; 2],
+    exit_publisher: Option<ProcessExitPublisher>,
 ) -> crate::sched::ThreadId {
     let elf = crate::elf::load_elf(image).unwrap_or_else(|e| panic!("invalid {name} ELF: {e:?}"));
     assert_eq!(elf.stack_size as u64, STACK_REGION.page_count * PAGE_SIZE);
@@ -138,6 +182,7 @@ fn enqueue(
             cspace,
             framebuffer,
             boot_channels,
+            exit_publisher,
         },
         enter_user,
     )

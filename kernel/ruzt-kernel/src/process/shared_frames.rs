@@ -101,7 +101,7 @@ impl UserProcess {
         });
     }
 
-    pub(crate) fn receive_buffer_is_stable(&self, address: u64, length: usize) -> bool {
+    pub(crate) fn buffer_is_stable(&self, address: u64, length: usize) -> bool {
         let end = address.saturating_add(length as u64);
         !self
             .space

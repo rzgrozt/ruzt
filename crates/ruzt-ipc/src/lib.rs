@@ -1,7 +1,7 @@
 #![no_std]
 #![deny(unsafe_code)]
 
-use ruzt_abi::{CapOp, CapRights, ErrorCode, IpcMessage, RetypeKind, SyscallNumber};
+use ruzt_abi::{CapOp, CapRights, ErrorCode, IpcMessage, ProcessStatus, RetypeKind, SyscallNumber};
 
 pub fn send(endpoint_cptr: u64, message: &IpcMessage) -> Result<(), ErrorCode> {
     let return_value = {
@@ -126,9 +126,31 @@ pub fn unmap_frame(cptr: u64) -> Result<(), ErrorCode> {
     control(cptr, CapOp::UnmapFrame, 0, 0, 0)
 }
 
+/// Wait for a process to terminate and return its status after cleanup.
+pub fn wait_process(cptr: u64) -> Result<ProcessStatus, ErrorCode> {
+    process_status(cptr, false)
+}
+
+/// Read the terminal status or return `WouldBlock` while the process is live.
+pub fn poll_process(cptr: u64) -> Result<ProcessStatus, ErrorCode> {
+    process_status(cptr, true)
+}
+
+fn process_status(cptr: u64, nonblocking: bool) -> Result<ProcessStatus, ErrorCode> {
+    let mut status = ProcessStatus::default();
+    control(
+        cptr,
+        CapOp::WaitProcess,
+        (&raw mut status) as u64,
+        u64::from(nonblocking),
+        0,
+    )?;
+    Ok(status)
+}
+
 #[allow(unsafe_code)]
 fn control(cptr: u64, op: CapOp, arg2: u64, arg3: u64, arg4: u64) -> Result<(), ErrorCode> {
-    // SAFETY: These capability-space operations take scalar arguments only.
+    // SAFETY: The wrappers supply the arguments required by each operation.
     let status = unsafe {
         ruzt_runtime::syscall::syscall(SyscallNumber::Invoke, cptr, op as u64, arg2, arg3, arg4, 0)
     };

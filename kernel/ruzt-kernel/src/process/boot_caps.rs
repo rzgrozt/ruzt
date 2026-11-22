@@ -1,17 +1,20 @@
 //! Capabilities granted by the boot policy.
 
 use ruzt_abi::{
-    console, CapRights, ROOTSRV_CONSOLE_REPLY, ROOTSRV_CONSOLE_REQUEST, ROOTSRV_KEYBOARD_DATA,
-    ROOTSRV_KEYBOARD_IRQ, ROOTSRV_UNTYPED,
+    console, CapRights, ROOTSRV_CONSOLE_PROCESS, ROOTSRV_CONSOLE_REPLY, ROOTSRV_CONSOLE_REQUEST,
+    ROOTSRV_KEYBOARD_DATA, ROOTSRV_KEYBOARD_IRQ, ROOTSRV_UNTYPED,
 };
 use ruzt_cap::{CapSlot, CapType, EndpointId};
 
-use crate::cap::{cspace::CSpace, object};
+use crate::cap::{
+    cspace::CSpace,
+    object::{self, ProcessExitPublisher},
+};
 use crate::{keyboard, serial};
 
 const ROOTSRV_UNTYPED_BITS: u8 = 14;
 
-pub(super) fn initial_services() -> ([EndpointId; 2], CSpace, CSpace) {
+pub(super) fn initial_services() -> ([EndpointId; 2], CSpace, CSpace, ProcessExitPublisher) {
     let request = endpoint();
     let reply = endpoint();
     let channels = [request, reply];
@@ -45,6 +48,13 @@ pub(super) fn initial_services() -> ([EndpointId; 2], CSpace, CSpace) {
     rootsrv
         .provision_untyped(ROOTSRV_UNTYPED, ROOTSRV_UNTYPED_BITS)
         .expect("reserve the root server RAM budget");
+    let (console_id, console_exit) = ProcessExitPublisher::new().expect("allocate console status");
+    grant(
+        &mut rootsrv,
+        ROOTSRV_CONSOLE_PROCESS,
+        CapType::Process(console_id),
+        CapRights::READ.union(CapRights::GRANT),
+    );
 
     let mut consoled = CSpace::new(3);
     grant(&mut consoled, console::REQUEST, request, CapRights::READ);
@@ -63,7 +73,7 @@ pub(super) fn initial_services() -> ([EndpointId; 2], CSpace, CSpace) {
         },
         CapRights::READ,
     );
-    (channels, rootsrv, consoled)
+    (channels, rootsrv, consoled, console_exit)
 }
 
 fn endpoint() -> EndpointId {

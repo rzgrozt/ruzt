@@ -5,11 +5,11 @@ mod tile;
 
 use ruzt_abi::{
     console, CapRights, CapTransferSlot, ErrorCode, IpcMessage, RetypeKind, FRAME_BYTES,
-    ROOTSRV_CONSOLE_FRAME, ROOTSRV_CONSOLE_NOTIFICATION, ROOTSRV_CONSOLE_REPLY,
-    ROOTSRV_CONSOLE_REQUEST, ROOTSRV_FRAMEBUFFER, ROOTSRV_KEYBOARD_DATA, ROOTSRV_KEYBOARD_IRQ,
-    ROOTSRV_UNTYPED,
+    PROCESS_EXITED, PROCESS_FAULTED, ROOTSRV_CONSOLE_FRAME, ROOTSRV_CONSOLE_NOTIFICATION,
+    ROOTSRV_CONSOLE_PROCESS, ROOTSRV_CONSOLE_REPLY, ROOTSRV_CONSOLE_REQUEST, ROOTSRV_FRAMEBUFFER,
+    ROOTSRV_KEYBOARD_DATA, ROOTSRV_KEYBOARD_IRQ, ROOTSRV_UNTYPED,
 };
-use ruzt_runtime::{debug_putchar, runtime_init};
+use ruzt_runtime::{debug_print, runtime_init};
 
 const CONSOLE_BUFFER: u64 = 0x5000_0000;
 const LOCAL_BUDGET: u64 = 11;
@@ -24,9 +24,7 @@ pub extern "C" fn _start() -> ! {
 }
 
 fn write_line(text: &str) {
-    for byte in text.bytes().chain(core::iter::once(b'\n')) {
-        debug_putchar(byte);
-    }
+    debug_print(format_args!("{text}\n"));
 }
 
 fn greet_via_console() -> Result<(), ErrorCode> {
@@ -191,6 +189,10 @@ fn reclaim_console_objects() {
 
 fn main() -> ! {
     check_revocation();
+    assert_eq!(
+        ruzt_ipc::poll_process(ROOTSRV_CONSOLE_PROCESS),
+        Err(ErrorCode::WouldBlock)
+    );
     split_service_budgets();
     create_console_objects();
     let result = greet_via_console();
@@ -202,7 +204,21 @@ fn main() -> ! {
     write_line("rootsrv: both delegated budgets reclaimed");
     match result {
         Ok(()) => {}
-        Err(ErrorCode::NotFound) => write_line("rootsrv: console disconnected"),
+        Err(ErrorCode::NotFound) => {
+            write_line("rootsrv: console disconnected");
+            let status = ruzt_ipc::wait_process(ROOTSRV_CONSOLE_PROCESS)
+                .expect("wait for the console to be reaped");
+            assert_eq!(ruzt_ipc::poll_process(ROOTSRV_CONSOLE_PROCESS), Ok(status));
+            let reason = match status.kind {
+                PROCESS_EXITED => "exit status",
+                PROCESS_FAULTED => "fault vector",
+                _ => panic!("unknown console termination kind"),
+            };
+            debug_print(format_args!(
+                "rootsrv: reaped console reported {reason} {}\n",
+                status.code
+            ));
+        }
         Err(error) => panic!("console IPC failed: {error:?}"),
     }
 

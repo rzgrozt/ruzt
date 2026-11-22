@@ -7,7 +7,7 @@ use crate::process::UserProcess;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
-use ruzt_abi::ErrorCode;
+use ruzt_abi::{ErrorCode, ProcessStatus};
 use ruzt_hal_x86_64::context::FpState;
 use spin::Mutex;
 
@@ -25,6 +25,8 @@ pub enum ThreadState {
     BlockedRecv(KObjectId),
     /// Thread is blocked waiting on a notification.
     BlockedWait(KObjectId),
+    /// Thread is waiting for a process to exit and be reaped.
+    BlockedProcess(KObjectId),
     /// A user driver is blocked waiting for a device interrupt.
     BlockedIrq(u32),
     /// The task has terminated and will never run again.
@@ -59,7 +61,7 @@ struct Scheduler {
     wait_queue: VecDeque<ThreadId>,
     current: ThreadId,
     kernel_cr3: u64,
-    retired: Option<ThreadId>,
+    retired: Option<(ThreadId, ProcessStatus)>,
 }
 
 impl Scheduler {
@@ -81,7 +83,7 @@ impl Scheduler {
             self.run_queue.push_back(id);
         }
     }
-    fn fail_waiters(&mut self, error: ErrorCode, matches: impl Fn(&Thread) -> bool) {
+    fn finish_waiters(&mut self, error: Option<ErrorCode>, matches: impl Fn(&Thread) -> bool) {
         loop {
             let waiter = self
                 .wait_queue
@@ -89,7 +91,7 @@ impl Scheduler {
                 .copied()
                 .find(|&id| matches(&self.threads[id]));
             let Some(id) = waiter else { break };
-            self.threads[id].ipc_error = Some(error);
+            self.threads[id].ipc_error = error;
             self.threads[id].message = None;
             self.mark_runnable(id);
         }
@@ -194,7 +196,7 @@ pub(crate) fn first_waiter(reason: ThreadState) -> Option<ThreadId> {
 pub(crate) fn cancel_endpoint_waiters(endpoint: KObjectId) {
     let mut guard = SCHEDULER.lock();
     let sched = guard.as_mut().expect("scheduler not initialised");
-    sched.fail_waiters(ErrorCode::NotFound, |thread| {
+    sched.finish_waiters(Some(ErrorCode::NotFound), |thread| {
         matches!(
             thread.state,
             ThreadState::BlockedSend(object) | ThreadState::BlockedRecv(object)
@@ -211,10 +213,18 @@ pub(crate) fn apply_capability_removals() {
             user.unmap_revoked_frames();
         }
     }
-    sched.fail_waiters(ErrorCode::InvalidCap, |thread| {
+    sched.finish_waiters(Some(ErrorCode::InvalidCap), |thread| {
         thread
             .wait_capability
             .is_some_and(|id| !cspace::is_live(id))
+    });
+}
+
+pub(crate) fn wake_process_waiters(process: KObjectId) {
+    let mut guard = SCHEDULER.lock();
+    let sched = guard.as_mut().expect("scheduler not initialised");
+    sched.finish_waiters(None, |thread| {
+        thread.state == ThreadState::BlockedProcess(process)
     });
 }
 
@@ -273,7 +283,7 @@ pub(crate) fn with_current_user<T>(f: impl FnOnce(&mut UserProcess) -> T) -> Opt
 
 /// Leave the dying task on its own stack until the idle thread can reap it.
 /// Called from a syscall or user fault with interrupts disabled.
-pub(crate) fn retire_current_user() -> ! {
+pub(crate) fn retire_current_user(status: ProcessStatus) -> ! {
     let mut guard = SCHEDULER.lock();
     let sched = guard.as_mut().expect("scheduler not initialised");
     let id = sched.current;
@@ -281,17 +291,17 @@ pub(crate) fn retire_current_user() -> ! {
     assert!(sched.retired.is_none());
     sched.run_queue.retain(|&thread| thread != id);
     sched.threads[id].state = ThreadState::Exited;
-    sched.retired = Some(id);
+    sched.retired = Some((id, status));
     request_switch();
     switch_to(guard, 0);
     unreachable!("exited thread resumed");
 }
 
 pub(crate) fn reap_retired_user() {
-    let (user, stack) = {
+    let (mut user, stack, status) = {
         let mut guard = SCHEDULER.lock();
         let sched = guard.as_mut().expect("scheduler not initialised");
-        let Some(id) = sched.retired.take() else {
+        let Some((id, status)) = sched.retired.take() else {
             return;
         };
         assert_eq!(sched.current, 0);
@@ -300,6 +310,7 @@ pub(crate) fn reap_retired_user() {
         (
             retired.user.take().expect("retired user task"),
             retired.stack.take(),
+            status,
         )
     };
     #[allow(unsafe_code)]
@@ -309,9 +320,13 @@ pub(crate) fn reap_retired_user() {
         ruzt_hal_x86_64::gdt::use_boot_trap_stack()
     };
     let name = user.name;
+    let publisher = user.exit_publisher.take();
     drop(user);
     drop(stack);
     crate::serial_println!("reaped user process {name}");
+    if let Some(publisher) = publisher {
+        publisher.publish(status);
+    }
 }
 
 /// Return the current thread's ID.
@@ -519,6 +534,66 @@ mod tests {
             scheduler.threads[revoked].ipc_error,
             Some(ErrorCode::InvalidCap)
         );
+    }
+
+    #[test]
+    fn exit_status_wakes_every_observer_and_persists_while_the_cap_is_live() {
+        use crate::cap::object::{self, ProcessExitPublisher};
+        use ruzt_cap::{CapRights, CapSlot, CapType};
+
+        let _state = crate::isolated_kernel_state();
+        let (process, publisher) = ProcessExitPublisher::new().unwrap();
+        let id = KObjectId(process.0);
+        let mut caps = cspace::CSpace::new(2);
+        caps.insert(
+            0,
+            CapSlot {
+                cap_type: CapType::Process(process),
+                rights: CapRights::READ,
+                badge: 0,
+            },
+        )
+        .unwrap();
+        let observer = Some(caps.capability_id(0).unwrap());
+        assert_eq!(
+            crate::process::wait_for_status(process, observer, true),
+            Err(ErrorCode::WouldBlock)
+        );
+        fn entry() -> ! {
+            panic!("host tests do not switch stacks")
+        }
+        let first = spawn(entry);
+        let second = spawn(entry);
+        let unrelated = spawn(entry);
+        {
+            let mut guard = SCHEDULER.lock();
+            let sched = guard.as_mut().unwrap();
+            sched.mark_blocked(first, ThreadState::BlockedProcess(id));
+            sched.mark_blocked(second, ThreadState::BlockedProcess(id));
+            sched.mark_blocked(unrelated, ThreadState::BlockedWait(id));
+        }
+        let expected = ProcessStatus {
+            kind: ruzt_abi::PROCESS_EXITED,
+            code: 23,
+        };
+        publisher.publish(expected);
+        {
+            let guard = SCHEDULER.lock();
+            let sched = guard.as_ref().unwrap();
+            assert_eq!(sched.run_queue, [first, second]);
+            assert_eq!(sched.wait_queue, [unrelated]);
+            assert_eq!(sched.threads[first].ipc_error, None);
+        }
+        assert_eq!(
+            crate::process::wait_for_status(process, observer, false),
+            Ok(expected)
+        );
+        assert_eq!(
+            crate::process::wait_for_status(process, observer, true),
+            Ok(expected)
+        );
+        drop(caps);
+        assert!(object::get(id).is_none());
     }
 
     #[test]

@@ -2,8 +2,8 @@
 
 use core::mem::{offset_of, size_of};
 use ruzt_abi::{
-    CapOp, CapRights, CapTransferSlot, ErrorCode, FramebufferInfo, IpcMessage, RetypeKind,
-    SyscallArgs, IPC_CAP_SLOTS,
+    CapOp, CapRights, CapTransferSlot, ErrorCode, FramebufferInfo, IpcMessage, ProcessStatus,
+    RetypeKind, SyscallArgs, IPC_CAP_SLOTS,
 };
 use ruzt_cap::CapType;
 use ruzt_hal::mem::PhysFrame;
@@ -11,7 +11,7 @@ use x86_64::instructions::port::{PortReadOnly, PortWriteOnly};
 
 use super::user_mem;
 use crate::cap::ops::{cap_delete, cap_mint, cap_move};
-use crate::{ipc, keyboard, sched};
+use crate::{ipc, keyboard, process, sched};
 
 const DATA_OFFSET: usize = offset_of!(IpcMessage, data);
 const LABEL_OFFSET: usize = offset_of!(IpcMessage, label);
@@ -96,17 +96,7 @@ pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
         CapType::Endpoint(id) if args.arg1 == CapOp::Recv as u64 => {
             require(capability.rights, CapRights::READ)?;
             // Reject bad buffers before consuming a pending sender or blocking.
-            let length = size_of::<IpcMessage>();
-            user_mem::validate_user_buffer(root, args.arg2, length, true)?;
-            // Grant delivery can finish before the waiter resumes. Its
-            // output cannot live in a frame another task can revoke.
-            if !sched::with_current_user(|process| {
-                process.receive_buffer_is_stable(args.arg2, length)
-            })
-            .ok_or(ErrorCode::InvalidCap)?
-            {
-                return Err(ErrorCode::BadMessage);
-            }
+            validate_blocking_output(root, args.arg2, size_of::<IpcMessage>())?;
             let capacity = usize::try_from(args.arg4).map_err(|_| ErrorCode::BadMessage)?;
             if capacity > IPC_CAP_SLOTS {
                 return Err(ErrorCode::BadMessage);
@@ -117,6 +107,25 @@ pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
             };
             let message = ipc::receive_packet(id, authority, slots)?;
             write_message(root, args.arg2, &message)
+        }
+        CapType::Process(id) if args.arg1 == CapOp::WaitProcess as u64 => {
+            require(capability.rights, CapRights::READ)?;
+            let nonblocking = match args.arg3 {
+                0 => false,
+                1 => true,
+                _ => return Err(ErrorCode::BadMessage),
+            };
+            let length = size_of::<ProcessStatus>();
+            if nonblocking {
+                user_mem::validate_user_buffer(root, args.arg2, length, true)?;
+            } else {
+                validate_blocking_output(root, args.arg2, length)?;
+            }
+            let status = process::wait_for_status(id, authority, nonblocking)?;
+            let mut bytes = [0; size_of::<ProcessStatus>()];
+            bytes[..4].copy_from_slice(&status.kind.to_ne_bytes());
+            bytes[4..].copy_from_slice(&status.code.to_ne_bytes());
+            user_mem::write_user_buffer(root, args.arg2, &bytes)
         }
         CapType::Notification(id) if args.arg1 == CapOp::Signal as u64 => {
             require(capability.rights, CapRights::WRITE)?;
@@ -163,6 +172,19 @@ pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
             user_mem::write_user_buffer(root, args.arg2, &bytes)
         }
         _ => Err(ErrorCode::InvalidCap),
+    }
+}
+
+fn validate_blocking_output(root: PhysFrame, address: u64, length: usize) -> Result<(), ErrorCode> {
+    user_mem::validate_user_buffer(root, address, length, true)?;
+    // A blocking call can complete in the kernel before the waiter resumes.
+    // Its output cannot live in a frame another task can revoke.
+    if sched::with_current_user(|process| process.buffer_is_stable(address, length))
+        .ok_or(ErrorCode::InvalidCap)?
+    {
+        Ok(())
+    } else {
+        Err(ErrorCode::BadMessage)
     }
 }
 

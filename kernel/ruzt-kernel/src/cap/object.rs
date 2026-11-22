@@ -1,8 +1,8 @@
 //! Kernel object table — every capability references a stable entry here.
 
 use alloc::vec::Vec;
-use ruzt_abi::{ErrorCode, RetypeKind};
-use ruzt_cap::{CapType, EndpointId, FrameSize, NotificationId, NULL_SLOT};
+use ruzt_abi::{ErrorCode, ProcessStatus, RetypeKind};
+use ruzt_cap::{CapType, EndpointId, FrameSize, NotificationId, ProcessId, NULL_SLOT};
 use ruzt_hal::mem::{PhysAddr, PhysFrame};
 use spin::Mutex;
 
@@ -38,6 +38,11 @@ pub enum KernelObject {
     Notification {
         /// Whether a signal arrived while nobody was waiting.
         state: bool,
+    },
+    /// A live process or its persistent terminal status.
+    Process {
+        /// Set once, after the scheduler reaps the process.
+        status: Option<ProcessStatus>,
     },
     /// Thread control block.
     Thread {
@@ -373,6 +378,36 @@ impl Drop for FramePin {
     }
 }
 
+/// Owns the process's reference while the kernel can still publish its status.
+pub(crate) struct ProcessExitPublisher(KObjectId);
+
+impl ProcessExitPublisher {
+    pub(crate) fn new() -> Result<(ProcessId, Self), ErrorCode> {
+        let id = allocate_with(|| Ok(KernelObject::Process { status: None }))?;
+        if let Err(error) = retain(id) {
+            deallocate(id);
+            return Err(error);
+        }
+        Ok((ProcessId(id.0), Self(id)))
+    }
+
+    pub(crate) fn publish(self, status: ProcessStatus) {
+        update(self.0, |object| {
+            let KernelObject::Process { status: stored } = object else {
+                unreachable!("exit publisher owns a process object");
+            };
+            assert!(stored.replace(status).is_none());
+        });
+        crate::sched::wake_process_waiters(self.0);
+    }
+}
+
+impl Drop for ProcessExitPublisher {
+    fn drop(&mut self) {
+        release(self.0);
+    }
+}
+
 fn destroy(object: KernelObject, backing: Option<UntypedAllocation>) {
     match object {
         KernelObject::CNode { slots, count, .. } => {
@@ -444,6 +479,7 @@ fn kernel_object_from_cap_type(cap_type: CapType) -> Result<KernelObject, ErrorC
             root_page_table: crate::mm::frame::allocate().ok_or(ErrorCode::NoMemory)?,
         }),
         CapType::Frame { .. } | CapType::Untyped { .. } => Err(ErrorCode::InvalidCap),
+        CapType::Process(_) => Err(ErrorCode::InvalidCap),
         CapType::CNode { radix_bits, .. } => {
             let count = 1usize
                 .checked_shl(u32::from(radix_bits))

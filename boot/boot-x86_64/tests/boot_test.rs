@@ -122,15 +122,19 @@ enum Services {
 
 #[test]
 fn test_user_fault_closes_ipc_and_keeps_the_other_process_running() {
-    assert_console_shutdown_isolated(Services::FaultingConsole, "instruction exception");
+    assert_console_shutdown_isolated(
+        Services::FaultingConsole,
+        "instruction exception",
+        "fault vector 6",
+    );
 }
 
 #[test]
 fn test_user_exit_closes_ipc_and_keeps_the_other_process_running() {
-    assert_console_shutdown_isolated(Services::ExitingConsole, "exit status 23");
+    assert_console_shutdown_isolated(Services::ExitingConsole, "exit status 23", "exit status 23");
 }
 
-fn assert_console_shutdown_isolated(services: Services, reason: &str) {
+fn assert_console_shutdown_isolated(services: Services, reason: &str, observed_status: &str) {
     let temp = tempfile::tempdir().expect("Failed to create boot test directory");
     let disk_image = build_image(temp.path(), "qemu-rootsrv-test", services);
     let serial_path = temp.path().join("serial.log");
@@ -159,6 +163,7 @@ fn assert_console_shutdown_isolated(services: Services, reason: &str) {
             "reaped user process consoled",
             "rootsrv: both delegated budgets reclaimed",
             "rootsrv: console disconnected",
+            &format!("rootsrv: reaped console reported {observed_status}"),
             "rootsrv thread waiting for keyboard IRQ",
             "rootsrv: Space key received",
         ],

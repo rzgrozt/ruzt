@@ -27,6 +27,10 @@ pub struct EndpointId(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NotificationId(pub u64);
 
+/// Opaque identifier for a process status object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessId(pub u64);
+
 /// Size of a frame mapping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameSize {
@@ -100,6 +104,8 @@ pub enum CapType {
     },
     /// Access to a mapped boot framebuffer.
     Framebuffer,
+    /// Observe the final status of a process.
+    Process(ProcessId),
 }
 
 /// A capability as it lives in a CNode slot.

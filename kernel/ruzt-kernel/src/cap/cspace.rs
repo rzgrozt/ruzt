@@ -260,6 +260,7 @@ impl CSpace {
         let object = match slot.cap_type {
             CapType::Endpoint(id) => Some(KObjectId(id.0)),
             CapType::Notification(id) => Some(KObjectId(id.0)),
+            CapType::Process(id) => Some(KObjectId(id.0)),
             CapType::Thread(id) => Some(KObjectId(id.0)),
             CapType::AddressSpace(id) => Some(KObjectId(id.0)),
             CapType::CNode { ptr, .. } => Some(KObjectId(ptr)),

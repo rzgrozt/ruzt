@@ -1,6 +1,7 @@
 //! x86_64 interrupt descriptor table and exception handlers.
 
 use crate::serial_println;
+use ruzt_abi::{ProcessStatus, PROCESS_FAULTED};
 use ruzt_hal::cpu::CpuOps;
 use ruzt_hal::time::Timer;
 use spin::Once;
@@ -21,20 +22,26 @@ pub fn init_idt() {
         idt.breakpoint.set_handler_fn(breakpoint_handler);
         idt.double_fault.set_handler_fn(double_fault_handler);
         idt.page_fault.set_handler_fn(page_fault_handler);
-        idt.divide_error.set_handler_fn(arithmetic_fault);
-        idt.x87_floating_point.set_handler_fn(arithmetic_fault);
-        idt.simd_floating_point.set_handler_fn(arithmetic_fault);
-        idt.debug.set_handler_fn(instruction_fault);
-        idt.overflow.set_handler_fn(arithmetic_fault);
-        idt.bound_range_exceeded.set_handler_fn(arithmetic_fault);
-        idt.invalid_opcode.set_handler_fn(instruction_fault);
-        idt.device_not_available.set_handler_fn(instruction_fault);
-        idt.invalid_tss.set_handler_fn(protection_fault);
-        idt.segment_not_present.set_handler_fn(protection_fault);
-        idt.stack_segment_fault.set_handler_fn(protection_fault);
+        idt.divide_error.set_handler_fn(arithmetic_fault::<0>);
+        idt.x87_floating_point
+            .set_handler_fn(arithmetic_fault::<16>);
+        idt.simd_floating_point
+            .set_handler_fn(arithmetic_fault::<19>);
+        idt.debug.set_handler_fn(instruction_fault::<1>);
+        idt.overflow.set_handler_fn(arithmetic_fault::<4>);
+        idt.bound_range_exceeded
+            .set_handler_fn(arithmetic_fault::<5>);
+        idt.invalid_opcode.set_handler_fn(instruction_fault::<6>);
+        idt.device_not_available
+            .set_handler_fn(instruction_fault::<7>);
+        idt.invalid_tss.set_handler_fn(protection_fault::<10>);
+        idt.segment_not_present
+            .set_handler_fn(protection_fault::<11>);
+        idt.stack_segment_fault
+            .set_handler_fn(protection_fault::<12>);
         idt.general_protection_fault
-            .set_handler_fn(protection_fault);
-        idt.alignment_check.set_handler_fn(protection_fault);
+            .set_handler_fn(protection_fault::<13>);
+        idt.alignment_check.set_handler_fn(protection_fault::<17>);
         idt[32].set_handler_fn(timer_handler);
         idt[33].set_handler_fn(keyboard_handler);
         unsafe {
@@ -100,27 +107,33 @@ extern "x86-interrupt" fn page_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
-    fatal_fault(stack_frame, format_args!("page fault ({error_code:?})"));
+    fatal_fault(stack_frame, 14, format_args!("page fault ({error_code:?})"));
 }
 
-extern "x86-interrupt" fn arithmetic_fault(frame: InterruptStackFrame) {
-    fatal_fault(frame, format_args!("arithmetic exception"));
+extern "x86-interrupt" fn arithmetic_fault<const VECTOR: u32>(frame: InterruptStackFrame) {
+    fatal_fault(frame, VECTOR, format_args!("arithmetic exception"));
 }
 
-extern "x86-interrupt" fn instruction_fault(frame: InterruptStackFrame) {
-    fatal_fault(frame, format_args!("instruction exception"));
+extern "x86-interrupt" fn instruction_fault<const VECTOR: u32>(frame: InterruptStackFrame) {
+    fatal_fault(frame, VECTOR, format_args!("instruction exception"));
 }
 
-extern "x86-interrupt" fn protection_fault(frame: InterruptStackFrame, code: u64) {
-    fatal_fault(frame, format_args!("protection fault ({code:#x})"));
+extern "x86-interrupt" fn protection_fault<const VECTOR: u32>(
+    frame: InterruptStackFrame,
+    code: u64,
+) {
+    fatal_fault(frame, VECTOR, format_args!("protection fault ({code:#x})"));
 }
 
-fn fatal_fault(frame: InterruptStackFrame, reason: core::fmt::Arguments<'_>) -> ! {
+fn fatal_fault(frame: InterruptStackFrame, vector: u32, reason: core::fmt::Arguments<'_>) -> ! {
     if frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
-        crate::process::terminate_current(format_args!(
-            "{reason} at {:?}",
-            frame.instruction_pointer
-        ));
+        crate::process::terminate_current(
+            ProcessStatus {
+                kind: PROCESS_FAULTED,
+                code: vector,
+            },
+            format_args!("{reason} at {:?}", frame.instruction_pointer),
+        );
     }
     panic!("kernel {reason}\n{frame:#?}");
 }
