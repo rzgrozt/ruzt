@@ -135,19 +135,29 @@ pub fn wait_process(cptr: u64) -> Result<ProcessStatus, ErrorCode> {
 ///
 /// The process status capability is installed at `status_slot`. Set a bit in
 /// `close_on_exit` for each startup endpoint that should close on termination.
+/// The child's private address-space pages come from `memory_budget`.
+#[allow(unsafe_code)]
 pub fn spawn_program(
     program: u64,
     status_slot: u64,
     grants: &IpcMessage,
     close_on_exit: u8,
+    memory_budget: u64,
 ) -> Result<(), ErrorCode> {
-    control(
-        program,
-        CapOp::SpawnProgram,
-        status_slot,
-        (grants as *const IpcMessage) as u64,
-        u64::from(close_on_exit),
-    )
+    // SAFETY: The immutable borrow keeps the entire grant packet readable
+    // throughout this synchronous syscall. The remaining arguments are scalar.
+    let status = unsafe {
+        ruzt_runtime::syscall::syscall(
+            SyscallNumber::Invoke,
+            program,
+            CapOp::SpawnProgram as u64,
+            status_slot,
+            (grants as *const IpcMessage) as u64,
+            u64::from(close_on_exit),
+            memory_budget,
+        )
+    };
+    ErrorCode::from_u64(status)
 }
 
 /// Read the terminal status or return `WouldBlock` while the process is live.

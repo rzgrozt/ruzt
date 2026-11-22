@@ -135,6 +135,7 @@ pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
                 args.arg2,
                 grants,
                 args.arg4,
+                args.arg5,
             )
         }
         CapType::Notification(id) if args.arg1 == CapOp::Signal as u64 => {

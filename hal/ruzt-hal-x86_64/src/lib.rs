@@ -24,7 +24,7 @@
 //! );
 //!
 //! let _: unsafe extern "C" fn(u64, u64, u64) -> ! = context::enter_user;
-//! let _: fn(&mut mapper::X86_64Mapper) -> Result<PhysFrame, MapError> =
+//! let _: fn(&mut mapper::X86_64Mapper, &dyn mapper::UserPageFrames) -> Result<PhysFrame, MapError> =
 //!     mapper::X86_64Mapper::create_user_address_space;
 //! let _: unsafe fn(
 //!     &mut mapper::X86_64Mapper,
@@ -32,6 +32,7 @@
 //!     VirtAddr,
 //!     PhysFrame,
 //!     PageFlags,
+//!     &dyn mapper::UserPageFrames,
 //! ) -> Result<(), MapError> = mapper::X86_64Mapper::map_in_address_space;
 //! let _: unsafe fn(PhysFrame) = mapper::zero_frame;
 //! let _: unsafe fn(PhysFrame, usize, &[u8]) -> Result<(), MapError> = mapper::copy_to_frame;

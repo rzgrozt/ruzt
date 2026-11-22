@@ -70,7 +70,7 @@ pub fn main(boot_info: &'static mut BootInfo) -> ! {
     // of the mapper. The bootloader identity-maps all physical memory at
     // `physical_memory_offset` and loaded a valid page table into CR3.
     unsafe {
-        ruzt_hal_x86_64::mapper::init(offset, mm::frame::allocate, mm::frame::deallocate);
+        ruzt_hal_x86_64::mapper::init(offset, mm::frame::allocate);
     }
 
     mm::heap::init();

@@ -10,7 +10,7 @@ Each service has its own capability space. The console endpoints grant send and 
 
 Capabilities keep kernel objects alive while copies exist. A caller with grant rights can derive a capability with reduced rights. Moving a capability preserves its ancestry, and revoking it removes all its descendants, unmaps their shared pages, and wakes waiters that lost their authority. IPC transfers install capabilities only in empty slots designated by the receiver. Each frame capability can establish one non-executable mapping in the caller, and mapped memory stays allocated until the final page-table alias is removed.
 
-The root server receives a 32 KiB Untyped RAM budget at boot. It creates console endpoints from the budget and reserves two separate 8 KiB regions, delegating one to the console service for its scratch buffer. A frame, endpoint, or notification currently costs one 4 KiB page. Copies of an Untyped capability draw from the same budget. A reserved region returns to its parent after the region cap and its last live object are gone.
+The root server receives an 8 MiB Untyped RAM budget at boot. Each process's image, user stack, heap, and private page tables draw from its address-space budget. `rootsrv` reserves 2 MiB for the console address space and delegates a separate 8 KiB region to the service for its scratch buffer. Copies of an Untyped capability draw from the same budget. A reserved region returns to its parent after the region cap and its last live allocation are gone.
 
 When a service exits or takes a user-mode fault, the kernel closes endpoints designated at launch, wakes blocked peers, and reclaims its stack and private address-space memory after switching away. `rootsrv` uses the process status capability to distinguish exit from fault and retries a failed console instance once with fresh endpoints.
 
@@ -44,7 +44,7 @@ Each test builds a BIOS image in a fresh temporary directory. The kernel-only te
 
 A separate guest keeps the console service CPU-bound after its first reply. It verifies that timer preemption still lets `rootsrv` handle keyboard input.
 
-The exit and fault guests terminate the console while its scratch frame is mapped. After reaping each instance, `rootsrv` reads its exit code or exception vector, reclaims both delegated budgets, and restarts the service with fresh endpoints. It continues handling input when the replacement also fails.
+The exit and fault guests terminate the console while its scratch frame is mapped. After reaping each instance, `rootsrv` checks that it can reserve the full address-space budget again and that both scratch budgets are reclaimed. It restarts the service with fresh endpoints and continues handling input when the replacement also fails.
 
 GitHub Actions runs both commands on pushes to `main` and on pull requests.
 

@@ -19,6 +19,9 @@ const SERVICE_BUDGET_BITS: u8 = 13;
 const SESSION_BUDGET: u64 = 15;
 const REQUEST_ENDPOINT: u64 = 16;
 const REPLY_ENDPOINT: u64 = 17;
+const PROGRAM_BUDGET: u64 = 20;
+const PROGRAM_BUDGET_BITS: u8 = 21;
+const PROGRAM_BUDGET_HALVES: [u64; 2] = [21, 22];
 const EXIT_CHANNELS: u8 = (1 << console::REQUEST) | (1 << console::REPLY);
 const GREETING: &[u8] = b"Hello from ring 3, rootsrv alive.\n";
 const _: () = assert!(GREETING.len() <= FRAME_BYTES);
@@ -238,7 +241,8 @@ fn start_console() {
             ROOTSRV_UART_DATA,
             ROOTSRV_CONSOLE_PROCESS,
             &launch,
-            EXIT_CHANNELS
+            EXIT_CHANNELS,
+            PROGRAM_BUDGET,
         ),
         Err(ErrorCode::InvalidCap)
     );
@@ -247,7 +251,8 @@ fn start_console() {
             ROOTSRV_CONSOLE_PROGRAM,
             ROOTSRV_CONSOLE_REQUEST,
             &launch,
-            EXIT_CHANNELS
+            EXIT_CHANNELS,
+            PROGRAM_BUDGET,
         ),
         Err(ErrorCode::SlotOccupied)
     );
@@ -256,15 +261,31 @@ fn start_console() {
             ROOTSRV_CONSOLE_PROGRAM,
             ROOTSRV_CONSOLE_PROCESS,
             &launch,
-            EXIT_CHANNELS | (1 << console::UART_DATA)
+            EXIT_CHANNELS | (1 << console::UART_DATA),
+            PROGRAM_BUDGET,
         ),
         Err(ErrorCode::BadMessage)
+    );
+    assert_eq!(
+        ruzt_ipc::spawn_program(
+            ROOTSRV_CONSOLE_PROGRAM,
+            ROOTSRV_CONSOLE_PROCESS,
+            &launch,
+            EXIT_CHANNELS,
+            SESSION_BUDGET,
+        ),
+        Err(ErrorCode::NoMemory)
+    );
+    assert_eq!(
+        ruzt_ipc::poll_process(ROOTSRV_CONSOLE_PROCESS),
+        Err(ErrorCode::InvalidCap)
     );
     ruzt_ipc::spawn_program(
         ROOTSRV_CONSOLE_PROGRAM,
         ROOTSRV_CONSOLE_PROCESS,
         &launch,
         EXIT_CHANNELS,
+        PROGRAM_BUDGET,
     )
     .expect("launch console with explicitly granted capabilities");
 }
@@ -284,11 +305,23 @@ fn confirm_console_ready() -> Result<(), ErrorCode> {
 }
 
 fn run_console() {
+    ruzt_ipc::split_untyped(ROOTSRV_UNTYPED, PROGRAM_BUDGET, PROGRAM_BUDGET_BITS)
+        .expect("reserve console address-space memory");
     ruzt_ipc::split_untyped(ROOTSRV_UNTYPED, SESSION_BUDGET, SERVICE_BUDGET_BITS + 1)
         .expect("reserve console session memory");
     for attempt in 0..2 {
         start_console();
         let ready = confirm_console_ready();
+        if ready.is_ok() {
+            assert_eq!(
+                ruzt_ipc::split_untyped(
+                    PROGRAM_BUDGET,
+                    PROGRAM_BUDGET_HALVES[0],
+                    PROGRAM_BUDGET_BITS - 1
+                ),
+                Err(ErrorCode::NoMemory)
+            );
+        }
         if attempt != 0 && ready.is_ok() {
             write_line("rootsrv: restarted console acknowledged IPC");
         }
@@ -324,6 +357,7 @@ fn run_console() {
             "rootsrv: reaped console reported {reason} {}\n",
             status.code
         ));
+        verify_program_budget_reclaimed();
 
         for slot in [REQUEST_ENDPOINT, REPLY_ENDPOINT] {
             ruzt_ipc::revoke(slot).expect("revoke the old console channel");
@@ -337,6 +371,17 @@ fn run_console() {
             write_line("rootsrv: restarting console with fresh endpoints");
         }
     }
+}
+
+fn verify_program_budget_reclaimed() {
+    for slot in PROGRAM_BUDGET_HALVES {
+        ruzt_ipc::split_untyped(PROGRAM_BUDGET, slot, PROGRAM_BUDGET_BITS - 1)
+            .expect("reclaim the console address-space budget");
+    }
+    for slot in PROGRAM_BUDGET_HALVES {
+        ruzt_ipc::delete(slot).expect("return the reclaimed span to the program budget");
+    }
+    write_line("rootsrv: console address-space budget reclaimed");
 }
 
 fn main() -> ! {

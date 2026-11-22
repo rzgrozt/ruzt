@@ -159,7 +159,8 @@ pub enum CapOp {
     /// to an [`IpcMessage`] containing only startup grants for child slots
     /// starting at zero. Each bit in `arg4` selects a startup endpoint that
     /// will close on child exit and requires full read, write and grant
-    /// authority on the source endpoint.
+    /// authority on the source endpoint. `arg5` is a writable Untyped slot
+    /// that funds the child's private address-space pages.
     SpawnProgram = 15,
 }
 

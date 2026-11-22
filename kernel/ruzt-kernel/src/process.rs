@@ -7,17 +7,18 @@ mod shared_frames;
 
 use crate::cap::{
     cspace::{self, CSpace, CapabilityId},
-    object::{self, KObjectId, KernelObject, ProcessExitPublisher},
+    object::{self, KObjectId, KernelObject, ProcessExitPublisher, UntypedBudget},
 };
 use crate::sched::{self, ThreadState};
 use alloc::vec::Vec;
 use ruzt_abi::{
     CapRights, ErrorCode, FramebufferInfo, ProcessStatus, IPC_CAP_SLOTS, ROOTSRV_FRAMEBUFFER,
+    ROOTSRV_UNTYPED,
 };
 use ruzt_cap::{CapType, EndpointId, ProcessId};
 use ruzt_hal::boot::Framebuffer;
 use ruzt_hal::mem::{MapError, PageFlags, PhysFrame, VirtAddr};
-use ruzt_hal_x86_64::mapper::{self, X86_64Mapper};
+use ruzt_hal_x86_64::mapper::{self, UserPageFrames, X86_64Mapper};
 
 const PAGE_SIZE: u64 = PhysFrame::SIZE as u64;
 const _: () = assert!(ruzt_abi::FRAME_BYTES == PhysFrame::SIZE);
@@ -70,6 +71,7 @@ struct UserAddressSpace {
     ram: Vec<PhysFrame>,
     // Dropped only after Drop destroys the private page tables.
     shared_frames: Vec<shared_frames::Mapping>,
+    budget: UntypedBudget,
 }
 
 impl Drop for UserAddressSpace {
@@ -78,13 +80,12 @@ impl Drop for UserAddressSpace {
         mapper::with_mapper(|mapper| {
             // SAFETY: An address space can be dropped only during failed
             // construction or after the scheduler permanently switches away.
-            unsafe { mapper.destroy_user_address_space(self.root) };
+            unsafe { mapper.destroy_user_address_space(self.root, &self.budget) };
         });
         for frame in self.ram.drain(..) {
             // SAFETY: These are owned allocator frames. No user table maps
             // them after destroying the root. Device pages are never tracked.
-            unsafe { mapper::zero_frame(frame) };
-            crate::mm::frame::deallocate(frame);
+            unsafe { self.budget.deallocate(frame) };
         }
     }
 }
@@ -93,13 +94,11 @@ impl Drop for UserAddressSpace {
 pub(crate) fn enqueue_initial(archive: &'static [u8], framebuffer: Option<Framebuffer>) {
     let rootsrv = initrd::file(archive, b"rootsrv").expect("unable to load rootsrv from initrd");
     let consoled = initrd::file(archive, b"consoled").expect("unable to load consoled from initrd");
-    let root = load(
-        "rootsrv",
-        rootsrv,
-        boot_caps::root_space(consoled),
-        framebuffer,
-    )
-    .expect("load rootsrv");
+    let root_space = boot_caps::root_space(consoled);
+    let budget = root_space
+        .untyped_budget(ROOTSRV_UNTYPED)
+        .expect("rootsrv RAM budget");
+    let root = load("rootsrv", rootsrv, root_space, framebuffer, budget).expect("load rootsrv");
     let root = sched::spawn_user(root, enter_user).expect("schedule rootsrv");
     crate::keyboard::enable_user_driver(root);
 }
@@ -109,6 +108,7 @@ pub(crate) fn spawn_program(
     status_slot: u64,
     packet: crate::ipc::Packet,
     close_on_exit: u64,
+    memory_slot: u64,
 ) -> Result<(), ErrorCode> {
     let Some(KernelObject::Program { name, image }) = object::get(program) else {
         return Err(ErrorCode::InvalidCap);
@@ -122,7 +122,7 @@ pub(crate) fn spawn_program(
         return Err(ErrorCode::BadMessage);
     }
 
-    let channels = sched::with_current_user(|parent| {
+    let (channels, budget) = sched::with_current_user(|parent| {
         parent.cspace.require_vacant(status_slot)?;
         let mut channels = [None; IPC_CAP_SLOTS];
         let channel_rights = CapRights::READ
@@ -141,13 +141,13 @@ pub(crate) fn spawn_program(
             }
             *channel = Some(id);
         }
-        Ok(channels)
+        Ok((channels, parent.cspace.untyped_budget(memory_slot)?))
     })
     .ok_or(ErrorCode::InvalidCap)??;
 
     let mut child_space = CSpace::try_new(4)?;
     child_space.accept_grants(0, &packet.grants[..count])?;
-    let mut child = load(name, image, child_space, None)?;
+    let mut child = load(name, image, child_space, None, budget)?;
     child.exit_channels = channels;
     let (process, publisher) = ProcessExitPublisher::new()?;
     child.exit_publisher = Some(publisher);
@@ -223,15 +223,17 @@ fn load(
     image: &'static [u8],
     mut cspace: CSpace,
     framebuffer: Option<Framebuffer>,
+    budget: UntypedBudget,
 ) -> Result<UserProcess, ErrorCode> {
     let elf = crate::elf::load_elf(image)?;
     if elf.stack_size as u64 != STACK_REGION.page_count * PAGE_SIZE {
         return Err(ErrorCode::BadMessage);
     }
-    let (space, framebuffer) = map_image(&elf, framebuffer).map_err(|error| match error {
-        MapError::FrameAllocationFailed => ErrorCode::NoMemory,
-        _ => ErrorCode::BadMessage,
-    })?;
+    let (space, framebuffer) =
+        map_image(&elf, framebuffer, budget).map_err(|error| match error {
+            MapError::FrameAllocationFailed => ErrorCode::NoMemory,
+            _ => ErrorCode::BadMessage,
+        })?;
 
     if framebuffer.is_some() {
         boot_caps::grant(
@@ -255,12 +257,14 @@ fn load(
 fn map_image(
     elf: &crate::elf::LoadedElf,
     framebuffer: Option<Framebuffer>,
+    budget: UntypedBudget,
 ) -> Result<(UserAddressSpace, Option<FramebufferInfo>), MapError> {
-    let root = mapper::with_mapper(|mapper| mapper.create_user_address_space())?;
+    let root = mapper::with_mapper(|mapper| mapper.create_user_address_space(&budget))?;
     let mut space = UserAddressSpace {
         root,
         ram: Vec::new(),
         shared_frames: Vec::new(),
+        budget,
     };
     let framebuffer = mapper::with_mapper(|mapper| {
         for segment in &elf.segments {
@@ -297,7 +301,7 @@ fn map_image(
         }
         Ok::<_, MapError>(
             framebuffer
-                .map(|framebuffer| framebuffer::map(mapper, root, framebuffer))
+                .map(|framebuffer| framebuffer::map(mapper, root, framebuffer, &space.budget))
                 .transpose()?
                 .flatten(),
         )
@@ -333,8 +337,11 @@ fn map_page(
         .ram
         .try_reserve(1)
         .map_err(|_| MapError::FrameAllocationFailed)?;
-    let frame = crate::mm::frame::allocate().ok_or(MapError::FrameAllocationFailed)?;
-    // SAFETY: The allocator gives exclusive ownership of this physmapped
+    let frame = space
+        .budget
+        .allocate()
+        .ok_or(MapError::FrameAllocationFailed)?;
+    // SAFETY: The budget gives exclusive ownership of this physmapped
     // frame, and root is the inactive address space under construction.
     let result = unsafe {
         mapper::zero_frame(frame);
@@ -344,13 +351,13 @@ fn map_page(
                 VirtAddr::new(page),
                 frame,
                 flags | PageFlags::USER,
+                &space.budget,
             )
         })
     };
     if result.is_err() {
         // SAFETY: A failed mapping leaves this leaf exclusively owned here.
-        unsafe { mapper::zero_frame(frame) };
-        crate::mm::frame::deallocate(frame);
+        unsafe { space.budget.deallocate(frame) };
     } else {
         space.ram.push(frame);
     }

@@ -4,8 +4,10 @@ use alloc::vec::Vec;
 use ruzt_abi::{ErrorCode, ProcessStatus, RetypeKind};
 use ruzt_cap::{CapType, EndpointId, FrameSize, NotificationId, ProcessId, NULL_SLOT};
 use ruzt_hal::mem::{PhysAddr, PhysFrame};
+use ruzt_hal_x86_64::mapper::{self, UserPageFrames};
 use spin::Mutex;
 
+use super::region::FreePages;
 use crate::mm::frame;
 
 /// Maximum number of kernel objects in the table.
@@ -81,8 +83,6 @@ pub enum KernelObject {
         phys: PhysFrame,
         /// Size of the region as a power-of-two exponent.
         size_bits: u8,
-        /// A set bit identifies a page still available for retyping.
-        free_pages: u64,
     },
     /// IRQ handler.
     Irq {
@@ -103,15 +103,16 @@ const MAX_GENERATION: u64 = u64::MAX >> INDEX_BITS;
 #[derive(Clone, Copy)]
 struct UntypedAllocation {
     region: KObjectId,
-    mask: u64,
+    first: usize,
+    count: usize,
 }
 
-#[derive(Clone, Copy)]
 struct Entry {
     generation: u64,
     object: Option<KernelObject>,
     references: usize,
     backing: Option<UntypedAllocation>,
+    free_pages: Option<FreePages>,
 }
 
 impl Entry {
@@ -120,6 +121,7 @@ impl Entry {
         object: None,
         references: 0,
         backing: None,
+        free_pages: None,
     };
 
     fn matches(&self, id: KObjectId) -> bool {
@@ -127,9 +129,11 @@ impl Entry {
     }
 
     fn take(&mut self) -> Option<(KernelObject, Option<UntypedAllocation>)> {
-        self.object
-            .take()
-            .map(|object| (object, self.backing.take()))
+        let object = self.object.take()?;
+        if let Some(pages) = self.free_pages.take() {
+            assert!(pages.is_all_free(), "live pages retain the Untyped region");
+        }
+        Some((object, self.backing.take()))
     }
 }
 
@@ -140,7 +144,7 @@ impl KObjectId {
 }
 
 /// Global object table protected by a spinlock.
-static TABLE: Mutex<[Entry; MAX_OBJECTS]> = Mutex::new([Entry::EMPTY; MAX_OBJECTS]);
+static TABLE: Mutex<[Entry; MAX_OBJECTS]> = Mutex::new([const { Entry::EMPTY }; MAX_OBJECTS]);
 
 /// Initialise the object table and the kernel-only CSpace.
 pub fn init() {
@@ -172,21 +176,11 @@ pub(crate) fn allocate_program(
 }
 
 const PAGE_BITS: u8 = PhysFrame::SIZE.trailing_zeros() as u8;
-const MAX_UNTYPED_BITS: u8 = PAGE_BITS + 6;
+const MAX_UNTYPED_BITS: u8 = PAGE_BITS + 12;
 
-fn available_page_mask(size_bits: u8) -> u64 {
-    let pages = 1 << (size_bits - PAGE_BITS);
-    u64::MAX >> (u64::BITS - pages)
-}
-
-fn find_aligned_run(free: u64, size_bits: u8, parent_bits: u8) -> Option<(u32, u64)> {
-    let pages = 1 << (size_bits - PAGE_BITS);
-    let extent = available_page_mask(size_bits);
-    let parent_pages = 1 << (parent_bits - PAGE_BITS);
-    (0..parent_pages).step_by(pages).find_map(|index| {
-        let mask = extent << index;
-        (free & mask == mask).then_some((index as u32, mask))
-    })
+fn frame_at(base: PhysFrame, index: usize) -> PhysFrame {
+    let address = base.base.as_u64() + (index as u64 * PhysFrame::SIZE as u64);
+    PhysFrame::from_base(PhysAddr::new(address)).expect("aligned Untyped page")
 }
 
 pub(super) fn allocate_untyped(size_bits: u8) -> Result<(KObjectId, CapType), ErrorCode> {
@@ -194,17 +188,14 @@ pub(super) fn allocate_untyped(size_bits: u8) -> Result<(KObjectId, CapType), Er
         return Err(ErrorCode::BadMessage);
     }
     let pages = 1 << (size_bits - PAGE_BITS);
-    let id = allocate_with(|| {
-        let phys = frame::allocate_untyped(pages).ok_or(ErrorCode::NoMemory)?;
-        Ok(KernelObject::Untyped {
-            phys,
-            size_bits,
-            free_pages: available_page_mask(size_bits),
-        })
-    })?;
-    let Some(KernelObject::Untyped { phys, .. }) = get(id) else {
-        unreachable!("new Untyped object must exist");
-    };
+    let free_pages = FreePages::new(pages)?;
+    let mut table = TABLE.lock();
+    let id = vacant_id(&table[..])?;
+    let phys = frame::allocate_untyped(pages).ok_or(ErrorCode::NoMemory)?;
+    let entry = &mut table[id.index()];
+    entry.object = Some(KernelObject::Untyped { phys, size_bits });
+    entry.free_pages = Some(free_pages);
+    entry.generation += 1;
     Ok((id, CapType::Untyped { phys, size_bits }))
 }
 
@@ -242,15 +233,14 @@ pub(super) fn retype(
     let Some(KernelObject::Untyped {
         phys,
         size_bits: parent_bits,
-        free_pages,
-    }) = &mut parent.object
+    }) = parent.object
     else {
         return Err(ErrorCode::InvalidCap);
     };
     let size_bits = match kind {
         RetypeKind::Untyped => {
             let bits = u8::try_from(requested_size_bits).map_err(|_| ErrorCode::BadMessage)?;
-            if !(PAGE_BITS..*parent_bits).contains(&bits) {
+            if !(PAGE_BITS..parent_bits).contains(&bits) {
                 return Err(ErrorCode::BadMessage);
             }
             bits
@@ -258,14 +248,23 @@ pub(super) fn retype(
         _ if requested_size_bits == 0 => PAGE_BITS,
         _ => return Err(ErrorCode::BadMessage),
     };
-    let (index, mask) =
-        find_aligned_run(*free_pages, size_bits, *parent_bits).ok_or(ErrorCode::NoMemory)?;
+    let count = 1 << (size_bits - PAGE_BITS);
+    let free_pages = if kind == RetypeKind::Untyped {
+        Some(FreePages::new(count)?)
+    } else {
+        None
+    };
     let references = parent
         .references
         .checked_add(1)
         .ok_or(ErrorCode::NoMemory)?;
-    let addr = phys.base.as_u64() + (u64::from(index) << PAGE_BITS);
-    let phys = PhysFrame::from_base(PhysAddr::new(addr)).expect("aligned Untyped page");
+    let first = parent
+        .free_pages
+        .as_mut()
+        .expect("Untyped page map")
+        .take(count)
+        .ok_or(ErrorCode::NoMemory)?;
+    let phys = frame_at(phys, first);
     let (object, cap_type) = match kind {
         RetypeKind::Frame => {
             // SAFETY: The page belongs to the region and has no live objects or aliases.
@@ -287,21 +286,21 @@ pub(super) fn retype(
             CapType::Notification(NotificationId(id.0)),
         ),
         RetypeKind::Untyped => (
-            KernelObject::Untyped {
-                phys,
-                size_bits,
-                free_pages: available_page_mask(size_bits),
-            },
+            KernelObject::Untyped { phys, size_bits },
             CapType::Untyped { phys, size_bits },
         ),
     };
-    *free_pages &= !mask;
     parent.references = references;
     let entry = &mut table[id.index()];
     entry.object = Some(object);
+    entry.free_pages = free_pages;
     // This reference keeps the whole parent extent reserved until the child
     // object, including any mappings through it, has been destroyed.
-    entry.backing = Some(UntypedAllocation { region, mask });
+    entry.backing = Some(UntypedAllocation {
+        region,
+        first,
+        count,
+    });
     entry.generation += 1;
     Ok((id, cap_type))
 }
@@ -392,6 +391,68 @@ impl Drop for FramePin {
     }
 }
 
+/// Keeps the Untyped allocator alive for every private page of an address space.
+pub(crate) struct UntypedBudget(KObjectId);
+
+impl UntypedBudget {
+    pub(super) fn new(id: KObjectId) -> Result<Self, ErrorCode> {
+        // The live CSpace node pins the object across the type check.
+        if !matches!(get(id), Some(KernelObject::Untyped { .. })) {
+            return Err(ErrorCode::InvalidCap);
+        }
+        retain(id)?;
+        Ok(Self(id))
+    }
+}
+
+// SAFETY: The region owns exclusive allocator frames held under the object
+// table lock. A released page is scrubbed before its bit becomes available.
+unsafe impl UserPageFrames for UntypedBudget {
+    fn allocate(&self) -> Option<PhysFrame> {
+        let mut table = TABLE.lock();
+        let entry = &mut table[self.0.index()];
+        assert!(entry.matches(self.0));
+        let Some(KernelObject::Untyped { phys, .. }) = entry.object else {
+            unreachable!("budget retains its source Untyped object");
+        };
+        let page = entry
+            .free_pages
+            .as_mut()
+            .expect("Untyped page map")
+            .take(1)?;
+        Some(frame_at(phys, page))
+    }
+
+    unsafe fn deallocate(&self, frame: PhysFrame) {
+        let mut table = TABLE.lock();
+        let entry = &mut table[self.0.index()];
+        assert!(entry.matches(self.0));
+        let Some(KernelObject::Untyped { phys, size_bits }) = entry.object else {
+            unreachable!("budget retains its source Untyped object");
+        };
+        let offset = frame
+            .base
+            .as_u64()
+            .checked_sub(phys.base.as_u64())
+            .expect("frame belongs to its Untyped region");
+        assert!(offset < 1 << size_bits && offset % PhysFrame::SIZE as u64 == 0);
+        // SAFETY: The caller owns this page with no live mappings, and the
+        // checked address is in the retained region.
+        unsafe { mapper::zero_frame(frame) };
+        entry
+            .free_pages
+            .as_mut()
+            .expect("Untyped page map")
+            .put((offset >> PAGE_BITS) as usize, 1);
+    }
+}
+
+impl Drop for UntypedBudget {
+    fn drop(&mut self) {
+        release(self.0);
+    }
+}
+
 /// Owns the process's reference while the kernel can still publish its status.
 pub(crate) struct ProcessExitPublisher(KObjectId);
 
@@ -437,12 +498,7 @@ fn destroy(object: KernelObject, backing: Option<UntypedAllocation>) {
             // and the page is still reserved in the parent region.
             unsafe { ruzt_hal_x86_64::mapper::zero_frame(phys) };
         }
-        KernelObject::Untyped {
-            phys,
-            size_bits,
-            free_pages,
-        } => {
-            assert_eq!(free_pages, available_page_mask(size_bits));
+        KernelObject::Untyped { phys, size_bits } => {
             if backing.is_none() {
                 frame::deallocate_contiguous(phys, 1 << (size_bits - PAGE_BITS));
             }
@@ -450,13 +506,16 @@ fn destroy(object: KernelObject, backing: Option<UntypedAllocation>) {
         _ => {}
     }
     if let Some(allocation) = backing {
-        update(allocation.region, |region| {
-            let KernelObject::Untyped { free_pages, .. } = region else {
-                unreachable!("object backing is Untyped");
-            };
-            assert_eq!(*free_pages & allocation.mask, 0);
-            *free_pages |= allocation.mask;
-        });
+        {
+            let mut table = TABLE.lock();
+            let region = &mut table[allocation.region.index()];
+            assert!(region.matches(allocation.region));
+            region
+                .free_pages
+                .as_mut()
+                .expect("Untyped page map")
+                .put(allocation.first, allocation.count);
+        }
         release(allocation.region);
     }
 }
@@ -519,13 +578,6 @@ fn kernel_object_from_cap_type(cap_type: CapType) -> Result<KernelObject, ErrorC
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn delegated_region_uses_only_naturally_aligned_free_pages() {
-        assert_eq!(find_aligned_run(0b0110, 13, 14), None);
-        assert_eq!(find_aligned_run(0b1110, 13, 14), Some((2, 0b1100)));
-        assert_eq!(find_aligned_run(1 << 63, 12, 18), Some((63, 1 << 63)));
-    }
 
     #[test]
     fn deallocate_works() {

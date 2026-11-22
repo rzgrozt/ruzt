@@ -5,7 +5,7 @@ use ruzt_abi::{ErrorCode, RetypeKind, IPC_CAP_SLOTS};
 use ruzt_cap::{CapRights, CapSlot, CapType, NULL_SLOT};
 use spin::Mutex;
 
-use super::object::{self, FramePin, KObjectId};
+use super::object::{self, FramePin, KObjectId, UntypedBudget};
 
 /// A capability identity that survives moves between slots.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -200,6 +200,19 @@ impl CSpace {
             return Err(ErrorCode::CapRightsViolation);
         }
         Ok((id, FramePin::new(object)?))
+    }
+
+    pub(crate) fn untyped_budget(&self, cptr: u64) -> Result<UntypedBudget, ErrorCode> {
+        let id = self.slots[self.index(cptr)?].ok_or(ErrorCode::InvalidCap)?;
+        let tree = DERIVATIONS.lock();
+        let node = tree.nodes.get(&id).ok_or(ErrorCode::InvalidCap)?;
+        if !matches!(node.slot.cap_type, CapType::Untyped { .. }) {
+            return Err(ErrorCode::InvalidCap);
+        }
+        if !node.slot.rights.contains(CapRights::WRITE) {
+            return Err(ErrorCode::CapRightsViolation);
+        }
+        UntypedBudget::new(node.object.ok_or(ErrorCode::InvalidCap)?)
     }
 
     pub(crate) fn provision_untyped(&mut self, cptr: u64, size_bits: u8) -> Result<(), ErrorCode> {

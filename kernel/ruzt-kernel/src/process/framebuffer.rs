@@ -3,7 +3,7 @@
 use ruzt_abi::{FramebufferInfo, FRAMEBUFFER_BGR, FRAMEBUFFER_GRAY8, FRAMEBUFFER_RGB};
 use ruzt_hal::boot::{Framebuffer, PixelFormat};
 use ruzt_hal::mem::{MapError, Mapper, PageFlags, PhysFrame, VirtAddr};
-use ruzt_hal_x86_64::mapper::X86_64Mapper;
+use ruzt_hal_x86_64::mapper::{UserPageFrames, X86_64Mapper};
 
 const USER_FRAMEBUFFER_BASE: u64 = 0x1_0000_0000;
 const PAGE_SIZE: usize = PhysFrame::SIZE;
@@ -12,6 +12,7 @@ pub(super) fn map(
     mapper: &mut X86_64Mapper,
     root: PhysFrame,
     framebuffer: Framebuffer,
+    frames: &dyn UserPageFrames,
 ) -> Result<Option<FramebufferInfo>, MapError> {
     let Some(info) = layout(&framebuffer) else {
         return Ok(None);
@@ -38,6 +39,7 @@ pub(super) fn map(
                 user_page,
                 phys,
                 PageFlags::USER | PageFlags::WRITABLE,
+                frames,
             )?;
         }
     }

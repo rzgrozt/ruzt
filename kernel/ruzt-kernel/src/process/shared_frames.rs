@@ -2,7 +2,7 @@
 
 use ruzt_abi::{CapRights, ErrorCode};
 use ruzt_hal::mem::{MapError, PageFlags, PhysFrame, VirtAddr};
-use ruzt_hal_x86_64::mapper;
+use ruzt_hal_x86_64::mapper::{self, UserPageFrames};
 
 use super::{UserProcess, PAGE_SIZE};
 use crate::cap::{cspace, cspace::CapabilityId, object::FramePin};
@@ -15,11 +15,11 @@ pub(super) struct Mapping {
 
 impl Mapping {
     #[allow(unsafe_code)]
-    fn unmap(&self, root: PhysFrame) {
+    fn unmap(&self, root: PhysFrame, frames: &dyn UserPageFrames) {
         let frame = mapper::with_mapper(|mapper| {
             // SAFETY: This record owns the lower-half leaf, and the scheduler
             // serializes access on the sole CPU that runs user roots.
-            unsafe { mapper.unmap_in_address_space(root, VirtAddr::new(self.address)) }
+            unsafe { mapper.unmap_in_address_space(root, VirtAddr::new(self.address), frames) }
         });
         assert_eq!(frame, self.frame.phys);
     }
@@ -60,6 +60,7 @@ impl UserProcess {
                     VirtAddr::new(address),
                     frame.phys,
                     flags,
+                    &self.space.budget,
                 )
             }
         })
@@ -84,18 +85,19 @@ impl UserProcess {
             .iter()
             .position(|mapping| mapping.authority == authority)
             .ok_or(ErrorCode::NotFound)?;
-        mappings[index].unmap(root);
+        mappings[index].unmap(root, &self.space.budget);
         mappings.swap_remove(index);
         Ok(())
     }
 
     pub(crate) fn unmap_revoked_frames(&mut self) {
         let root = self.root();
+        let budget = &self.space.budget;
         self.space.shared_frames.retain(|mapping| {
             if cspace::is_live(mapping.authority) {
                 true
             } else {
-                mapping.unmap(root);
+                mapping.unmap(root, budget);
                 false
             }
         });
