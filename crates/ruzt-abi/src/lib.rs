@@ -14,7 +14,7 @@
 /// Both kernel and userland must agree on this value.
 pub const SYS_SYSCALL: u32 = 0x80;
 
-/// Capability slot granted to the initial process to send console requests.
+/// Slot where the root process creates its console request capability.
 pub const ROOTSRV_CONSOLE_REQUEST: u64 = 0;
 
 /// Capability slot granted to the initial process for PS/2 keyboard interrupts.
@@ -26,7 +26,7 @@ pub const ROOTSRV_KEYBOARD_DATA: u64 = 2;
 /// Capability slot granted to the initial process when a framebuffer is available.
 pub const ROOTSRV_FRAMEBUFFER: u64 = 3;
 
-/// Capability slot granted to the initial process to receive console replies.
+/// Slot where the root process creates its console reply capability.
 pub const ROOTSRV_CONSOLE_REPLY: u64 = 4;
 
 /// Slot where the root process creates the console notification.
@@ -37,6 +37,12 @@ pub const ROOTSRV_CONSOLE_FRAME: u64 = 9;
 pub const ROOTSRV_UNTYPED: u64 = 10;
 /// Read authority for the console service's termination status.
 pub const ROOTSRV_CONSOLE_PROCESS: u64 = 13;
+/// Authority to launch the console executable from the boot archive.
+pub const ROOTSRV_CONSOLE_PROGRAM: u64 = 14;
+/// Delegable authority for the console's UART data port.
+pub const ROOTSRV_UART_DATA: u64 = 18;
+/// Delegable authority for the console's UART status port.
+pub const ROOTSRV_UART_STATUS: u64 = 19;
 
 /// Byte length of a frame supported by the user mapping ABI.
 pub const FRAME_BYTES: usize = 4096;
@@ -148,6 +154,13 @@ pub enum CapOp {
     /// `arg3` set to 0 this blocks until cleanup, or with 1 it polls.
     /// A blocking wait requires an output buffer in a non-revocable mapping.
     WaitProcess = 14,
+    /// Launch this program in a fresh address space and capability space.
+    /// `arg2` is the empty process status slot in the caller. `arg3` points
+    /// to an [`IpcMessage`] containing only startup grants for child slots
+    /// starting at zero. Each bit in `arg4` selects a startup endpoint that
+    /// will close on child exit and requires full read, write and grant
+    /// authority on the source endpoint.
+    SpawnProgram = 15,
 }
 
 /// The process invoked `Exit`.
@@ -486,6 +499,7 @@ mod tests {
         assert_eq!(CapOp::MapFrame as u64, 12);
         assert_eq!(CapOp::UnmapFrame as u64, 13);
         assert_eq!(CapOp::WaitProcess as u64, 14);
+        assert_eq!(CapOp::SpawnProgram as u64, 15);
     }
 
     #[test]

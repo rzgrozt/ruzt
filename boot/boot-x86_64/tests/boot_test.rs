@@ -66,8 +66,15 @@ fn test_rootsrv_updates_the_framebuffer_from_keyboard_input() {
     assert_markers(
         &serial,
         &[
-            "Breakpoint returned cleanly.",
+            "rootsrv process created, entering user mode...",
             "consoled process created, entering user mode...",
+            "Hello from ring 3, rootsrv alive.",
+        ],
+    );
+    assert_markers(
+        &serial,
+        &[
+            "Breakpoint returned cleanly.",
             "rootsrv process created, entering user mode...",
             "rootsrv: moved capability revoked transitively",
             "Hello from ring 3, rootsrv alive.",
@@ -167,6 +174,13 @@ fn assert_console_shutdown_isolated(services: Services, reason: &str, observed_s
             "reaped user process consoled",
             "rootsrv: both delegated budgets reclaimed",
             "rootsrv: console disconnected",
+            &format!("rootsrv: reaped console reported {observed_status}"),
+            "rootsrv: restarting console with fresh endpoints",
+            "consoled process created, entering user mode...",
+            "rootsrv: restarted console acknowledged IPC",
+            "consoled: delegated scratch mapped",
+            &format!("user process consoled terminated: {reason}"),
+            "reaped user process consoled",
             &format!("rootsrv: reaped console reported {observed_status}"),
             "rootsrv thread waiting for keyboard IRQ",
             "rootsrv: Space key received",

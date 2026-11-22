@@ -127,6 +127,16 @@ pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
             bytes[4..].copy_from_slice(&status.code.to_ne_bytes());
             user_mem::write_user_buffer(root, args.arg2, &bytes)
         }
+        CapType::Program(id) if args.arg1 == CapOp::SpawnProgram as u64 => {
+            require(capability.rights, CapRights::WRITE)?;
+            let grants = read_packet(root, args.arg3, capability.rights)?;
+            process::spawn_program(
+                crate::cap::object::KObjectId(id),
+                args.arg2,
+                grants,
+                args.arg4,
+            )
+        }
         CapType::Notification(id) if args.arg1 == CapOp::Signal as u64 => {
             require(capability.rights, CapRights::WRITE)?;
             ErrorCode::from_u64(ipc::notification_signal(id))
@@ -199,7 +209,7 @@ fn require(rights: CapRights, required: CapRights) -> Result<(), ErrorCode> {
 fn read_packet(
     root: PhysFrame,
     address: u64,
-    endpoint_rights: CapRights,
+    invocation_rights: CapRights,
 ) -> Result<ipc::Packet, ErrorCode> {
     let mut message = IpcMessage::default();
     // Read the fixed header and inline data without copying C-layout padding.
@@ -221,7 +231,7 @@ fn read_packet(
     if count == 0 {
         return Ok(packet);
     }
-    require(endpoint_rights, CapRights::GRANT)?;
+    require(invocation_rights, CapRights::GRANT)?;
     for index in 0..count {
         // The header range proved this is a lower-half address. Offsets in
         // the 168-byte message cannot overflow, and every read checks its pages.

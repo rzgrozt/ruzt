@@ -106,6 +106,8 @@ pub enum CapType {
     Framebuffer,
     /// Observe the final status of a process.
     Process(ProcessId),
+    /// An executable image issued by the trusted loader.
+    Program(u64),
 }
 
 /// A capability as it lives in a CNode slot.

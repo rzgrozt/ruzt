@@ -1,6 +1,6 @@
 //! Per-process slots and the kernel-wide capability derivation tree.
 
-use alloc::{collections::BTreeMap, vec, vec::Vec};
+use alloc::{collections::BTreeMap, vec::Vec};
 use ruzt_abi::{ErrorCode, RetypeKind, IPC_CAP_SLOTS};
 use ruzt_cap::{CapRights, CapSlot, CapType, NULL_SLOT};
 use spin::Mutex;
@@ -133,9 +133,19 @@ pub fn kernel_cspace() -> spin::MutexGuard<'static, Option<CSpace>> {
 impl CSpace {
     /// Create a root CNode with 2^radix_bits slots.
     pub fn new(radix_bits: u8) -> Self {
-        Self {
-            slots: vec![None; 1usize << radix_bits],
-        }
+        Self::try_new(radix_bits).expect("allocate CSpace")
+    }
+
+    pub(crate) fn try_new(radix_bits: u8) -> Result<Self, ErrorCode> {
+        let count = 1usize
+            .checked_shl(u32::from(radix_bits))
+            .ok_or(ErrorCode::BadMessage)?;
+        let mut slots = Vec::new();
+        slots
+            .try_reserve_exact(count)
+            .map_err(|_| ErrorCode::NoMemory)?;
+        slots.resize(count, None);
+        Ok(Self { slots })
     }
 
     fn index(&self, cptr: u64) -> Result<usize, ErrorCode> {
@@ -261,6 +271,7 @@ impl CSpace {
             CapType::Endpoint(id) => Some(KObjectId(id.0)),
             CapType::Notification(id) => Some(KObjectId(id.0)),
             CapType::Process(id) => Some(KObjectId(id.0)),
+            CapType::Program(id) => Some(KObjectId(id)),
             CapType::Thread(id) => Some(KObjectId(id.0)),
             CapType::AddressSpace(id) => Some(KObjectId(id.0)),
             CapType::CNode { ptr, .. } => Some(KObjectId(ptr)),
@@ -401,6 +412,10 @@ impl CSpace {
             .position(|slot| slot.is_none_or(|id| !tree.nodes.contains_key(&id)))
             .map(|index| index as u64)
             .ok_or(ErrorCode::NoMemory)
+    }
+
+    pub(crate) fn require_vacant(&self, cptr: u64) -> Result<(), ErrorCode> {
+        self.vacant(self.index(cptr)?, &DERIVATIONS.lock())
     }
 }
 

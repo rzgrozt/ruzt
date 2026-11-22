@@ -113,7 +113,7 @@ pub(crate) fn receive_packet(
     }
 }
 
-pub(crate) fn close_boot_channel(endpoint: EndpointId) {
+pub(crate) fn close_endpoint(endpoint: EndpointId) {
     let id = KObjectId(endpoint.0);
     object::close_endpoint(id);
     sched::cancel_endpoint_waiters(id);
@@ -187,13 +187,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn closed_boot_channel_stays_closed_with_a_live_handle() {
+    fn closed_endpoint_stays_closed_with_a_live_handle() {
         let _state = crate::isolated_kernel_state();
         let cap_type = ruzt_cap::CapType::Endpoint(EndpointId(0));
         let old = object::allocate(cap_type).unwrap();
         let endpoint = EndpointId(old.0);
 
-        close_boot_channel(endpoint);
+        close_endpoint(endpoint);
         let new = object::allocate(cap_type).unwrap();
         assert_ne!(old, new);
         assert_eq!(

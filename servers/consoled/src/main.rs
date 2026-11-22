@@ -32,12 +32,12 @@ fn main() -> ! {
         ) {
             Ok(()) => {}
             Err(ErrorCode::NotFound) => ruzt_runtime::syscall::exit(0),
+            Err(ErrorCode::InvalidCap) => ruzt_runtime::syscall::exit(1),
             Err(
-                ErrorCode::BadMessage
-                | ErrorCode::SlotOccupied
-                | ErrorCode::CapRightsViolation
-                | ErrorCode::InvalidCap,
-            ) => continue,
+                ErrorCode::BadMessage | ErrorCode::SlotOccupied | ErrorCode::CapRightsViolation,
+            ) => {
+                continue;
+            }
             Err(error) => panic!("console receive failed: {error:?}"),
         }
         let label = match (request.label, request.cap_count) {

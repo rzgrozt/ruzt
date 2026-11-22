@@ -1,4 +1,4 @@
-//! Construction of the trusted boot-time user process.
+//! User process construction, launch, and termination.
 
 mod boot_caps;
 mod framebuffer;
@@ -11,7 +11,9 @@ use crate::cap::{
 };
 use crate::sched::{self, ThreadState};
 use alloc::vec::Vec;
-use ruzt_abi::{CapRights, ErrorCode, FramebufferInfo, ProcessStatus, ROOTSRV_FRAMEBUFFER};
+use ruzt_abi::{
+    CapRights, ErrorCode, FramebufferInfo, ProcessStatus, IPC_CAP_SLOTS, ROOTSRV_FRAMEBUFFER,
+};
 use ruzt_cap::{CapType, EndpointId, ProcessId};
 use ruzt_hal::boot::Framebuffer;
 use ruzt_hal::mem::{MapError, PageFlags, PhysFrame, VirtAddr};
@@ -53,7 +55,7 @@ pub(crate) struct UserProcess {
     pub(crate) name: &'static str,
     pub(crate) cspace: CSpace,
     pub(crate) framebuffer: Option<FramebufferInfo>,
-    pub(crate) boot_channels: [EndpointId; 2],
+    exit_channels: [Option<EndpointId>; IPC_CAP_SLOTS],
     pub(crate) exit_publisher: Option<ProcessExitPublisher>,
 }
 
@@ -87,36 +89,99 @@ impl Drop for UserAddressSpace {
     }
 }
 
-/// Load the initial servers and enqueue them on the boot CPU.
-///
-/// Any failure stops boot. These frames belong to the boot services for
-/// the lifetime of the system.
+/// Load the root server and give it authority to start the console.
 pub(crate) fn enqueue_initial(archive: &'static [u8], framebuffer: Option<Framebuffer>) {
     let rootsrv = initrd::file(archive, b"rootsrv").expect("unable to load rootsrv from initrd");
     let consoled = initrd::file(archive, b"consoled").expect("unable to load consoled from initrd");
-    let (channels, root_space, console_space, console_exit) = boot_caps::initial_services();
-    enqueue(
-        "consoled",
-        consoled,
-        console_space,
-        None,
-        channels,
-        Some(console_exit),
-    );
-    let root = enqueue("rootsrv", rootsrv, root_space, framebuffer, channels, None);
+    let root = load(
+        "rootsrv",
+        rootsrv,
+        boot_caps::root_space(consoled),
+        framebuffer,
+    )
+    .expect("load rootsrv");
+    let root = sched::spawn_user(root, enter_user).expect("schedule rootsrv");
     crate::keyboard::enable_user_driver(root);
+}
+
+pub(crate) fn spawn_program(
+    program: KObjectId,
+    status_slot: u64,
+    packet: crate::ipc::Packet,
+    close_on_exit: u64,
+) -> Result<(), ErrorCode> {
+    let Some(KernelObject::Program { name, image }) = object::get(program) else {
+        return Err(ErrorCode::InvalidCap);
+    };
+    let count = usize::from(packet.message.cap_count);
+    if count > IPC_CAP_SLOTS
+        || close_on_exit >> count != 0
+        || packet.message.label != 0
+        || packet.message.length != 0
+    {
+        return Err(ErrorCode::BadMessage);
+    }
+
+    let channels = sched::with_current_user(|parent| {
+        parent.cspace.require_vacant(status_slot)?;
+        let mut channels = [None; IPC_CAP_SLOTS];
+        let channel_rights = CapRights::READ
+            .union(CapRights::WRITE)
+            .union(CapRights::GRANT);
+        for (index, channel) in channels[..count].iter_mut().enumerate() {
+            if close_on_exit & (1 << index) == 0 {
+                continue;
+            }
+            let slot = parent.cspace.lookup(packet.message.caps[index].cptr)?;
+            let CapType::Endpoint(id) = slot.cap_type else {
+                return Err(ErrorCode::BadMessage);
+            };
+            if !slot.rights.contains(channel_rights) {
+                return Err(ErrorCode::CapRightsViolation);
+            }
+            *channel = Some(id);
+        }
+        Ok(channels)
+    })
+    .ok_or(ErrorCode::InvalidCap)??;
+
+    let mut child_space = CSpace::try_new(4)?;
+    child_space.accept_grants(0, &packet.grants[..count])?;
+    let mut child = load(name, image, child_space, None)?;
+    child.exit_channels = channels;
+    let (process, publisher) = ProcessExitPublisher::new()?;
+    child.exit_publisher = Some(publisher);
+    sched::with_current_user(|parent| {
+        parent.cspace.insert(
+            status_slot,
+            ruzt_cap::CapSlot {
+                cap_type: CapType::Process(process),
+                rights: CapRights::READ.union(CapRights::GRANT),
+                badge: 0,
+            },
+        )
+    })
+    .ok_or(ErrorCode::InvalidCap)??;
+
+    if let Err(error) = sched::spawn_user(child, enter_user) {
+        sched::with_current_user(|parent| parent.cspace.delete(status_slot))
+            .expect("launch caller remains current")
+            .expect("launch status slot is valid");
+        return Err(error);
+    }
+    Ok(())
 }
 
 pub(crate) fn terminate_current(status: ProcessStatus, reason: core::fmt::Arguments<'_>) -> ! {
     let (name, channels) = crate::sched::with_current_user(|user| {
         user.cspace.revoke_all_descendants();
-        (user.name, user.boot_channels)
+        (user.name, user.exit_channels)
     })
     .expect("termination requires a user task");
     crate::sched::apply_capability_removals();
     crate::serial_println!("user process {name} terminated: {reason}");
-    for channel in channels {
-        crate::ipc::close_boot_channel(channel);
+    for channel in channels.into_iter().flatten() {
+        crate::ipc::close_endpoint(channel);
     }
     crate::keyboard::detach_user_driver(crate::sched::current_thread_id());
     crate::sched::retire_current_user(status)
@@ -153,18 +218,20 @@ pub(crate) fn wait_for_status(
     }
 }
 
-fn enqueue(
+fn load(
     name: &'static str,
     image: &'static [u8],
     mut cspace: CSpace,
     framebuffer: Option<Framebuffer>,
-    boot_channels: [EndpointId; 2],
-    exit_publisher: Option<ProcessExitPublisher>,
-) -> crate::sched::ThreadId {
-    let elf = crate::elf::load_elf(image).unwrap_or_else(|e| panic!("invalid {name} ELF: {e:?}"));
-    assert_eq!(elf.stack_size as u64, STACK_REGION.page_count * PAGE_SIZE);
-    let (space, framebuffer) = map_image(&elf, framebuffer)
-        .unwrap_or_else(|e| panic!("failed to map {name} address space: {e:?}"));
+) -> Result<UserProcess, ErrorCode> {
+    let elf = crate::elf::load_elf(image)?;
+    if elf.stack_size as u64 != STACK_REGION.page_count * PAGE_SIZE {
+        return Err(ErrorCode::BadMessage);
+    }
+    let (space, framebuffer) = map_image(&elf, framebuffer).map_err(|error| match error {
+        MapError::FrameAllocationFailed => ErrorCode::NoMemory,
+        _ => ErrorCode::BadMessage,
+    })?;
 
     if framebuffer.is_some() {
         boot_caps::grant(
@@ -174,18 +241,15 @@ fn enqueue(
             CapRights::WRITE,
         );
     }
-    crate::sched::spawn_user(
-        UserProcess {
-            space,
-            entry: elf.entry_point,
-            name,
-            cspace,
-            framebuffer,
-            boot_channels,
-            exit_publisher,
-        },
-        enter_user,
-    )
+    Ok(UserProcess {
+        space,
+        entry: elf.entry_point,
+        name,
+        cspace,
+        framebuffer,
+        exit_channels: [None; IPC_CAP_SLOTS],
+        exit_publisher: None,
+    })
 }
 
 fn map_image(

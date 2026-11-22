@@ -31,7 +31,7 @@ pub enum KernelObject {
     Null,
     /// IPC endpoint. Waiters live in the scheduler.
     Endpoint {
-        /// The peer of a boot channel has exited.
+        /// The process that owns the endpoint's lifetime has exited.
         closed: bool,
     },
     /// Async notification object.
@@ -43,6 +43,13 @@ pub enum KernelObject {
     Process {
         /// Set once, after the scheduler reaps the process.
         status: Option<ProcessStatus>,
+    },
+    /// Executable image from the trusted boot archive.
+    Program {
+        /// Display name for diagnostics.
+        name: &'static str,
+        /// Immutable executable bytes from the boot archive.
+        image: &'static [u8],
     },
     /// Thread control block.
     Thread {
@@ -155,6 +162,13 @@ pub fn init() {
 /// Allocate a kernel object and return its generation-qualified identity.
 pub fn allocate(cap_type: CapType) -> Result<KObjectId, ErrorCode> {
     allocate_with(|| kernel_object_from_cap_type(cap_type))
+}
+
+pub(crate) fn allocate_program(
+    name: &'static str,
+    image: &'static [u8],
+) -> Result<KObjectId, ErrorCode> {
+    allocate_with(|| Ok(KernelObject::Program { name, image }))
 }
 
 const PAGE_BITS: u8 = PhysFrame::SIZE.trailing_zeros() as u8;
@@ -479,7 +493,7 @@ fn kernel_object_from_cap_type(cap_type: CapType) -> Result<KernelObject, ErrorC
             root_page_table: crate::mm::frame::allocate().ok_or(ErrorCode::NoMemory)?,
         }),
         CapType::Frame { .. } | CapType::Untyped { .. } => Err(ErrorCode::InvalidCap),
-        CapType::Process(_) => Err(ErrorCode::InvalidCap),
+        CapType::Process(_) | CapType::Program(_) => Err(ErrorCode::InvalidCap),
         CapType::CNode { radix_bits, .. } => {
             let count = 1usize
                 .checked_shl(u32::from(radix_bits))

@@ -1,33 +1,18 @@
 //! Capabilities granted by the boot policy.
 
 use ruzt_abi::{
-    console, CapRights, ROOTSRV_CONSOLE_PROCESS, ROOTSRV_CONSOLE_REPLY, ROOTSRV_CONSOLE_REQUEST,
-    ROOTSRV_KEYBOARD_DATA, ROOTSRV_KEYBOARD_IRQ, ROOTSRV_UNTYPED,
+    CapRights, ROOTSRV_CONSOLE_PROGRAM, ROOTSRV_KEYBOARD_DATA, ROOTSRV_KEYBOARD_IRQ,
+    ROOTSRV_UART_DATA, ROOTSRV_UART_STATUS, ROOTSRV_UNTYPED,
 };
-use ruzt_cap::{CapSlot, CapType, EndpointId};
+use ruzt_cap::{CapSlot, CapType};
 
-use crate::cap::{
-    cspace::CSpace,
-    object::{self, ProcessExitPublisher},
-};
+use crate::cap::{cspace::CSpace, object};
 use crate::{keyboard, serial};
 
-const ROOTSRV_UNTYPED_BITS: u8 = 14;
+const ROOTSRV_UNTYPED_BITS: u8 = 15;
 
-pub(super) fn initial_services() -> ([EndpointId; 2], CSpace, CSpace, ProcessExitPublisher) {
-    let request = endpoint();
-    let reply = endpoint();
-    let channels = [request, reply];
-    let request = CapType::Endpoint(request);
-    let reply = CapType::Endpoint(reply);
-    let mut rootsrv = CSpace::new(4);
-    grant(
-        &mut rootsrv,
-        ROOTSRV_CONSOLE_REQUEST,
-        request,
-        CapRights::WRITE.union(CapRights::GRANT),
-    );
-    grant(&mut rootsrv, ROOTSRV_CONSOLE_REPLY, reply, CapRights::READ);
+pub(super) fn root_space(console_image: &'static [u8]) -> CSpace {
+    let mut rootsrv = CSpace::new(5);
     grant(
         &mut rootsrv,
         ROOTSRV_KEYBOARD_IRQ,
@@ -44,42 +29,32 @@ pub(super) fn initial_services() -> ([EndpointId; 2], CSpace, CSpace, ProcessExi
         },
         CapRights::READ,
     );
-
     rootsrv
         .provision_untyped(ROOTSRV_UNTYPED, ROOTSRV_UNTYPED_BITS)
         .expect("reserve the root server RAM budget");
-    let (console_id, console_exit) = ProcessExitPublisher::new().expect("allocate console status");
+    let program =
+        object::allocate_program("consoled", console_image).expect("register console executable");
     grant(
         &mut rootsrv,
-        ROOTSRV_CONSOLE_PROCESS,
-        CapType::Process(console_id),
-        CapRights::READ.union(CapRights::GRANT),
+        ROOTSRV_CONSOLE_PROGRAM,
+        CapType::Program(program.0),
+        CapRights::WRITE.union(CapRights::GRANT),
     );
-
-    let mut consoled = CSpace::new(3);
-    grant(&mut consoled, console::REQUEST, request, CapRights::READ);
-    grant(&mut consoled, console::REPLY, reply, CapRights::WRITE);
     grant(
-        &mut consoled,
-        console::UART_DATA,
+        &mut rootsrv,
+        ROOTSRV_UART_DATA,
         CapType::IoPort { port: serial::COM1 },
-        CapRights::WRITE,
+        CapRights::WRITE.union(CapRights::GRANT),
     );
     grant(
-        &mut consoled,
-        console::UART_STATUS,
+        &mut rootsrv,
+        ROOTSRV_UART_STATUS,
         CapType::IoPort {
             port: serial::COM1 + 5,
         },
-        CapRights::READ,
+        CapRights::READ.union(CapRights::GRANT),
     );
-    (channels, rootsrv, consoled, console_exit)
-}
-
-fn endpoint() -> EndpointId {
-    let id =
-        object::allocate(CapType::Endpoint(EndpointId(0))).expect("allocate boot service endpoint");
-    EndpointId(id.0)
+    rootsrv
 }
 
 pub(super) fn grant(cspace: &mut CSpace, index: u64, cap_type: CapType, rights: CapRights) {

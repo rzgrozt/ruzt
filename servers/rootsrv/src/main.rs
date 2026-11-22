@@ -6,8 +6,9 @@ mod tile;
 use ruzt_abi::{
     console, CapRights, CapTransferSlot, ErrorCode, IpcMessage, RetypeKind, FRAME_BYTES,
     PROCESS_EXITED, PROCESS_FAULTED, ROOTSRV_CONSOLE_FRAME, ROOTSRV_CONSOLE_NOTIFICATION,
-    ROOTSRV_CONSOLE_PROCESS, ROOTSRV_CONSOLE_REPLY, ROOTSRV_CONSOLE_REQUEST, ROOTSRV_FRAMEBUFFER,
-    ROOTSRV_KEYBOARD_DATA, ROOTSRV_KEYBOARD_IRQ, ROOTSRV_UNTYPED,
+    ROOTSRV_CONSOLE_PROCESS, ROOTSRV_CONSOLE_PROGRAM, ROOTSRV_CONSOLE_REPLY,
+    ROOTSRV_CONSOLE_REQUEST, ROOTSRV_FRAMEBUFFER, ROOTSRV_KEYBOARD_DATA, ROOTSRV_KEYBOARD_IRQ,
+    ROOTSRV_UART_DATA, ROOTSRV_UART_STATUS, ROOTSRV_UNTYPED,
 };
 use ruzt_runtime::{debug_print, runtime_init};
 
@@ -15,6 +16,10 @@ const CONSOLE_BUFFER: u64 = 0x5000_0000;
 const LOCAL_BUDGET: u64 = 11;
 const CONSOLE_BUDGET: u64 = 12;
 const SERVICE_BUDGET_BITS: u8 = 13;
+const SESSION_BUDGET: u64 = 15;
+const REQUEST_ENDPOINT: u64 = 16;
+const REPLY_ENDPOINT: u64 = 17;
+const EXIT_CHANNELS: u8 = (1 << console::REQUEST) | (1 << console::REPLY);
 const GREETING: &[u8] = b"Hello from ring 3, rootsrv alive.\n";
 const _: () = assert!(GREETING.len() <= FRAME_BYTES);
 
@@ -187,40 +192,155 @@ fn reclaim_console_objects() {
     write_line("rootsrv: Untyped budget enforced and reclaimed after revocation");
 }
 
-fn main() -> ! {
-    check_revocation();
-    assert_eq!(
-        ruzt_ipc::poll_process(ROOTSRV_CONSOLE_PROCESS),
-        Err(ErrorCode::WouldBlock)
-    );
-    split_service_budgets();
-    create_console_objects();
-    let result = greet_via_console();
-    reclaim_console_objects();
-    ruzt_ipc::revoke(ROOTSRV_UNTYPED).expect("reclaim delegated budgets");
-    split_service_budgets();
-    ruzt_ipc::delete(LOCAL_BUDGET).expect("release the reclaimed local budget");
-    ruzt_ipc::delete(CONSOLE_BUDGET).expect("release the reclaimed console budget");
-    write_line("rootsrv: both delegated budgets reclaimed");
-    match result {
-        Ok(()) => {}
-        Err(ErrorCode::NotFound) => {
-            write_line("rootsrv: console disconnected");
-            let status = ruzt_ipc::wait_process(ROOTSRV_CONSOLE_PROCESS)
-                .expect("wait for the console to be reaped");
-            assert_eq!(ruzt_ipc::poll_process(ROOTSRV_CONSOLE_PROCESS), Ok(status));
-            let reason = match status.kind {
-                PROCESS_EXITED => "exit status",
-                PROCESS_FAULTED => "fault vector",
-                _ => panic!("unknown console termination kind"),
-            };
-            debug_print(format_args!(
-                "rootsrv: reaped console reported {reason} {}\n",
-                status.code
-            ));
-        }
-        Err(error) => panic!("console IPC failed: {error:?}"),
+fn start_console() {
+    for slot in [REQUEST_ENDPOINT, REPLY_ENDPOINT] {
+        ruzt_ipc::retype(ROOTSRV_UNTYPED, slot, RetypeKind::Endpoint)
+            .expect("create fresh console endpoint");
     }
+    ruzt_ipc::mint(
+        REQUEST_ENDPOINT,
+        ROOTSRV_CONSOLE_REQUEST,
+        CapRights::WRITE.union(CapRights::GRANT),
+        0,
+    )
+    .expect("grant the root server console send authority");
+    ruzt_ipc::mint(REPLY_ENDPOINT, ROOTSRV_CONSOLE_REPLY, CapRights::READ, 0)
+        .expect("grant the root server console receive authority");
+
+    let launch = IpcMessage {
+        cap_count: 4,
+        caps: [
+            CapTransferSlot {
+                cptr: REQUEST_ENDPOINT,
+                rights: CapRights::READ,
+                badge: 0,
+            },
+            CapTransferSlot {
+                cptr: REPLY_ENDPOINT,
+                rights: CapRights::WRITE,
+                badge: 0,
+            },
+            CapTransferSlot {
+                cptr: ROOTSRV_UART_DATA,
+                rights: CapRights::WRITE,
+                badge: 0,
+            },
+            CapTransferSlot {
+                cptr: ROOTSRV_UART_STATUS,
+                rights: CapRights::READ,
+                badge: 0,
+            },
+        ],
+        ..IpcMessage::default()
+    };
+    assert_eq!(
+        ruzt_ipc::spawn_program(
+            ROOTSRV_UART_DATA,
+            ROOTSRV_CONSOLE_PROCESS,
+            &launch,
+            EXIT_CHANNELS
+        ),
+        Err(ErrorCode::InvalidCap)
+    );
+    assert_eq!(
+        ruzt_ipc::spawn_program(
+            ROOTSRV_CONSOLE_PROGRAM,
+            ROOTSRV_CONSOLE_REQUEST,
+            &launch,
+            EXIT_CHANNELS
+        ),
+        Err(ErrorCode::SlotOccupied)
+    );
+    assert_eq!(
+        ruzt_ipc::spawn_program(
+            ROOTSRV_CONSOLE_PROGRAM,
+            ROOTSRV_CONSOLE_PROCESS,
+            &launch,
+            EXIT_CHANNELS | (1 << console::UART_DATA)
+        ),
+        Err(ErrorCode::BadMessage)
+    );
+    ruzt_ipc::spawn_program(
+        ROOTSRV_CONSOLE_PROGRAM,
+        ROOTSRV_CONSOLE_PROCESS,
+        &launch,
+        EXIT_CHANNELS,
+    )
+    .expect("launch console with explicitly granted capabilities");
+}
+
+fn confirm_console_ready() -> Result<(), ErrorCode> {
+    let request = IpcMessage {
+        label: console::WRITE,
+        ..IpcMessage::default()
+    };
+    let mut reply = IpcMessage::default();
+    ruzt_ipc::send(ROOTSRV_CONSOLE_REQUEST, &request)?;
+    ruzt_ipc::recv(ROOTSRV_CONSOLE_REPLY, &mut reply)?;
+    if reply.label != console::WRITTEN {
+        return Err(ErrorCode::BadMessage);
+    }
+    Ok(())
+}
+
+fn run_console() {
+    ruzt_ipc::split_untyped(ROOTSRV_UNTYPED, SESSION_BUDGET, SERVICE_BUDGET_BITS + 1)
+        .expect("reserve console session memory");
+    for attempt in 0..2 {
+        start_console();
+        let ready = confirm_console_ready();
+        if attempt != 0 && ready.is_ok() {
+            write_line("rootsrv: restarted console acknowledged IPC");
+        }
+        check_revocation();
+        split_service_budgets();
+        create_console_objects();
+        let result = ready.and_then(|()| match ruzt_ipc::poll_process(ROOTSRV_CONSOLE_PROCESS) {
+            Ok(_) => Err(ErrorCode::NotFound),
+            Err(ErrorCode::WouldBlock) => greet_via_console(),
+            Err(error) => Err(error),
+        });
+        reclaim_console_objects();
+        ruzt_ipc::revoke(SESSION_BUDGET).expect("reclaim delegated budgets");
+        split_service_budgets();
+        ruzt_ipc::delete(LOCAL_BUDGET).expect("release the reclaimed local budget");
+        ruzt_ipc::delete(CONSOLE_BUDGET).expect("release the reclaimed console budget");
+        write_line("rootsrv: both delegated budgets reclaimed");
+
+        match result {
+            Ok(()) => return,
+            Err(ErrorCode::NotFound) => write_line("rootsrv: console disconnected"),
+            Err(error) => panic!("console IPC failed: {error:?}"),
+        }
+        let status = ruzt_ipc::wait_process(ROOTSRV_CONSOLE_PROCESS)
+            .expect("wait for the console to be reaped");
+        assert_eq!(ruzt_ipc::poll_process(ROOTSRV_CONSOLE_PROCESS), Ok(status));
+        let reason = match status.kind {
+            PROCESS_EXITED => "exit status",
+            PROCESS_FAULTED => "fault vector",
+            _ => panic!("unknown console termination kind"),
+        };
+        debug_print(format_args!(
+            "rootsrv: reaped console reported {reason} {}\n",
+            status.code
+        ));
+
+        for slot in [REQUEST_ENDPOINT, REPLY_ENDPOINT] {
+            ruzt_ipc::revoke(slot).expect("revoke the old console channel");
+            ruzt_ipc::delete(slot).expect("release the old console endpoint");
+        }
+        ruzt_ipc::delete(ROOTSRV_CONSOLE_PROCESS).expect("release old console status");
+        if status.kind == PROCESS_EXITED && status.code == 0 {
+            return;
+        }
+        if attempt == 0 {
+            write_line("rootsrv: restarting console with fresh endpoints");
+        }
+    }
+}
+
+fn main() -> ! {
+    run_console();
 
     assert_eq!(
         ruzt_driver_sdk::wait_irq(u64::MAX),
@@ -263,15 +383,15 @@ fn main() -> ! {
 
 fn split_service_budgets() {
     assert_eq!(
-        ruzt_ipc::split_untyped(ROOTSRV_UNTYPED, LOCAL_BUDGET, SERVICE_BUDGET_BITS + 1),
+        ruzt_ipc::split_untyped(SESSION_BUDGET, LOCAL_BUDGET, SERVICE_BUDGET_BITS + 1),
         Err(ErrorCode::BadMessage)
     );
     for budget in [LOCAL_BUDGET, CONSOLE_BUDGET] {
-        ruzt_ipc::split_untyped(ROOTSRV_UNTYPED, budget, SERVICE_BUDGET_BITS)
+        ruzt_ipc::split_untyped(SESSION_BUDGET, budget, SERVICE_BUDGET_BITS)
             .expect("reserve a service RAM budget");
     }
     assert_eq!(
-        ruzt_ipc::retype(ROOTSRV_UNTYPED, ROOTSRV_CONSOLE_FRAME, RetypeKind::Frame),
+        ruzt_ipc::retype(SESSION_BUDGET, ROOTSRV_CONSOLE_FRAME, RetypeKind::Frame),
         Err(ErrorCode::NoMemory)
     );
 }

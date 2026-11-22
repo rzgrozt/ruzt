@@ -4,6 +4,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![feature(abi_x86_interrupt)]
 #![feature(alloc_error_handler)]
+#![feature(allocator_api)]
 
 
 //! Ruzt microkernel — Phase 2.

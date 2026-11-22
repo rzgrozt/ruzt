@@ -131,6 +131,25 @@ pub fn wait_process(cptr: u64) -> Result<ProcessStatus, ErrorCode> {
     process_status(cptr, false)
 }
 
+/// Launch a program with attenuated startup capabilities in consecutive slots.
+///
+/// The process status capability is installed at `status_slot`. Set a bit in
+/// `close_on_exit` for each startup endpoint that should close on termination.
+pub fn spawn_program(
+    program: u64,
+    status_slot: u64,
+    grants: &IpcMessage,
+    close_on_exit: u8,
+) -> Result<(), ErrorCode> {
+    control(
+        program,
+        CapOp::SpawnProgram,
+        status_slot,
+        (grants as *const IpcMessage) as u64,
+        u64::from(close_on_exit),
+    )
+}
+
 /// Read the terminal status or return `WouldBlock` while the process is live.
 pub fn poll_process(cptr: u64) -> Result<ProcessStatus, ErrorCode> {
     process_status(cptr, true)

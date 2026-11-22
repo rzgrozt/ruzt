@@ -4,15 +4,15 @@ Ruzt is an experimental, privacy-first operating system built around a Rust micr
 
 ## Development status
 
-The x86_64 kernel contains early boot code, serial diagnostics, interrupt handling, memory management, and a scheduler. The graphical boot starts `rootsrv` and `consoled` in separate ring-3 address spaces. `rootsrv` writes its greeting into a shared page and transfers a read-only frame capability over blocking IPC. `consoled` writes the greeting to COM1 and acknowledges it on a separate reply endpoint. The AArch64 boot path is a stub.
+The x86_64 kernel contains early boot code, serial diagnostics, interrupt handling, memory management, and a scheduler. The kernel boots `rootsrv`, which launches `consoled` in a separate ring-3 address space through an executable capability from the boot archive. The child receives four explicit startup grants for IPC and UART access. `rootsrv` transfers its greeting through a read-only shared frame, and `consoled` acknowledges it on a separate reply endpoint. The AArch64 boot path is a stub.
 
 Each service has its own capability space. The console endpoints grant send and receive rights separately. The kernel forwards PS/2 interrupts to `rootsrv` and hands it the boot framebuffer. The server sleeps while waiting for an interrupt, then decodes the Space key and draws a status tile in ring 3.
 
 Capabilities keep kernel objects alive while copies exist. A caller with grant rights can derive a capability with reduced rights. Moving a capability preserves its ancestry, and revoking it removes all its descendants, unmaps their shared pages, and wakes waiters that lost their authority. IPC transfers install capabilities only in empty slots designated by the receiver. Each frame capability can establish one non-executable mapping in the caller, and mapped memory stays allocated until the final page-table alias is removed.
 
-The root server receives a 16 KiB Untyped RAM budget at boot. It reserves two separate 8 KiB regions and delegates one to the console service. The console uses that budget for its scratch buffer. A frame, endpoint, or notification currently costs one 4 KiB page. Copies of an Untyped capability draw from the same budget. A reserved region returns to its parent after the region cap and its last live object are gone.
+The root server receives a 32 KiB Untyped RAM budget at boot. It creates console endpoints from the budget and reserves two separate 8 KiB regions, delegating one to the console service for its scratch buffer. A frame, endpoint, or notification currently costs one 4 KiB page. Copies of an Untyped capability draw from the same budget. A reserved region returns to its parent after the region cap and its last live object are gone.
 
-When a boot service exits or takes a user-mode fault, the kernel closes its console channels, wakes blocked peers, and reclaims its stack and private address-space memory after switching away.
+When a service exits or takes a user-mode fault, the kernel closes endpoints designated at launch, wakes blocked peers, and reclaims its stack and private address-space memory after switching away. `rootsrv` uses the process status capability to distinguish exit from fault and retries a failed console instance once with fresh endpoints.
 
 ## Repository layout
 
@@ -44,7 +44,7 @@ Each test builds a BIOS image in a fresh temporary directory. The kernel-only te
 
 A separate guest keeps the console service CPU-bound after its first reply. It verifies that timer preemption still lets `rootsrv` handle keyboard input.
 
-The exit and fault guests terminate the console while its scratch frame is mapped. After the kernel reaps the process, `rootsrv` can read its exit code or exception vector through a process capability. The tests also verify that `rootsrv` reclaims both delegated budgets and continues handling input.
+The exit and fault guests terminate the console while its scratch frame is mapped. After reaping each instance, `rootsrv` reads its exit code or exception vector, reclaims both delegated budgets, and restarts the service with fresh endpoints. It continues handling input when the replacement also fails.
 
 GitHub Actions runs both commands on pushes to `main` and on pull requests.
 

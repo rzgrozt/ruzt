@@ -363,24 +363,32 @@ pub(crate) fn take_thread_message(thread_id: ThreadId) -> Option<Packet> {
 /// Allocates a 64 KiB stack, sets up an initial frame, and pushes the thread
 /// onto the run queue.
 pub fn spawn(f: fn() -> !) -> ThreadId {
-    spawn_thread(f, None)
+    spawn_thread(f, None).expect("allocate kernel thread")
 }
 
-pub(crate) fn spawn_user(user: UserProcess, entry: fn() -> !) -> ThreadId {
+pub(crate) fn spawn_user(user: UserProcess, entry: fn() -> !) -> Result<ThreadId, ErrorCode> {
     spawn_thread(entry, Some(user))
 }
 
-fn spawn_thread(f: fn() -> !, user: Option<UserProcess>) -> ThreadId {
+fn spawn_thread(f: fn() -> !, user: Option<UserProcess>) -> Result<ThreadId, ErrorCode> {
+    const STACK_SIZE: usize = 64 * 1024;
+    let mut stack = Vec::new();
+    stack
+        .try_reserve_exact(STACK_SIZE)
+        .map_err(|_| ErrorCode::NoMemory)?;
+    stack.resize(STACK_SIZE, 0u8);
+    let mut stack = stack.into_boxed_slice();
+    #[allow(unsafe_code)]
+    // SAFETY: The new 64 KiB stack is exclusively owned by this thread.
+    let rsp = unsafe { ruzt_hal_x86_64::context::init_stack(&mut stack, f) };
+
     let mut guard = SCHEDULER.lock();
     let sched = guard.as_mut().expect("scheduler not initialised");
-
-    let id = sched.threads.len();
-    let mut stack = alloc::vec![0u8; 64 * 1024].into_boxed_slice();
-
-    #[allow(unsafe_code)]
-    let rsp = unsafe { ruzt_hal_x86_64::context::init_stack(&mut *stack, f) };
-
-    sched.threads.push(alloc::boxed::Box::new(Thread {
+    sched
+        .run_queue
+        .try_reserve(1)
+        .map_err(|_| ErrorCode::NoMemory)?;
+    let thread = Thread {
         stack: Some(stack),
         rsp,
         fp: FpState::default(),
@@ -390,10 +398,27 @@ fn spawn_thread(f: fn() -> !, user: Option<UserProcess>) -> ThreadId {
         wait_capability: None,
         ipc_error: None,
         user,
-    }));
+    };
+    let id = if let Some(index) = sched.threads.iter().position(|thread| {
+        thread.state == ThreadState::Exited && thread.stack.is_none() && thread.user.is_none()
+    }) {
+        // The idle thread already reaped this slot. Only the independently
+        // generation-qualified process capability escapes the scheduler.
+        *sched.threads[index] = thread;
+        index
+    } else {
+        let index = sched.threads.len();
+        sched
+            .threads
+            .try_reserve(1)
+            .map_err(|_| ErrorCode::NoMemory)?;
+        let thread = alloc::boxed::Box::try_new(thread).map_err(|_| ErrorCode::NoMemory)?;
+        sched.threads.push(thread);
+        index
+    };
     sched.run_queue.push_back(id);
 
-    id
+    Ok(id)
 }
 
 /// Rotate the run queue and, if a different thread should run, perform the
@@ -455,6 +480,33 @@ mod tests {
         let _state = crate::isolated_kernel_state();
         let id = current_thread_id();
         assert_eq!(id, 0);
+    }
+
+    #[test]
+    fn thread_slot_is_reused_after_its_stack_is_released() {
+        let _state = crate::isolated_kernel_state();
+        fn entry() -> ! {
+            panic!("host tests do not switch stacks")
+        }
+        let retired = spawn(entry);
+        {
+            let mut guard = SCHEDULER.lock();
+            let sched = guard.as_mut().unwrap();
+            sched.run_queue.clear();
+            sched.threads[retired].state = ThreadState::Exited;
+        }
+        let live = spawn(entry);
+        assert_ne!(live, retired);
+        {
+            let mut guard = SCHEDULER.lock();
+            let sched = guard.as_mut().unwrap();
+            sched.threads[retired].stack = None;
+        }
+        assert_eq!(spawn(entry), retired);
+        let guard = SCHEDULER.lock();
+        let sched = guard.as_ref().unwrap();
+        assert_eq!(sched.run_queue, [live, retired]);
+        assert_eq!(sched.threads.len(), 3);
     }
 
     #[test]
