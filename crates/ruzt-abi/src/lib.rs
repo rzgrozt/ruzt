@@ -29,10 +29,12 @@ pub const ROOTSRV_FRAMEBUFFER: u64 = 3;
 /// Capability slot granted to the initial process to receive console replies.
 pub const ROOTSRV_CONSOLE_REPLY: u64 = 4;
 
-/// Notification that the console signals after receiving an initial write.
+/// Slot where the root process creates the console notification.
 pub const ROOTSRV_CONSOLE_NOTIFICATION: u64 = 8;
-/// Initial RAM frame that the root process can share with the console.
+/// Slot where the root process creates the frame to share with the console.
 pub const ROOTSRV_CONSOLE_FRAME: u64 = 9;
+/// RAM budget initially granted to the root process.
+pub const ROOTSRV_UNTYPED: u64 = 10;
 
 /// Byte length of a frame supported by the user mapping ABI.
 pub const FRAME_BYTES: usize = 4096;
@@ -116,7 +118,8 @@ pub enum CapOp {
     Wait = 3,
     /// Delete a capability.
     Delete = 4,
-    /// Retype an untyped capability into a kernel object.
+    /// Create a child object from an Untyped capability. `arg2` is the
+    /// empty destination slot and `arg3` is a [`RetypeKind`].
     Retype = 5,
     /// Mint a derived capability.
     Mint = 6,
@@ -134,6 +137,31 @@ pub enum CapOp {
     MapFrame = 12,
     /// Remove the caller's mapping created with this frame capability.
     UnmapFrame = 13,
+}
+
+/// Objects that can be created by invoking an Untyped capability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u64)]
+pub enum RetypeKind {
+    /// A zero-initialized 4 KiB RAM frame.
+    Frame = 0,
+    /// A synchronous IPC endpoint.
+    Endpoint = 1,
+    /// An initially unsignalled notification.
+    Notification = 2,
+}
+
+impl TryFrom<u64> for RetypeKind {
+    type Error = ErrorCode;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Frame),
+            1 => Ok(Self::Endpoint),
+            2 => Ok(Self::Notification),
+            _ => Err(ErrorCode::BadMessage),
+        }
+    }
 }
 
 /// Byte layout of an RGB framebuffer.
@@ -426,6 +454,14 @@ mod tests {
         assert_eq!(CapOp::Revoke as u64, 11);
         assert_eq!(CapOp::MapFrame as u64, 12);
         assert_eq!(CapOp::UnmapFrame as u64, 13);
+    }
+
+    #[test]
+    fn retype_kind_uses_known_wire_codes() {
+        assert_eq!(RetypeKind::try_from(0), Ok(RetypeKind::Frame));
+        assert_eq!(RetypeKind::try_from(1), Ok(RetypeKind::Endpoint));
+        assert_eq!(RetypeKind::try_from(2), Ok(RetypeKind::Notification));
+        assert_eq!(RetypeKind::try_from(3), Err(ErrorCode::BadMessage));
     }
 
     #[test]

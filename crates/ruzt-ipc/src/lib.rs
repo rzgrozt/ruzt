@@ -1,7 +1,7 @@
 #![no_std]
 #![deny(unsafe_code)]
 
-use ruzt_abi::{CapOp, CapRights, ErrorCode, IpcMessage, SyscallNumber};
+use ruzt_abi::{CapOp, CapRights, ErrorCode, IpcMessage, RetypeKind, SyscallNumber};
 
 pub fn send(endpoint_cptr: u64, message: &IpcMessage) -> Result<(), ErrorCode> {
     let return_value = {
@@ -92,6 +92,11 @@ pub fn delete(cptr: u64) -> Result<(), ErrorCode> {
 /// Revoke all descendants while keeping the invoked capability.
 pub fn revoke(cptr: u64) -> Result<(), ErrorCode> {
     control(cptr, CapOp::Revoke, 0, 0, 0)
+}
+
+/// Create a child object in an empty slot, charging the invoked Untyped budget.
+pub fn retype(untyped: u64, destination: u64, kind: RetypeKind) -> Result<(), ErrorCode> {
+    control(untyped, CapOp::Retype, destination, kind as u64, 0)
 }
 
 /// Map a shared frame into the caller at a page-aligned user address.

@@ -70,6 +70,7 @@ fn test_rootsrv_updates_the_framebuffer_from_keyboard_input() {
             "rootsrv: console endpoint rights verified",
             "rootsrv: notification transferred and revoked across capability spaces",
             "rootsrv: shared frame mapped read-only by console and unmapped on revocation",
+            "rootsrv: Untyped budget enforced and reclaimed after revocation",
             "rootsrv: framebuffer tile drawn",
             "rootsrv: press Space to test keyboard input",
             "rootsrv thread waiting for keyboard IRQ",

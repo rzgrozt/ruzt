@@ -1,9 +1,9 @@
 //! Invoke dispatcher — routes capability operations to their handlers.
 
-use ruzt_abi::{ErrorCode as AbiErrorCode, SyscallArgs};
+use ruzt_abi::{ErrorCode as AbiErrorCode, RetypeKind, SyscallArgs};
 use ruzt_cap::CapType;
 
-use crate::cap::ops::{CapOp, cap_delete, cap_mint, cap_move, cap_retype};
+use crate::cap::ops::{cap_delete, cap_mint, cap_move, CapOp};
 
 /// The `invoke` syscall handler.
 ///
@@ -40,10 +40,16 @@ pub fn invoke(args: &SyscallArgs) -> u64 {
                 Err(e) => e.as_u64(),
             }
         }
-        CapOp::Retype { src_cptr, dest_cptr, new_type } => {
+        CapOp::Retype {
+            src_cptr,
+            dest_cptr,
+            kind,
+        } => {
             let mut guard = crate::cap::cspace::kernel_cspace();
             let cspace = guard.as_mut().expect("kernel cspace not initialised");
-            match cap_retype(cspace, src_cptr, dest_cptr, new_type) {
+            match RetypeKind::try_from(kind)
+                .and_then(|kind| cspace.retype(src_cptr, dest_cptr, kind))
+            {
                 Ok(()) => AbiErrorCode::Ok.as_u64(),
                 Err(e) => e.as_u64(),
             }

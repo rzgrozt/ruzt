@@ -1,10 +1,12 @@
 //! Kernel object table — every capability references a stable entry here.
 
 use alloc::vec::Vec;
-use ruzt_abi::ErrorCode;
-use ruzt_cap::{CapType, NULL_SLOT};
-use ruzt_hal::mem::PhysFrame;
+use ruzt_abi::{ErrorCode, RetypeKind};
+use ruzt_cap::{CapType, EndpointId, FrameSize, NotificationId, NULL_SLOT};
+use ruzt_hal::mem::{PhysAddr, PhysFrame};
 use spin::Mutex;
+
+use crate::mm::frame;
 
 /// Maximum number of kernel objects in the table.
 const MAX_OBJECTS: usize = 256;
@@ -51,8 +53,6 @@ pub enum KernelObject {
     Frame {
         /// Physical frame backing this mapping.
         phys: PhysFrame,
-        /// Whether the object owns one 4 KiB allocator frame.
-        owned: bool,
     },
     /// Capability table node.
     CNode {
@@ -69,6 +69,8 @@ pub enum KernelObject {
         phys: PhysFrame,
         /// Size of the region as a power-of-two exponent.
         size_bits: u8,
+        /// A set bit identifies a page still available for retyping.
+        free_pages: u64,
     },
     /// IRQ handler.
     Irq {
@@ -87,10 +89,17 @@ const INDEX_MASK: u64 = MAX_OBJECTS as u64 - 1;
 const MAX_GENERATION: u64 = u64::MAX >> INDEX_BITS;
 
 #[derive(Clone, Copy)]
+struct UntypedPage {
+    region: KObjectId,
+    index: u32,
+}
+
+#[derive(Clone, Copy)]
 struct Entry {
     generation: u64,
     object: Option<KernelObject>,
     references: usize,
+    backing: Option<UntypedPage>,
 }
 
 impl Entry {
@@ -98,10 +107,17 @@ impl Entry {
         generation: 0,
         object: None,
         references: 0,
+        backing: None,
     };
 
     fn matches(&self, id: KObjectId) -> bool {
         self.generation == id.0 >> INDEX_BITS
+    }
+
+    fn take(&mut self) -> Option<(KernelObject, Option<UntypedPage>)> {
+        self.object
+            .take()
+            .map(|object| (object, self.backing.take()))
     }
 }
 
@@ -117,11 +133,14 @@ static TABLE: Mutex<[Entry; MAX_OBJECTS]> = Mutex::new([Entry::EMPTY; MAX_OBJECT
 /// Initialise the object table and the kernel-only CSpace.
 pub fn init() {
     super::cspace::init_kernel_cspace();
+    #[cfg(test)]
     {
         let mut table = TABLE.lock();
         for entry in table.iter_mut() {
-            if let Some(object) = entry.object.take() {
-                destroy(object);
+            if let Some((object, backing)) = entry.take() {
+                // Host tests never reserve or retype actual physical RAM.
+                assert!(backing.is_none());
+                destroy(object, None);
             }
             entry.references = 0;
         }
@@ -133,30 +152,102 @@ pub fn allocate(cap_type: CapType) -> Result<KObjectId, ErrorCode> {
     allocate_with(|| kernel_object_from_cap_type(cap_type))
 }
 
-pub(super) fn allocate_shared_frame() -> Result<(KObjectId, PhysFrame), ErrorCode> {
-    let phys = crate::mm::frame::allocate().ok_or(ErrorCode::NoMemory)?;
-    // SAFETY: The fresh allocator frame is exclusive and in the physmap.
-    unsafe { ruzt_hal_x86_64::mapper::zero_frame(phys) };
-    let frame = KernelObject::Frame { phys, owned: true };
-    let result = allocate_with(|| Ok(frame)).map(|id| (id, phys));
-    if result.is_err() {
-        crate::mm::frame::deallocate(phys);
+const PAGE_BITS: u8 = PhysFrame::SIZE.trailing_zeros() as u8;
+const MAX_UNTYPED_BITS: u8 = PAGE_BITS + 6;
+
+pub(super) fn allocate_untyped(size_bits: u8) -> Result<(KObjectId, CapType), ErrorCode> {
+    if !(PAGE_BITS..=MAX_UNTYPED_BITS).contains(&size_bits) {
+        return Err(ErrorCode::BadMessage);
     }
-    result
+    let pages = 1 << (size_bits - PAGE_BITS);
+    let id = allocate_with(|| {
+        let phys = frame::allocate_untyped(pages).ok_or(ErrorCode::NoMemory)?;
+        Ok(KernelObject::Untyped {
+            phys,
+            size_bits,
+            free_pages: u64::MAX >> (u64::BITS as usize - pages),
+        })
+    })?;
+    let Some(KernelObject::Untyped { phys, .. }) = get(id) else {
+        unreachable!("new Untyped object must exist");
+    };
+    Ok((id, CapType::Untyped { phys, size_bits }))
 }
 
 fn allocate_with(
     build: impl FnOnce() -> Result<KernelObject, ErrorCode>,
 ) -> Result<KObjectId, ErrorCode> {
     let mut table = TABLE.lock();
-    let (index, entry) = table
-        .iter_mut()
-        .enumerate()
-        .find(|(_, entry)| entry.object.is_none() && entry.generation < MAX_GENERATION)
-        .ok_or(ErrorCode::NoMemory)?;
+    let id = vacant_id(&table[..])?;
+    let entry = &mut table[id.index()];
     entry.object = Some(build()?);
     entry.generation += 1;
-    Ok(KObjectId((entry.generation << INDEX_BITS) | index as u64))
+    Ok(id)
+}
+
+fn vacant_id(table: &[Entry]) -> Result<KObjectId, ErrorCode> {
+    table
+        .iter()
+        .enumerate()
+        .find(|(_, entry)| entry.object.is_none() && entry.generation < MAX_GENERATION)
+        .map(|(index, entry)| KObjectId(((entry.generation + 1) << INDEX_BITS) | index as u64))
+        .ok_or(ErrorCode::NoMemory)
+}
+
+pub(super) fn retype(
+    region: KObjectId,
+    kind: RetypeKind,
+) -> Result<(KObjectId, CapType), ErrorCode> {
+    let mut table = TABLE.lock();
+    let id = vacant_id(&table[..])?;
+    let parent = &mut table[region.index()];
+    if !parent.matches(region) {
+        return Err(ErrorCode::InvalidCap);
+    }
+    let Some(KernelObject::Untyped {
+        phys, free_pages, ..
+    }) = &mut parent.object
+    else {
+        return Err(ErrorCode::InvalidCap);
+    };
+    if *free_pages == 0 {
+        return Err(ErrorCode::NoMemory);
+    }
+    let references = parent
+        .references
+        .checked_add(1)
+        .ok_or(ErrorCode::NoMemory)?;
+    let index = free_pages.trailing_zeros();
+    let (object, cap_type) = match kind {
+        RetypeKind::Frame => {
+            let addr = phys.base.as_u64() + (u64::from(index) << PAGE_BITS);
+            let phys = PhysFrame::from_base(PhysAddr::new(addr)).expect("aligned Untyped page");
+            // SAFETY: The page belongs to the region and has no live objects or aliases.
+            unsafe { ruzt_hal_x86_64::mapper::zero_frame(phys) };
+            (
+                KernelObject::Frame { phys },
+                CapType::Frame {
+                    phys,
+                    size: FrameSize::Size4K,
+                },
+            )
+        }
+        RetypeKind::Endpoint => (
+            KernelObject::Endpoint { closed: false },
+            CapType::Endpoint(EndpointId(id.0)),
+        ),
+        RetypeKind::Notification => (
+            KernelObject::Notification { state: false },
+            CapType::Notification(NotificationId(id.0)),
+        ),
+    };
+    *free_pages &= !(1 << index);
+    parent.references = references;
+    let entry = &mut table[id.index()];
+    entry.object = Some(object);
+    entry.backing = Some(UntypedPage { region, index });
+    entry.generation += 1;
+    Ok((id, cap_type))
 }
 
 /// Return the object identified by this live generation.
@@ -184,13 +275,13 @@ pub fn deallocate(id: KObjectId) {
         let mut table = TABLE.lock();
         let entry = &mut table[id.index()];
         if entry.matches(id) && entry.references == 0 {
-            entry.object.take()
+            entry.take()
         } else {
             None
         }
     };
-    if let Some(object) = object {
-        destroy(object);
+    if let Some((object, backing)) = object {
+        destroy(object, backing);
     }
 }
 
@@ -211,13 +302,13 @@ pub(super) fn release(id: KObjectId) {
         assert!(entry.matches(id) && entry.references != 0);
         entry.references -= 1;
         if entry.references == 0 {
-            entry.object.take()
+            entry.take()
         } else {
             None
         }
     };
-    if let Some(object) = object {
-        destroy(object);
+    if let Some((object, backing)) = object {
+        destroy(object, backing);
     }
 }
 
@@ -231,7 +322,7 @@ impl FramePin {
     pub(super) fn new(id: KObjectId) -> Result<Self, ErrorCode> {
         // The caller holds the derivation lock and already has a reference
         // through the live capability, so the object cannot disappear here.
-        let Some(KernelObject::Frame { phys, owned: true }) = get(id) else {
+        let Some(KernelObject::Frame { phys }) = get(id) else {
             return Err(ErrorCode::InvalidCap);
         };
         retain(id)?;
@@ -245,7 +336,7 @@ impl Drop for FramePin {
     }
 }
 
-fn destroy(object: KernelObject) {
+fn destroy(object: KernelObject, backing: Option<UntypedPage>) {
     match object {
         KernelObject::CNode { slots, count, .. } => {
             // SAFETY: This is the unique boxed slice from CNode allocation.
@@ -255,13 +346,32 @@ fn destroy(object: KernelObject) {
                 ))
             };
         }
-        KernelObject::Frame { phys, owned: true } => {
+        KernelObject::Frame { phys } => {
             // SAFETY: The final reference is gone, including every mapping,
-            // and the frame still belongs to this object until deallocation.
+            // and the page is still reserved in the parent region.
             unsafe { ruzt_hal_x86_64::mapper::zero_frame(phys) };
-            crate::mm::frame::deallocate(phys);
+        }
+        KernelObject::Untyped {
+            phys,
+            size_bits,
+            free_pages,
+        } => {
+            let pages = 1 << (size_bits - PAGE_BITS);
+            assert_eq!(free_pages.count_ones() as usize, pages);
+            frame::deallocate_contiguous(phys, pages);
         }
         _ => {}
+    }
+    if let Some(page) = backing {
+        update(page.region, |region| {
+            let KernelObject::Untyped { free_pages, .. } = region else {
+                unreachable!("object backing is Untyped");
+            };
+            let bit = 1 << page.index;
+            assert_eq!(*free_pages & bit, 0);
+            *free_pages |= bit;
+        });
+        release(page.region);
     }
 }
 
@@ -296,7 +406,7 @@ fn kernel_object_from_cap_type(cap_type: CapType) -> Result<KernelObject, ErrorC
         CapType::AddressSpace(_) => Ok(KernelObject::AddressSpace {
             root_page_table: crate::mm::frame::allocate().ok_or(ErrorCode::NoMemory)?,
         }),
-        CapType::Frame { phys, size: _ } => Ok(KernelObject::Frame { phys, owned: false }),
+        CapType::Frame { .. } | CapType::Untyped { .. } => Err(ErrorCode::InvalidCap),
         CapType::CNode { radix_bits, .. } => {
             let count = 1usize
                 .checked_shl(u32::from(radix_bits))
@@ -313,7 +423,6 @@ fn kernel_object_from_cap_type(cap_type: CapType) -> Result<KernelObject, ErrorC
                 count,
             })
         }
-        CapType::Untyped { phys, size_bits } => Ok(KernelObject::Untyped { phys, size_bits }),
         CapType::Irq { irq_num } => Ok(KernelObject::Irq { irq_num }),
         // Boot device capabilities are only provisioned at process creation.
         CapType::IoPort { .. } | CapType::Framebuffer => Err(ErrorCode::NotImplemented),
@@ -323,8 +432,6 @@ fn kernel_object_from_cap_type(cap_type: CapType) -> Result<KernelObject, ErrorC
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ruzt_cap::{EndpointId, NotificationId};
-    use ruzt_hal::mem::PhysAddr;
 
     #[test]
     fn deallocate_works() {
@@ -381,29 +488,23 @@ mod tests {
     }
 
     #[test]
-    fn allocate_frame() {
+    fn raw_descriptors_cannot_allocate_ram_objects() {
         let _state = crate::isolated_kernel_state();
-        let frame = ruzt_hal::mem::PhysFrame::from_base(PhysAddr::new(0x1000)).unwrap();
-        let id = allocate(CapType::Frame {
-            phys: frame,
-            size: ruzt_cap::FrameSize::Size4K,
-        })
-        .unwrap();
-        let obj = get(id).unwrap();
-        assert!(matches!(obj, KernelObject::Frame { .. }));
-    }
-
-    #[test]
-    fn allocate_untyped() {
-        let _state = crate::isolated_kernel_state();
-        let frame = ruzt_hal::mem::PhysFrame::from_base(PhysAddr::new(0x2000)).unwrap();
-        let id = allocate(CapType::Untyped {
-            phys: frame,
-            size_bits: 12,
-        })
-        .unwrap();
-        let obj = get(id).unwrap();
-        assert!(matches!(obj, KernelObject::Untyped { size_bits: 12, .. }));
+        let phys = PhysFrame::from_base(PhysAddr::new(0x1000)).unwrap();
+        assert_eq!(
+            allocate(CapType::Frame {
+                phys,
+                size: FrameSize::Size4K
+            }),
+            Err(ErrorCode::InvalidCap)
+        );
+        assert_eq!(
+            allocate(CapType::Untyped {
+                phys,
+                size_bits: 12
+            }),
+            Err(ErrorCode::InvalidCap)
+        );
     }
 
     #[test]

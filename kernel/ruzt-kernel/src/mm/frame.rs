@@ -82,6 +82,36 @@ impl BitmapAllocator {
         let bit = frame % 64;
         self.bitmap[word] &= !(1 << bit);
     }
+
+    /// Find a run respecting an alignment expressed as a power of two in frames.
+    fn allocate_run(&mut self, count: usize, alignment: usize) -> Option<PhysFrame> {
+        debug_assert!(alignment.is_power_of_two() && alignment <= MAX_FRAMES);
+        if count == 0 {
+            return None;
+        }
+
+        let last_start = self.max_frame.checked_sub(count)?;
+        let mut start = self.next_hint.next_multiple_of(alignment);
+        while start <= last_start {
+            let end = start + count;
+            if let Some(used) = (start..end).find(|&frame| !self.is_free(frame)) {
+                // Every start through this occupied frame would intersect it.
+                start = (used + 1).next_multiple_of(alignment);
+                continue;
+            }
+
+            for frame in start..end {
+                self.alloc_specific(frame);
+            }
+            // A skipped prefix may contain smaller free runs.
+            if self.next_hint == start {
+                self.next_hint = end;
+            }
+            return PhysFrame::from_base(PhysAddr::new((start * FRAME_SIZE) as u64));
+        }
+
+        None
+    }
 }
 
 impl FrameAllocator for BitmapAllocator {
@@ -109,31 +139,7 @@ impl FrameAllocator for BitmapAllocator {
     }
 
     fn allocate_contiguous(&mut self, count: usize) -> Option<PhysFrame> {
-        if count == 0 {
-            return None;
-        }
-
-        let last_start = self.max_frame.checked_sub(count)?;
-        let mut start = self.next_hint;
-        while start <= last_start {
-            let end = start + count;
-            if let Some(used) = (start..end).find(|&frame| !self.is_free(frame)) {
-                // Every start through this occupied frame would intersect it.
-                start = used + 1;
-                continue;
-            }
-
-            for frame in start..end {
-                self.alloc_specific(frame);
-            }
-            // A skipped prefix may contain smaller free runs.
-            if self.next_hint == start {
-                self.next_hint = end;
-            }
-            return PhysFrame::from_base(PhysAddr::new((start * FRAME_SIZE) as u64));
-        }
-
-        None
+        self.allocate_run(count, 1)
     }
 
     fn deallocate(&mut self, frame: PhysFrame) {
@@ -168,6 +174,22 @@ pub fn allocate() -> Option<PhysFrame> {
 /// Allocate `count` physically contiguous 4 KiB frames.
 pub fn allocate_contiguous(count: usize) -> Option<PhysFrame> {
     ALLOCATOR.lock().allocate_contiguous(count)
+}
+
+/// Reserve a physically contiguous, naturally aligned range for an Untyped budget.
+pub(crate) fn allocate_untyped(count: usize) -> Option<PhysFrame> {
+    assert!(count.is_power_of_two() && count <= MAX_FRAMES);
+    ALLOCATOR.lock().allocate_run(count, count)
+}
+
+/// Release a contiguous range previously reserved by the frame allocator.
+pub(crate) fn deallocate_contiguous(base: PhysFrame, count: usize) {
+    let mut allocator = ALLOCATOR.lock();
+    let start = base.base.as_u64() as usize / FRAME_SIZE;
+    for frame in start..start + count {
+        allocator.free_specific(frame);
+    }
+    allocator.next_hint = allocator.next_hint.min(start);
 }
 
 /// Deallocate a previously allocated frame.
@@ -319,6 +341,22 @@ mod tests {
         let mut allocator = BitmapAllocator::new();
         allocator.init(&boot_info_from(&REGIONS));
 
+        assert_eq!(allocator.allocate().unwrap().base.as_u64(), 0x0010_1000);
+        assert!(allocator.allocate().is_none());
+    }
+
+    #[test]
+    fn aligned_run_leaves_preceding_pages_available() {
+        static REGIONS: [MemoryRegion; 1] = [MemoryRegion {
+            start: PhysAddr::new(0x0010_1000),
+            end: PhysAddr::new(0x0010_4000),
+            kind: MemoryRegionKind::Usable,
+        }];
+        let mut allocator = BitmapAllocator::new();
+        allocator.init(&boot_info_from(&REGIONS));
+
+        let base = allocator.allocate_run(2, 2).unwrap();
+        assert_eq!(base.base.as_u64(), 0x0010_2000);
         assert_eq!(allocator.allocate().unwrap().base.as_u64(), 0x0010_1000);
         assert!(allocator.allocate().is_none());
     }

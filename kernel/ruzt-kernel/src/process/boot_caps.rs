@@ -1,13 +1,15 @@
 //! Capabilities granted by the boot policy.
 
 use ruzt_abi::{
-    console, CapRights, ROOTSRV_CONSOLE_FRAME, ROOTSRV_CONSOLE_NOTIFICATION, ROOTSRV_CONSOLE_REPLY,
-    ROOTSRV_CONSOLE_REQUEST, ROOTSRV_KEYBOARD_DATA, ROOTSRV_KEYBOARD_IRQ,
+    console, CapRights, ROOTSRV_CONSOLE_REPLY, ROOTSRV_CONSOLE_REQUEST, ROOTSRV_KEYBOARD_DATA,
+    ROOTSRV_KEYBOARD_IRQ, ROOTSRV_UNTYPED,
 };
-use ruzt_cap::{CapSlot, CapType, EndpointId, NotificationId};
+use ruzt_cap::{CapSlot, CapType, EndpointId};
 
 use crate::cap::{cspace::CSpace, object};
 use crate::{keyboard, serial};
+
+const ROOTSRV_UNTYPED_BITS: u8 = 13;
 
 pub(super) fn initial_services() -> ([EndpointId; 2], CSpace, CSpace) {
     let request = endpoint();
@@ -40,19 +42,9 @@ pub(super) fn initial_services() -> ([EndpointId; 2], CSpace, CSpace) {
         CapRights::READ,
     );
 
-    let notification = object::allocate(CapType::Notification(NotificationId(0)))
-        .expect("allocate boot notification");
-    grant(
-        &mut rootsrv,
-        ROOTSRV_CONSOLE_NOTIFICATION,
-        CapType::Notification(NotificationId(notification.0)),
-        CapRights::READ
-            .union(CapRights::WRITE)
-            .union(CapRights::GRANT),
-    );
     rootsrv
-        .provision_shared_frame(ROOTSRV_CONSOLE_FRAME)
-        .expect("allocate boot console frame");
+        .provision_untyped(ROOTSRV_UNTYPED, ROOTSRV_UNTYPED_BITS)
+        .expect("reserve the root server RAM budget");
 
     let mut consoled = CSpace::new(3);
     grant(&mut consoled, console::REQUEST, request, CapRights::READ);

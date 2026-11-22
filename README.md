@@ -10,6 +10,8 @@ Each service has its own capability space. The console endpoints grant send and 
 
 Capabilities keep kernel objects alive while copies exist. A caller with grant rights can derive a capability with reduced rights. Moving a capability preserves its ancestry, and revoking it removes all its descendants, unmaps their shared pages, and wakes waiters that lost their authority. IPC transfers install capabilities only in empty slots designated by the receiver. Each frame capability can establish one non-executable mapping in the caller, and mapped memory stays allocated until the final page-table alias is removed.
 
+The root server receives an 8 KiB Untyped RAM budget at boot. It creates its shared frame and notification with `Retype`. A frame, endpoint, or notification currently costs one 4 KiB page. Copies of an Untyped capability draw from the same budget, and each page becomes reusable when the last reference to its object is gone.
+
 When a boot service exits or takes a user-mode fault, the kernel closes its console channels, wakes blocked peers, and reclaims its stack and private address-space memory after switching away.
 
 ## Repository layout

@@ -1,8 +1,8 @@
 //! Per-process slots and the kernel-wide capability derivation tree.
 
 use alloc::{collections::BTreeMap, vec, vec::Vec};
-use ruzt_abi::{ErrorCode, IPC_CAP_SLOTS};
-use ruzt_cap::{CapRights, CapSlot, CapType, FrameSize, NULL_SLOT};
+use ruzt_abi::{ErrorCode, RetypeKind, IPC_CAP_SLOTS};
+use ruzt_cap::{CapRights, CapSlot, CapType, NULL_SLOT};
 use spin::Mutex;
 
 use super::object::{self, FramePin, KObjectId};
@@ -192,18 +192,13 @@ impl CSpace {
         Ok((id, FramePin::new(object)?))
     }
 
-    pub(crate) fn provision_shared_frame(&mut self, cptr: u64) -> Result<(), ErrorCode> {
-        let (object, phys) = object::allocate_shared_frame()?;
+    pub(crate) fn provision_untyped(&mut self, cptr: u64, size_bits: u8) -> Result<(), ErrorCode> {
+        let (object, cap_type) = object::allocate_untyped(size_bits)?;
         let result = self.install(
             cptr,
             CapSlot {
-                cap_type: CapType::Frame {
-                    phys,
-                    size: FrameSize::Size4K,
-                },
-                rights: CapRights::READ
-                    .union(CapRights::WRITE)
-                    .union(CapRights::GRANT),
+                cap_type,
+                rights: CapRights::WRITE.union(CapRights::GRANT),
                 badge: 0,
             },
             Some(object),
@@ -214,6 +209,49 @@ impl CSpace {
         result
     }
 
+    pub(crate) fn retype(
+        &mut self,
+        cptr: u64,
+        destination: u64,
+        kind: RetypeKind,
+    ) -> Result<(), ErrorCode> {
+        let source = self.slots[self.index(cptr)?].ok_or(ErrorCode::InvalidCap)?;
+        let dest = self.index(destination)?;
+        let mut tree = DERIVATIONS.lock();
+        let node = tree.nodes.get(&source).ok_or(ErrorCode::InvalidCap)?;
+        if !matches!(node.slot.cap_type, CapType::Untyped { .. }) {
+            return Err(ErrorCode::InvalidCap);
+        }
+        if !node.slot.rights.contains(CapRights::WRITE) {
+            return Err(ErrorCode::CapRightsViolation);
+        }
+        let region = node.object.ok_or(ErrorCode::InvalidCap)?;
+        self.vacant(dest, &tree)?;
+
+        let (object, cap_type) = object::retype(region, kind)?;
+        let installed = tree.install(Node {
+            slot: CapSlot {
+                cap_type,
+                rights: CapRights::READ
+                    .union(CapRights::WRITE)
+                    .union(CapRights::GRANT),
+                badge: 0,
+            },
+            object: Some(object),
+            parent: Some(source),
+        });
+        match installed {
+            Ok(id) => {
+                self.slots[dest] = Some(id);
+                Ok(())
+            }
+            Err(error) => {
+                object::deallocate(object);
+                Err(error)
+            }
+        }
+    }
+
     /// Install a capability issued by the kernel at boot.
     pub fn insert(&mut self, cptr: u64, slot: CapSlot) -> Result<(), ErrorCode> {
         let object = match slot.cap_type {
@@ -222,16 +260,15 @@ impl CSpace {
             CapType::Thread(id) => Some(KObjectId(id.0)),
             CapType::AddressSpace(id) => Some(KObjectId(id.0)),
             CapType::CNode { ptr, .. } => Some(KObjectId(ptr)),
-            CapType::Untyped { .. }
-            | CapType::Irq { .. }
-            | CapType::IoPort { .. }
-            | CapType::Framebuffer => None,
-            CapType::Null | CapType::Frame { .. } => return Err(ErrorCode::InvalidCap),
+            CapType::Irq { .. } | CapType::IoPort { .. } | CapType::Framebuffer => None,
+            CapType::Null | CapType::Frame { .. } | CapType::Untyped { .. } => {
+                return Err(ErrorCode::InvalidCap)
+            }
         };
         self.install(cptr, slot, object)
     }
 
-    pub(super) fn install(
+    fn install(
         &mut self,
         cptr: u64,
         slot: CapSlot,
@@ -360,10 +397,6 @@ impl CSpace {
             .position(|slot| slot.is_none_or(|id| !tree.nodes.contains_key(&id)))
             .map(|index| index as u64)
             .ok_or(ErrorCode::NoMemory)
-    }
-
-    pub(super) fn require_vacant(&self, cptr: u64) -> Result<(), ErrorCode> {
-        self.vacant(self.index(cptr)?, &DERIVATIONS.lock())
     }
 }
 

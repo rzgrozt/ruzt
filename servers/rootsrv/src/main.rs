@@ -4,9 +4,10 @@
 mod tile;
 
 use ruzt_abi::{
-    console, CapRights, CapTransferSlot, ErrorCode, IpcMessage, FRAME_BYTES, ROOTSRV_CONSOLE_FRAME,
-    ROOTSRV_CONSOLE_NOTIFICATION, ROOTSRV_CONSOLE_REPLY, ROOTSRV_CONSOLE_REQUEST,
-    ROOTSRV_FRAMEBUFFER, ROOTSRV_KEYBOARD_DATA, ROOTSRV_KEYBOARD_IRQ,
+    console, CapRights, CapTransferSlot, ErrorCode, IpcMessage, RetypeKind, FRAME_BYTES,
+    ROOTSRV_CONSOLE_FRAME, ROOTSRV_CONSOLE_NOTIFICATION, ROOTSRV_CONSOLE_REPLY,
+    ROOTSRV_CONSOLE_REQUEST, ROOTSRV_FRAMEBUFFER, ROOTSRV_KEYBOARD_DATA, ROOTSRV_KEYBOARD_IRQ,
+    ROOTSRV_UNTYPED,
 };
 use ruzt_runtime::{debug_putchar, runtime_init};
 
@@ -125,10 +126,64 @@ fn check_revocation() {
     write_line("rootsrv: moved capability revoked transitively");
 }
 
+fn create_console_objects() {
+    const COPY: u64 = 5;
+    const PROBE: u64 = 6;
+    let budget = ROOTSRV_UNTYPED;
+    assert_eq!(
+        ruzt_ipc::retype(budget, ROOTSRV_CONSOLE_REQUEST, RetypeKind::Frame),
+        Err(ErrorCode::SlotOccupied)
+    );
+    ruzt_ipc::mint(budget, COPY, CapRights::empty(), 0).expect("copy budget without write rights");
+    assert_eq!(
+        ruzt_ipc::retype(COPY, PROBE, RetypeKind::Frame),
+        Err(ErrorCode::CapRightsViolation)
+    );
+    ruzt_ipc::delete(COPY).expect("delete attenuated budget copy");
+
+    ruzt_ipc::mint(budget, COPY, CapRights::WRITE, 0).expect("copy writable budget");
+    ruzt_ipc::retype(budget, ROOTSRV_CONSOLE_FRAME, RetypeKind::Frame)
+        .expect("create console frame");
+    ruzt_ipc::retype(COPY, ROOTSRV_CONSOLE_NOTIFICATION, RetypeKind::Notification)
+        .expect("create console notification");
+    assert_eq!(
+        ruzt_ipc::retype(budget, PROBE, RetypeKind::Endpoint),
+        Err(ErrorCode::NoMemory)
+    );
+    ruzt_ipc::delete(COPY).expect("delete writable budget copy");
+}
+
+fn reclaim_console_objects() {
+    let budget = ROOTSRV_UNTYPED;
+    let frame = ROOTSRV_CONSOLE_FRAME;
+    let notification = ROOTSRV_CONSOLE_NOTIFICATION;
+    ruzt_ipc::revoke(budget).expect("revoke all console objects");
+    assert_eq!(ruzt_ipc::signal(notification), Err(ErrorCode::InvalidCap));
+    assert_eq!(
+        ruzt_ipc::map_frame(frame, CONSOLE_BUFFER, false),
+        Err(ErrorCode::InvalidCap)
+    );
+
+    ruzt_ipc::retype(budget, frame, RetypeKind::Frame).expect("reuse released Untyped page");
+    ruzt_ipc::retype(budget, notification, RetypeKind::Endpoint)
+        .expect("reuse the second Untyped page while the frame is live");
+    ruzt_ipc::map_frame(frame, CONSOLE_BUFFER, false).expect("reuse released frame address");
+    for offset in 0..FRAME_BYTES {
+        // SAFETY: The replacement frame is mapped for reading and is private
+        // until it is released below. No references into the page escape.
+        let byte = unsafe { ((CONSOLE_BUFFER as usize + offset) as *const u8).read_volatile() };
+        assert_eq!(byte, 0);
+    }
+    ruzt_ipc::delete(frame).expect("release replacement frame");
+    ruzt_ipc::delete(notification).expect("release retyped endpoint");
+    write_line("rootsrv: Untyped budget enforced and reclaimed after revocation");
+}
+
 fn main() -> ! {
     check_revocation();
+    create_console_objects();
     let result = greet_via_console();
-    ruzt_ipc::delete(ROOTSRV_CONSOLE_FRAME).expect("release boot console frame");
+    reclaim_console_objects();
     match result {
         Ok(()) => {}
         Err(ErrorCode::NotFound) => write_line("rootsrv: console disconnected"),

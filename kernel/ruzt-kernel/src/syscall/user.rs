@@ -2,8 +2,8 @@
 
 use core::mem::{offset_of, size_of};
 use ruzt_abi::{
-    CapOp, CapRights, CapTransferSlot, ErrorCode, FramebufferInfo, IpcMessage, SyscallArgs,
-    IPC_CAP_SLOTS,
+    CapOp, CapRights, CapTransferSlot, ErrorCode, FramebufferInfo, IpcMessage, RetypeKind,
+    SyscallArgs, IPC_CAP_SLOTS,
 };
 use ruzt_cap::CapType;
 use ruzt_hal::mem::PhysFrame;
@@ -24,6 +24,13 @@ const BADGE_OFFSET: usize = offset_of!(CapTransferSlot, badge);
 
 pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
     let operation = args.arg1;
+    if operation == CapOp::Retype as u64 {
+        let kind = RetypeKind::try_from(args.arg3)?;
+        return sched::with_current_user(|process| {
+            process.cspace.retype(args.arg0, args.arg2, kind)
+        })
+        .ok_or(ErrorCode::InvalidCap)?;
+    }
     if operation == CapOp::MapFrame as u64 {
         let writable = match args.arg3 {
             0 => false,
