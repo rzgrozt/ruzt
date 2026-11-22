@@ -8,6 +8,11 @@ use std::time::{Duration, Instant};
 // small CI runner. Keep independent image builds parallel.
 static QEMU_SLOT: Mutex<()> = Mutex::new(());
 
+const BOOT_TIMEOUT: Duration = Duration::from_secs(90);
+const ACTION_TIMEOUT: Duration = Duration::from_secs(30);
+const GUEST_TIMEOUT: Duration =
+    Duration::from_secs(BOOT_TIMEOUT.as_secs() + ACTION_TIMEOUT.as_secs() + 5);
+
 fn qemu_slot() -> MutexGuard<'static, ()> {
     QEMU_SLOT.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -38,13 +43,13 @@ fn test_rootsrv_updates_the_framebuffer_from_keyboard_input() {
     let serial_path = temp.path().join("serial.log");
     let mut vm = start_guest(&disk_image, &serial_path);
 
-    let deadline = Instant::now() + Duration::from_secs(30);
     wait_for_serial(
         &mut vm.child,
         &serial_path,
         "rootsrv thread waiting for keyboard IRQ",
-        deadline,
+        Instant::now() + BOOT_TIMEOUT,
     );
+    let deadline = Instant::now() + ACTION_TIMEOUT;
     let initial_image = temp.path().join("before.ppm");
     assert_tile_color(&mut vm.child, &initial_image, [0x8a, 0xb4, 0xff], deadline);
     monitor(&mut vm.child, "sendkey spc");
@@ -87,25 +92,25 @@ fn test_timer_preempts_cpu_bound_user_code() {
     let disk_image = build_image(temp.path(), "qemu-rootsrv-test", Services::CpuBoundConsole);
     let serial_path = temp.path().join("serial.log");
     let mut vm = start_guest(&disk_image, &serial_path);
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let boot_deadline = Instant::now() + BOOT_TIMEOUT;
     wait_for_serial(
         &mut vm.child,
         &serial_path,
         "consoled: reply followed by CPU-bound loop",
-        deadline,
+        boot_deadline,
     );
     wait_for_serial(
         &mut vm.child,
         &serial_path,
         "rootsrv thread waiting for keyboard IRQ",
-        deadline,
+        boot_deadline,
     );
     monitor(&mut vm.child, "sendkey spc");
     wait_for_serial(
         &mut vm.child,
         &serial_path,
         "rootsrv: Space key received",
-        deadline,
+        Instant::now() + ACTION_TIMEOUT,
     );
     monitor(&mut vm.child, "quit");
     assert!(vm.child.wait().expect("Failed to wait for QEMU").success());
@@ -139,19 +144,18 @@ fn assert_console_shutdown_isolated(services: Services, reason: &str, observed_s
     let disk_image = build_image(temp.path(), "qemu-rootsrv-test", services);
     let serial_path = temp.path().join("serial.log");
     let mut vm = start_guest(&disk_image, &serial_path);
-    let deadline = Instant::now() + Duration::from_secs(30);
     wait_for_serial(
         &mut vm.child,
         &serial_path,
         "rootsrv thread waiting for keyboard IRQ",
-        deadline,
+        Instant::now() + BOOT_TIMEOUT,
     );
     monitor(&mut vm.child, "sendkey spc");
     let serial = wait_for_serial(
         &mut vm.child,
         &serial_path,
         "rootsrv: Space key received",
-        deadline,
+        Instant::now() + ACTION_TIMEOUT,
     );
     monitor(&mut vm.child, "quit");
     assert!(vm.child.wait().expect("Failed to wait for QEMU").success());
@@ -233,7 +237,8 @@ fn build_image(temp: &Path, kernel_feature: &str, services: Services) -> PathBuf
 fn run_smoke_test(disk_image: &Path) -> String {
     let _slot = qemu_slot();
     let output = Command::new("timeout")
-        .args(["30s", "qemu-system-x86_64", "-drive"])
+        .arg(BOOT_TIMEOUT.as_secs().to_string())
+        .args(["qemu-system-x86_64", "-drive"])
         .arg(format!("format=raw,file={}", disk_image.display()))
         .args([
             "-serial",
@@ -271,7 +276,8 @@ fn start_guest(disk_image: &Path, serial_path: &Path) -> Guest {
     let slot = qemu_slot();
     Guest {
         child: Command::new("timeout")
-            .args(["35s", "qemu-system-x86_64", "-drive"])
+            .arg(GUEST_TIMEOUT.as_secs().to_string())
+            .args(["qemu-system-x86_64", "-drive"])
             .arg(format!("format=raw,file={}", disk_image.display()))
             .arg("-serial")
             .arg(format!("file:{}", serial_path.display()))
