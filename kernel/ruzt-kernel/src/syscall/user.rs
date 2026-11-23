@@ -91,6 +91,13 @@ pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
         return sched::with_current_user(|user| user.cspace.claim_irq(args.arg0, args.arg2, line))
             .ok_or(ErrorCode::InvalidCap)?;
     }
+    if operation == CapOp::ClaimGsi as u64 {
+        let gsi = u32::try_from(args.arg3).map_err(|_| ErrorCode::BadMessage)?;
+        return sched::with_current_user(|user| {
+            user.cspace.claim_gsi(args.arg0, args.arg2, gsi, args.arg4)
+        })
+        .ok_or(ErrorCode::InvalidCap)?;
+    }
     if operation == CapOp::Retype as u64 {
         let kind = RetypeKind::try_from(args.arg3)?;
         return sched::with_current_user(|process| {

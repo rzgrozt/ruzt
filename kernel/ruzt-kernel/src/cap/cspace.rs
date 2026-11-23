@@ -546,6 +546,22 @@ impl CSpace {
         })
     }
 
+    pub(crate) fn claim_gsi(
+        &mut self,
+        control: u64,
+        destination: u64,
+        gsi: u32,
+        flags: u64,
+    ) -> Result<(), ErrorCode> {
+        self.allocate_device_object(control, destination, |cap| {
+            if cap != CapType::IrqControl {
+                return Err(ErrorCode::InvalidCap);
+            }
+            let (object, irq_num) = object::allocate_gsi(gsi, flags)?;
+            Ok((object, CapType::Irq { irq_num, id: object.0 }))
+        })
+    }
+
     pub(crate) fn claim_pci_device(
         &mut self,
         control: u64,

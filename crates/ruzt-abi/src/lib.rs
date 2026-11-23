@@ -191,6 +191,12 @@ pub mod console {
     pub const DMA_UNAVAILABLE: u64 = 14;
     /// Verify the previous DMA buffer mapping was removed.
     pub const CHECK_DMA_REVOKED: u64 = 15;
+    /// Exercise the delegated QEMU EDU INTx line and register page.
+    pub const CHECK_PCI_IRQ: u64 = 16;
+    /// The EDU IRQ test or its revocation check succeeded.
+    pub const PCI_IRQ_CHECKED: u64 = 17;
+    /// Verify the previous EDU interrupt capability was revoked.
+    pub const CHECK_PCI_IRQ_REVOKED: u64 = 18;
 }
 
 /// System-call numbers.
@@ -335,7 +341,15 @@ pub enum CapOp {
     BindDma = 31,
     /// Disable bus mastering and retire the caller's DMA binding on this device.
     UnbindDma = 32,
+    /// Claim the non-ISA GSI in `arg3` into slot `arg2` using IRQ control.
+    /// `arg4` contains the firmware-described `IRQ_*` signal flags.
+    ClaimGsi = 33,
 }
+
+/// The interrupt is asserted low. The default is active high.
+pub const IRQ_ACTIVE_LOW: u64 = 1;
+/// The interrupt is level-triggered. The default is edge-triggered.
+pub const IRQ_LEVEL_TRIGGERED: u64 = 2;
 
 /// The process invoked `Exit`.
 pub const PROCESS_EXITED: u32 = 0;

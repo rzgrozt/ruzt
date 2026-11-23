@@ -9,34 +9,39 @@ mod dma;
 mod pci;
 pub use dma::{allocate_dma_buffer, bind_dma, map_dma_buffer, unbind_dma, unmap_dma_buffer};
 pub use pci::{claim_pci_device, map_mmio, open_pci_bar, read_pci_config, unmap_mmio, MmioRegion};
-pub use ruzt_abi::{DMA_READ, DMA_WRITE};
+pub use ruzt_abi::{DMA_READ, DMA_WRITE, IRQ_ACTIVE_LOW, IRQ_LEVEL_TRIGGERED};
 
 /// Claim a device interrupt line into an empty capability slot.
 pub fn claim_irq(control: u64, destination: u64, line: u32) -> Result<(), ErrorCode> {
-    invoke_irq(control, CapOp::ClaimIrq, destination, u64::from(line))
+    invoke_irq(control, CapOp::ClaimIrq, destination, u64::from(line), 0)
+}
+
+/// Claim a non-ISA global system interrupt with the platform's signal flags.
+pub fn claim_gsi(control: u64, destination: u64, gsi: u32, flags: u64) -> Result<(), ErrorCode> {
+    invoke_irq(control, CapOp::ClaimGsi, destination, u64::from(gsi), flags)
 }
 
 /// Bind an exclusively claimed interrupt to the calling driver.
 pub fn bind_irq(cap: u64) -> Result<(), ErrorCode> {
-    invoke_irq(cap, CapOp::BindIrq, 0, 0)
+    invoke_irq(cap, CapOp::BindIrq, 0, 0, 0)
 }
 
 /// Sleep until the bound interrupt is pending, then consume the event.
 pub fn wait_irq(cap: u64) -> Result<(), ErrorCode> {
-    invoke_irq(cap, CapOp::Wait, 0, 0)
+    invoke_irq(cap, CapOp::Wait, 0, 0, 0)
 }
 
 /// Re-arm the line after servicing the device and clearing its interrupt.
 pub fn acknowledge_irq(cap: u64) -> Result<(), ErrorCode> {
-    invoke_irq(cap, CapOp::AckIrq, 0, 0)
+    invoke_irq(cap, CapOp::AckIrq, 0, 0, 0)
 }
 
 /// Mask and release the calling driver's binding.
 pub fn unbind_irq(cap: u64) -> Result<(), ErrorCode> {
-    invoke_irq(cap, CapOp::UnbindIrq, 0, 0)
+    invoke_irq(cap, CapOp::UnbindIrq, 0, 0, 0)
 }
 
-fn invoke_irq(cap: u64, operation: CapOp, arg2: u64, arg3: u64) -> Result<(), ErrorCode> {
+fn invoke_irq(cap: u64, operation: CapOp, arg2: u64, arg3: u64, arg4: u64) -> Result<(), ErrorCode> {
     // SAFETY: This operation has no memory operands.
     let status = unsafe {
         syscall(
@@ -45,7 +50,7 @@ fn invoke_irq(cap: u64, operation: CapOp, arg2: u64, arg3: u64) -> Result<(), Er
             operation as u64,
             arg2,
             arg3,
-            0,
+            arg4,
             0,
         )
     };

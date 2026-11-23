@@ -116,6 +116,14 @@ impl LocalApic {
     pub(crate) fn end_of_interrupt(&self) {
         self.registers.write(0xb0, 0);
     }
+
+    pub(crate) fn vector_idle(&self, vector: u8) -> bool {
+        let offset = usize::from(vector / 32) * 16;
+        let bit = 1 << (vector % 32);
+        // The caller has disabled local interrupts, so IRR cannot move into ISR.
+        self.registers.read(0x200 + offset) & bit == 0
+            && self.registers.read(0x100 + offset) & bit == 0
+    }
 }
 
 /// An I/O APIC register window and its hardware-reported pin count.
@@ -213,5 +221,11 @@ impl Input {
             old | REDIRECTION_MASK
         };
         self.unit.write(self.register, new);
+    }
+
+    pub(crate) fn delivery_idle(self) -> bool {
+        let entry = self.unit.read(self.register);
+        let pending = (1 << 12) | (1 << 14); // Delivery status and remote IRR.
+        entry & (REDIRECTION_MASK | pending) == REDIRECTION_MASK
     }
 }

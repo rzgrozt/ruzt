@@ -198,6 +198,16 @@ pub(super) fn allocate_irq(irq_num: u32) -> Result<KObjectId, ErrorCode> {
     Ok(id)
 }
 
+pub(super) fn allocate_gsi(gsi: u32, flags: u64) -> Result<(KObjectId, u32), ErrorCode> {
+    let mut table = TABLE.lock();
+    let id = vacant_id(&table[..])?;
+    let irq_num = crate::apic::reserve_gsi(gsi, flags)?;
+    let entry = &mut table[id.index()];
+    entry.object = Some(KernelObject::Irq { irq_num });
+    entry.generation += 1;
+    Ok((id, irq_num))
+}
+
 pub(super) fn allocate_pci_device(address: PciAddress) -> Result<KObjectId, ErrorCode> {
     let mut table = TABLE.lock();
     if table.iter().any(|entry| {

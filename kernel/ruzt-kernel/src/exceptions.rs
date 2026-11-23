@@ -4,7 +4,10 @@ use crate::serial_println;
 use ruzt_abi::{ProcessStatus, PROCESS_FAULTED};
 use ruzt_hal::cpu::CpuOps;
 use ruzt_hal::time::Timer;
-use ruzt_hal_x86_64::{apic::SPURIOUS_VECTOR, irq::VECTOR_BASE};
+use ruzt_hal_x86_64::{
+    apic::SPURIOUS_VECTOR,
+    irq::{IRQ_COUNT, VECTOR_BASE},
+};
 use spin::Once;
 use x86_64::{
     registers::rflags::RFlags,
@@ -89,9 +92,19 @@ pub fn init_idt() {
             gate!(idt.alignment_check, protection_entry::<17>);
             gate!(idt[VECTOR_BASE], timer_entry);
             macro_rules! device_gates {
-                ($($line:literal),*) => { $(gate!(idt[VECTOR_BASE + $line], device_entry::<$line>);)* };
+                ($($line:literal),*) => {
+                    const _: [u8; IRQ_COUNT - 1] = [$($line),*];
+                    $(gate!(idt[VECTOR_BASE + $line], device_entry::<$line>);)*
+                };
             }
-            device_gates!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+            device_gates!(
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+                32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
+                48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
+                64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79,
+                80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95
+            );
             gate!(idt[SPURIOUS_VECTOR], spurious_entry);
             gate!(idt[0x80], syscall_handler).set_privilege_level(x86_64::PrivilegeLevel::Ring3);
         }

@@ -62,6 +62,16 @@ fn main() -> ! {
             }
             (console::CHECK_DMA, 3) => dma::check(&request),
             (console::CHECK_DMA_REVOKED, 0) => dma::check_revoked().map(|()| console::DMA_CHECKED),
+            #[cfg(feature = "qemu-pci-intx-test")]
+            (console::CHECK_PCI_IRQ, 2) => check_pci_irq(&request).map(|()| console::PCI_IRQ_CHECKED),
+            #[cfg(feature = "qemu-pci-intx-test")]
+            (console::CHECK_PCI_IRQ_REVOKED, 0) => {
+                assert_eq!(
+                    ruzt_driver_sdk::bind_irq(console::RECEIVED_NOTIFICATION),
+                    Err(ErrorCode::InvalidCap)
+                );
+                Ok(console::PCI_IRQ_CHECKED)
+            }
             _ => Err(ErrorCode::BadMessage),
         };
         if label.is_err() {
@@ -190,6 +200,44 @@ fn check_irq(request: &IpcMessage) -> Result<(), ErrorCode> {
     ruzt_ipc::delete(identify)?;
     // The supervisor revokes the remaining bound IRQ from its original cap.
     Ok(())
+}
+
+#[cfg(feature = "qemu-pci-intx-test")]
+fn check_pci_irq(request: &IpcMessage) -> Result<(), ErrorCode> {
+    use ruzt_driver_sdk::{acknowledge_irq, bind_irq, map_mmio, unmap_mmio};
+    const STATUS: u64 = 0x24;
+    const RAISE: u64 = 0x60;
+    const CLEAR: u64 = 0x64;
+    let irq = request.caps[0].cptr;
+    let bar = request.caps[1].cptr;
+    let registers = map_mmio(bar, DEVICE_WINDOW, true)?;
+    let probe = (|| {
+        bind_irq(irq)?;
+        for bit in [1, 2] {
+            // SAFETY: The test supervisor delegates the EDU BAR0 register
+            // page. These offsets are its dword interrupt registers.
+            unsafe {
+                registers.write_u32(RAISE, bit)?;
+                let deadline = ruzt_runtime::syscall::monotonic_ns()? + 1_000_000_000;
+                let event = ruzt_ipc::wait_any_until(&[irq], deadline)?;
+                if event.kind != WAIT_IRQ || registers.read_u32(STATUS)? != bit {
+                    return Err(ErrorCode::BadMessage);
+                }
+                registers.write_u32(CLEAR, bit)?;
+                // Read back the posted MMIO write before unmasking the pin.
+                if registers.read_u32(STATUS)? != 0 {
+                    return Err(ErrorCode::BadMessage);
+                }
+            }
+            acknowledge_irq(irq)?;
+        }
+        Ok(())
+    })();
+    // SAFETY: Clear both test sources on the verified EDU BAR before unmapping.
+    let clear = unsafe { registers.write_u32(CLEAR, 3) };
+    let unmapped = unmap_mmio(bar);
+    probe.and(clear).and(unmapped)?;
+    ruzt_ipc::delete(bar)
 }
 
 fn write_shared(request: &IpcMessage) -> Result<(), ErrorCode> {

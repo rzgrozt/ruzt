@@ -109,11 +109,16 @@ fn owned_route(
         .ok_or(ErrorCode::InvalidCap)
 }
 
-/// Detach the hardware line after its last capability disappears.
-pub(crate) fn release(line: u32) {
+fn remove_route(line: u32) {
     let mut routes = ROUTES.lock();
     disable(line);
     routes[line as usize] = None;
+}
+
+/// Detach the hardware line after its last capability disappears.
+pub(crate) fn release(line: u32) {
+    remove_route(line);
+    hardware::release_gsi(line);
 }
 
 pub(crate) fn detach_thread(thread: ThreadId) {
@@ -127,13 +132,13 @@ pub(crate) fn detach_thread(thread: ThreadId) {
 }
 
 pub(crate) fn detach_revoked() {
-    // Snapshot before checking capabilities to avoid taking the capability
-    // tree lock under the route lock. IRQ delivery cannot interleave here.
-    let routes = *ROUTES.lock();
-    for (line, route) in routes.into_iter().enumerate() {
+    for line in 0..IRQ_COUNT {
+        // Copy one route without nesting the route and capability tree locks.
+        // The boot CPU has interrupts disabled, so delivery cannot interleave.
+        let route = ROUTES.lock()[line];
         if let Some(route) = route {
             if !route.authority.is_live() {
-                release(line as u32);
+                remove_route(line as u32);
                 sched::wake_irq(route.thread, line as u32);
             }
         }

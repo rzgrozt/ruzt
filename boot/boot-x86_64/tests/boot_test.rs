@@ -58,7 +58,7 @@ fn test_uefi_boots_user_services_with_a_randomized_kernel() {
     let disk = build_firmware_image(
         temp.path(),
         "qemu-rootsrv-test,qemu-kaslr-test",
-        Services::Console,
+        Services::PciInterruptConsole,
         true,
     );
     let (code, vars) = [
@@ -84,7 +84,7 @@ fn test_uefi_boots_user_services_with_a_randomized_kernel() {
         let isolated = index == 0;
         let mut devices = vec![
             "-machine", "q35", "-cpu", "max", &first, &code_arg, &second, &vars_arg, "-device",
-            "edu",
+            "edu,addr=3",
         ];
         if isolated {
             devices.extend(["-device", "intel-iommu,caching-mode=on"]);
@@ -117,6 +117,7 @@ fn test_uefi_boots_user_services_with_a_randomized_kernel() {
                 &[
                     "VT-d DMA translation enabled with an empty root table",
                     "rootsrv: cleared firmware-enabled PCI bus mastering before delegation",
+                    "rootsrv: PCI INTx delivered, re-armed, revoked and reclaimed",
                     "rootsrv: delegated DMA round trip, revocation and reclamation verified",
                     "rootsrv: PCI BAR mapped, delegated read-only, revoked and reclaimed",
                 ],
@@ -276,6 +277,7 @@ fn test_timer_preempts_cpu_bound_user_code() {
 enum Services {
     None,
     Console,
+    PciInterruptConsole,
     CpuBoundConsole,
     FaultingConsole,
     ExitingConsole,
@@ -284,7 +286,7 @@ enum Services {
 #[test]
 fn test_vtd_isolates_and_reclaims_delegated_dma() {
     let temp = tempfile::tempdir().expect("create VT-d test directory");
-    let disk_image = build_image(temp.path(), "qemu-vtd-test", Services::Console);
+    let disk_image = build_image(temp.path(), "qemu-vtd-test", Services::PciInterruptConsole);
     let serial_path = temp.path().join("serial.log");
     let mut guest = start_guest_with_devices(
         &disk_image,
@@ -295,7 +297,7 @@ fn test_vtd_isolates_and_reclaims_delegated_dma() {
             "-device",
             "intel-iommu,caching-mode=on",
             "-device",
-            "edu",
+            "edu,addr=3",
         ],
     );
     let serial = wait_for_serial(
@@ -309,6 +311,7 @@ fn test_vtd_isolates_and_reclaims_delegated_dma() {
         &[
             "VT-d DMA translation enabled with an empty root table",
             "VT-d rejected an unassigned EDU DMA request",
+            "rootsrv: PCI INTx delivered, re-armed, revoked and reclaimed",
             "rootsrv: delegated DMA round trip, revocation and reclamation verified",
             "rootsrv: PCI BAR mapped, delegated read-only, revoked and reclaimed",
         ],
@@ -413,6 +416,10 @@ fn build_firmware_image(
             .arg(&build_dir)
             .current_dir(workspace.join("servers"));
         match services {
+            Services::PciInterruptConsole => build.args([
+                "--features",
+                "rootsrv/qemu-pci-intx-test,consoled/qemu-pci-intx-test",
+            ]),
             Services::CpuBoundConsole => {
                 build.args(["--features", "consoled/qemu-preemption-test"])
             }

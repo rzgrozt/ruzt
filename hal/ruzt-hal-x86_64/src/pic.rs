@@ -11,7 +11,7 @@ const ICW1_INIT: u8 = 0x11;
 const ICW4_8086: u8 = 0x01;
 const CASCADE: u8 = 2;
 
-use crate::irq::IRQ_COUNT;
+use crate::irq::ISA_IRQ_COUNT;
 
 pub(crate) fn mask_all() {
     // SAFETY: The kernel owns both PICs and is switching to APIC mode.
@@ -65,7 +65,7 @@ pub fn send_eoi(irq: u8) {
 /// Change a device IRQ mask and keep the slave cascade enabled as needed.
 /// Call with interrupts disabled on the boot CPU.
 pub(crate) fn set_enabled(line: u32, enabled: bool) {
-    if line >= IRQ_COUNT as u32 || line == u32::from(CASCADE) {
+    if line >= ISA_IRQ_COUNT as u32 || line == u32::from(CASCADE) {
         return;
     }
     let line = line as u8;

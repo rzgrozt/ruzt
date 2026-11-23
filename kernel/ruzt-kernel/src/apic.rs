@@ -1,11 +1,12 @@
 //! Discover and validate ACPI interrupt routing before replacing the PIC.
 
 use alloc::vec::Vec;
+use ruzt_abi::{ErrorCode, IRQ_ACTIVE_LOW, IRQ_LEVEL_TRIGGERED};
 use ruzt_hal::boot::{BootInfo, FirmwareTables, MemoryRegionKind};
 use ruzt_hal::mem::{PhysFrame, VirtAddr};
 use ruzt_hal_x86_64::{
     apic::{Input, IoApic, LocalApic},
-    irq::{self, CASCADE, IRQ_COUNT, KEYBOARD, TIMER},
+    irq::{self, ReserveError, CASCADE, ISA_IRQ_COUNT, KEYBOARD, TIMER},
     mapper, pic,
 };
 use spin::Once;
@@ -17,6 +18,7 @@ const PCAT_COMPATIBLE: u32 = 1;
 const PAGE: u64 = PhysFrame::SIZE as u64;
 
 static MMIO_PAGES: Once<Vec<u64>> = Once::new();
+static TOPOLOGY: Once<Topology> = Once::new();
 
 #[derive(Debug, PartialEq, Eq)]
 enum Error {
@@ -38,7 +40,7 @@ struct Madt {
     pcat_compatible: bool,
     processors: [bool; 255],
     controllers: Vec<Descriptor>,
-    overrides: [Option<Route>; IRQ_COUNT],
+    overrides: [Option<Route>; ISA_IRQ_COUNT],
     nmi: Vec<u32>,
 }
 
@@ -72,7 +74,7 @@ impl Madt {
             pcat_compatible: dword(&header[40..]) & PCAT_COMPATIBLE != 0,
             processors: [false; 255],
             controllers: Vec::new(),
-            overrides: [None; IRQ_COUNT],
+            overrides: [None; ISA_IRQ_COUNT],
             nmi: Vec::new(),
         };
         let mut override_local = false;
@@ -91,7 +93,7 @@ impl Madt {
                 2 if size == 10 && record[2] == 0 => {
                     let line = usize::from(record[3]);
                     let route = Route::parse(dword(&record[4..]), word(&record[8..]))?;
-                    if line >= IRQ_COUNT
+                    if line >= ISA_IRQ_COUNT
                         || line == CASCADE
                         || result.overrides[line].is_some()
                         || result
@@ -162,7 +164,7 @@ impl Madt {
     }
 
     fn routes(&self) -> impl Iterator<Item = (usize, Route)> + '_ {
-        (0..IRQ_COUNT).filter_map(|line| {
+        (0..ISA_IRQ_COUNT).filter_map(|line| {
             if line == CASCADE {
                 return None;
             }
@@ -196,6 +198,39 @@ struct Controller {
     first: u32,
     end: u32,
     hardware: IoApic,
+}
+
+struct Topology {
+    controllers: Vec<Controller>,
+    overrides: [Option<Route>; ISA_IRQ_COUNT],
+    nmi: Vec<u32>,
+}
+
+pub(crate) fn reserve_gsi(gsi: u32, flags: u64) -> Result<u32, ErrorCode> {
+    if gsi < ISA_IRQ_COUNT as u32 || flags & !(IRQ_ACTIVE_LOW | IRQ_LEVEL_TRIGGERED) != 0 {
+        return Err(ErrorCode::BadMessage);
+    }
+    let topology = TOPOLOGY.get().ok_or(ErrorCode::NotFound)?;
+    if topology.nmi.contains(&gsi)
+        || topology.overrides.iter().flatten().any(|route| route.gsi == gsi)
+    {
+        return Err(ErrorCode::BadMessage);
+    }
+    let route = Route {
+        gsi,
+        low: flags & IRQ_ACTIVE_LOW != 0,
+        level: flags & IRQ_LEVEL_TRIGGERED != 0,
+    };
+    let input = find_input(&topology.controllers, route).ok_or(ErrorCode::NotFound)?;
+    #[allow(unsafe_code)]
+    // SAFETY: The syscall runs on the boot CPU with interrupts disabled.
+    // The validated topology identifies a unique non-ISA, non-NMI pin.
+    let line = unsafe { irq::reserve_gsi(gsi, input) };
+    line.map_err(|error| match error {
+        ReserveError::Unavailable => ErrorCode::NotFound,
+        ReserveError::Occupied => ErrorCode::SlotOccupied,
+        ReserveError::NoVector => ErrorCode::NoMemory,
+    })
 }
 
 pub(crate) fn init(boot: &BootInfo) {
@@ -263,7 +298,7 @@ fn start(boot: &BootInfo) -> Result<bool, Error> {
         return Err(Error::UnusableController);
     }
     let controllers = inspect_controllers(&madt.controllers)?;
-    let mut inputs = [None; IRQ_COUNT];
+    let mut inputs = [None; ISA_IRQ_COUNT];
     for (line, route) in madt.routes() {
         inputs[line] = find_input(&controllers, route);
         if inputs[line].is_none() && madt.overrides[line].is_some() {
@@ -285,6 +320,11 @@ fn start(boot: &BootInfo) -> Result<bool, Error> {
             madt.pcat_compatible,
         )
     };
+    TOPOLOGY.call_once(|| Topology {
+        controllers,
+        overrides: madt.overrides,
+        nmi: madt.nmi,
+    });
     Ok(true)
 }
 
