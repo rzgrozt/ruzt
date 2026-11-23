@@ -21,7 +21,7 @@ fn qemu_slot() -> MutexGuard<'static, ()> {
 fn test_kernel_boots_and_schedules_blocking_ipc() {
     let temp = tempfile::tempdir().expect("Failed to create boot test directory");
     let disk_image = build_image(temp.path(), "qemu-smoke-test", Services::None);
-    let serial = run_smoke_test(&disk_image, &["-no-acpi"]);
+    let serial = run_smoke_test(&disk_image, &["-machine", "pc,acpi=off"]);
     assert_markers(
         &serial,
         &[
