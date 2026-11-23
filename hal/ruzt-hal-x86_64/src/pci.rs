@@ -50,6 +50,22 @@ fn write_command(function: u16, value: u16) {
     unsafe { PortWriteOnly::<u16>::new(CONFIG_DATA).write(value) };
 }
 
+/// Set or clear bus mastering on a PCI function.
+///
+/// # Safety
+/// The caller holds the function exclusively, serializes configuration
+/// access, and has active DMA isolation for the requester before enabling it.
+pub unsafe fn set_bus_master(function: u16, enabled: bool) {
+    // SAFETY: The caller serializes PCI configuration accesses.
+    let command = unsafe { read_config(function, COMMAND) } as u16;
+    let command = if enabled {
+        command | BUS_MASTER
+    } else {
+        command & !BUS_MASTER
+    };
+    write_command(function, command);
+}
+
 /// Size assigned memory BARs while the endpoint's memory decode is disabled.
 ///
 /// Returns `None` for non-endpoint functions, functions with memory decode

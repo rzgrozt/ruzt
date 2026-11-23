@@ -47,6 +47,7 @@ pub mod irq;
 pub mod mapper;
 pub mod pic;
 pub mod pci;
+pub mod vtd;
 pub mod time;
 pub mod timer;
 

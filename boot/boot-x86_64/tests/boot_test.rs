@@ -144,6 +144,41 @@ enum Services {
 }
 
 #[test]
+fn test_vtd_rejects_dma_from_an_unassigned_device() {
+    let temp = tempfile::tempdir().expect("create VT-d test directory");
+    let disk_image = build_image(temp.path(), "qemu-vtd-test", Services::Console);
+    let serial_path = temp.path().join("serial.log");
+    let mut guest = start_guest_with_devices(
+        &disk_image,
+        &serial_path,
+        &[
+            "-machine",
+            "q35",
+            "-device",
+            "intel-iommu,caching-mode=on",
+            "-device",
+            "edu",
+        ],
+    );
+    let serial = wait_for_serial(
+        &mut guest.child,
+        &serial_path,
+        "rootsrv: press Space to test keyboard input",
+        Instant::now() + BOOT_TIMEOUT,
+    );
+    assert_markers(
+        &serial,
+        &[
+            "VT-d DMA translation enabled with an empty root table",
+            "VT-d rejected an unassigned EDU DMA request",
+            "rootsrv: PCI BAR mapped, delegated read-only, revoked and reclaimed",
+        ],
+    );
+    monitor(&mut guest.child, "quit");
+    assert!(guest.child.wait().expect("wait for VT-d guest").success());
+}
+
+#[test]
 fn test_user_fault_closes_ipc_and_keeps_the_other_process_running() {
     assert_console_shutdown_isolated(
         Services::FaultingConsole,

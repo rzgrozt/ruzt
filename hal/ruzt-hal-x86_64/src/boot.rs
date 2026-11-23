@@ -26,6 +26,10 @@ fn convert_kind(kind: bootloader_api::info::MemoryRegionKind) -> MemoryRegionKin
         BlKind::Usable => MemoryRegionKind::Usable,
         BlKind::Bootloader => MemoryRegionKind::BootloaderReclaimable,
         BlKind::UnknownUefi(tag) => MemoryRegionKind::Unknown(tag as u64),
+        BlKind::UnknownBios(2) => MemoryRegionKind::Reserved,
+        BlKind::UnknownBios(3) => MemoryRegionKind::AcpiReclaimable,
+        BlKind::UnknownBios(4) => MemoryRegionKind::AcpiNvs,
+        BlKind::UnknownBios(5) => MemoryRegionKind::BadMemory,
         BlKind::UnknownBios(tag) => MemoryRegionKind::Unknown(tag as u64),
         _ => MemoryRegionKind::Unknown(0),
     }

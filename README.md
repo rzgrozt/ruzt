@@ -20,6 +20,8 @@ The boot server can claim and delegate exclusive device IRQ capabilities for the
 
 The boot server can enumerate conventional PCI configuration space and claim firmware-programmed memory BARs on endpoint functions with bus mastering disabled. It can delegate individual page-aligned BAR ranges with read or write rights. Device mappings are uncached and non-executable, and revocation removes their page-table entries. The QEMU EDU guest checks a real PCI register read and write, read-only delegation, rollback on an occupied page, and reclamation after revocation.
 
+On supported x86-64 systems the kernel validates ACPI's DMA remapping table and starts a segment-zero Intel VT-d unit with an empty root table. Covered PCI requesters start without DMA access. The q35 test temporarily enables bus mastering for an isolated EDU fixture and requires a hardware fault that identifies both the unassigned requester and its DMA address.
+
 The root server receives an 8 MiB Untyped RAM budget at boot. Each process's image, user stack, heap, and private page tables draw from its address-space budget. `rootsrv` reserves 2 MiB for the console address space and delegates a separate 8 KiB region to the service for its scratch buffer. Copies of an Untyped capability draw from the same budget. A reserved region returns to its parent after the region cap and its last live allocation are gone.
 
 Each process has a self address-space capability for mapping zeroed anonymous pages at a chosen virtual address. These pages draw from its address-space budget and may be read-only or writable. Unmapping returns the pages to the budget. A failed range operation preserves existing mappings.

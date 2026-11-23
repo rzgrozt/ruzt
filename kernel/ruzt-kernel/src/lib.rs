@@ -14,6 +14,8 @@ extern crate alloc;
 extern crate std;
 
 mod boot_screen;
+mod acpi;
+mod iommu;
 mod irq;
 mod pci;
 pub mod serial;
@@ -78,6 +80,8 @@ pub fn main(boot_info: &'static mut BootInfo) -> ! {
     mm::heap::init();
     advance_screen();
 
+    iommu::init(boot_info);
+
     cap::object::init();
     serial_println!("cap object table initialised.");
     advance_screen();
@@ -124,6 +128,8 @@ pub fn main(boot_info: &'static mut BootInfo) -> ! {
     if let Some(image) = boot_info.initrd {
         let framebuffer = screen.map(boot_screen::BootScreen::hand_off).or(undrawn_framebuffer);
         pci::init(boot_info.memory_map, framebuffer.as_ref());
+        #[cfg(feature = "qemu-vtd-test")]
+        iommu::verify_unassigned_device();
         process::enqueue_initial(image, framebuffer);
     } else {
         assert!(!cfg!(feature = "qemu-rootsrv-test"), "rootsrv is missing from the boot image");

@@ -140,6 +140,23 @@ pub struct X86_64Mapper {
 }
 
 impl X86_64Mapper {
+    /// Return the direct-map virtual address if the entire physical range is mapped.
+    pub fn physmap_alias(&self, start: u64, bytes: u64) -> Option<VirtAddr> {
+        let page = PhysFrame::SIZE as u64;
+        let end = start.checked_add(bytes)?;
+        if bytes == 0 {
+            return None;
+        }
+        let offset = physical_memory_offset().as_u64();
+        for physical in (start & !(page - 1)..end).step_by(PhysFrame::SIZE) {
+            let alias = X64VirtAddr::try_new(offset.checked_add(physical)?).ok()?;
+            if self.inner.translate_addr(alias)?.as_u64() != physical {
+                return None;
+            }
+        }
+        Some(VirtAddr::new(offset.checked_add(start)?))
+    }
+
     /// Match the boot physmap's cache attributes to a device's user mappings.
     ///
     /// # Safety
