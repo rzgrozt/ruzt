@@ -19,6 +19,26 @@ pub static SERIAL1: Lazy<Mutex<SerialPort>> = Lazy::new(|| {
     Mutex::new(unsafe { SerialPort::new(COM1) })
 });
 
+struct Writer<'a>(&'a mut SerialPort);
+
+impl fmt::Write for Writer<'_> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        for byte in text.bytes() {
+            self.0.send(byte);
+        }
+        Ok(())
+    }
+}
+
+/// Write from a terminal fault handler even if the interrupted code held COM1.
+pub(crate) fn emergency_print(args: fmt::Arguments) {
+    #[allow(unsafe_code)]
+    // SAFETY: The only CPU has stopped the interrupted writer and will halt
+    // after diagnostics. COM1 was initialized before loading the IDT.
+    let mut port = unsafe { SerialPort::new(COM1) };
+    let _ = fmt::Write::write_fmt(&mut Writer(&mut port), args);
+}
+
 /// Prints to the serial console without a trailing newline.
 #[macro_export]
 macro_rules! serial_print {
@@ -42,15 +62,6 @@ macro_rules! serial_println {
 pub fn _print(args: fmt::Arguments) {
     interrupts::without_interrupts(|| {
         let mut serial = SERIAL1.lock();
-        struct Writer<'a>(&'a mut SerialPort);
-        impl<'a> fmt::Write for Writer<'a> {
-            fn write_str(&mut self, s: &str) -> fmt::Result {
-                for byte in s.bytes() {
-                    self.0.send(byte);
-                }
-                Ok(())
-            }
-        }
         let _ = fmt::Write::write_fmt(&mut Writer(&mut serial), args);
     });
 }

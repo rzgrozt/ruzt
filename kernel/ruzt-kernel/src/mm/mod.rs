@@ -1,5 +1,6 @@
 //! Memory management subsystem.
 
+pub(crate) mod exception_stack;
 pub mod frame;
 pub mod heap;
 

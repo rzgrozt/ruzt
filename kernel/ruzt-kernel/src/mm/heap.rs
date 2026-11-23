@@ -16,6 +16,7 @@ pub const HEAP_START: u64 = 0xFFFF_FF80_0000_0000;
 
 /// Size of the heap in bytes (4 MiB).
 const HEAP_SIZE: usize = 4 * 1024 * 1024;
+pub(super) const HEAP_END: u64 = HEAP_START + HEAP_SIZE as u64;
 
 /// Number of 4 KiB pages needed for the heap.
 const HEAP_PAGES: usize = HEAP_SIZE / 4096;

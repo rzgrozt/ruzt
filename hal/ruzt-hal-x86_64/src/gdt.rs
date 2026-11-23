@@ -27,6 +27,9 @@ pub const USER_CODE_SELECTOR: u64 = 0x1B;
 /// Ring-3 data-segment selector, including requested privilege level 3.
 pub const USER_DATA_SELECTOR: u64 = 0x23;
 
+/// Zero-based IST slot used for the double-fault stack.
+pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
+
 const _: () = assert!(RING3_TRAP_STACK_SIZE % 16 == 0);
 
 #[repr(align(16))]
@@ -97,17 +100,26 @@ unsafe fn build_gdt(tss: *const TaskStateSegment) -> GdtState {
 /// The GDT layout is fixed to kernel code/data, user code/data, then the
 /// two-entry TSS descriptor. The TSS starts with a dedicated 64 KiB stack,
 /// and the scheduler installs the active user thread's stack before entry.
+/// Double faults use a separate interrupt stack.
 ///
 /// # Safety
 ///
 /// Call this exactly once from CPL0 on the boot CPU with interrupts disabled,
 /// before loading the IDT or entering ring 3. The kernel image containing the
-/// GDT, TSS, and trap stack must remain mapped in every installed CR3. No other
-/// CPU may concurrently use this TSS or its trap stack.
-pub unsafe fn init() {
+/// GDT, TSS, and stacks must remain mapped supervisor-only in every installed
+/// CR3. `double_fault_top` must be the aligned top of a dedicated writable
+/// stack that no other handler or CPU uses.
+pub unsafe fn init(double_fault_top: u64) {
     INIT.call_once(|| {
         // SAFETY: The boot CPU owns this TSS and interrupts are disabled.
-        unsafe { set_trap_stack(RING3_TRAP_STACK.top().as_u64()) };
+        unsafe {
+            set_trap_stack(RING3_TRAP_STACK.top().as_u64());
+            let tss = TASK_STATE_SEGMENT.0.get();
+            core::ptr::addr_of_mut!((*tss).interrupt_stack_table)
+                .cast::<VirtAddr>()
+                .add(usize::from(DOUBLE_FAULT_IST_INDEX))
+                .write_unaligned(VirtAddr::new(double_fault_top));
+        }
         // SAFETY: The TSS lives at a fixed address for the kernel's lifetime.
         let gdt = GDT.call_once(|| unsafe { build_gdt(TASK_STATE_SEGMENT.0.get()) });
 

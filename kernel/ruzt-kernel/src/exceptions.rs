@@ -69,7 +69,8 @@ pub fn init_idt() {
         // typed handler. Only the syscall vector is callable from ring 3.
         unsafe {
             gate!(idt.breakpoint, breakpoint_entry);
-            gate!(idt.double_fault, double_fault_entry);
+            gate!(idt.double_fault, double_fault_entry)
+                .set_stack_index(ruzt_hal_x86_64::gdt::DOUBLE_FAULT_IST_INDEX);
             gate!(idt.page_fault, page_fault_entry);
             gate!(idt.divide_error, arithmetic_entry::<0>);
             gate!(idt.x87_floating_point, arithmetic_entry::<16>);
@@ -159,11 +160,58 @@ extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
 
 extern "x86-interrupt" fn double_fault_handler(
     stack_frame: InterruptStackFrame,
-    _error_code: u64,
+    error_code: u64,
 ) -> ! {
-    serial_println!("EXCEPTION: DOUBLE FAULT\n{:#?}", stack_frame);
+    crate::serial::emergency_print(format_args!(
+        "EXCEPTION: DOUBLE FAULT ({error_code:#x})\n{stack_frame:#?}\n"
+    ));
+    #[cfg(feature = "qemu-double-fault-test")]
+    {
+        use crate::mm::exception_stack::{BOTTOM, TOP};
+        let stack_pointer: u64;
+        #[allow(unsafe_code)]
+        // SAFETY: This only reads the live handler stack pointer.
+        unsafe {
+            core::arch::asm!(
+                "mov {}, rsp",
+                out(reg) stack_pointer,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        if (BOTTOM..TOP).contains(&stack_pointer)
+            && stack_frame.stack_pointer.as_u64() == TEST_FAULT_RSP
+            && error_code == 0
+            && crate::serial::SERIAL1.is_locked()
+        {
+            crate::serial::emergency_print(format_args!(
+                "double fault entered the emergency stack while the serial lock was held\n"
+            ));
+            ruzt_hal_x86_64::cpu::qemu_shutdown();
+        }
+    }
     loop {
         ruzt_hal_x86_64::cpu::X86_64Cpu::cpu_idle();
+    }
+}
+
+#[cfg(feature = "qemu-double-fault-test")]
+const TEST_FAULT_RSP: u64 = crate::mm::exception_stack::GUARD + 128;
+
+#[cfg(feature = "qemu-double-fault-test")]
+#[allow(unsafe_code)]
+pub(crate) fn trigger_double_fault() {
+    serial_println!("testing double fault with an unmapped stack");
+    let _serial = crate::serial::SERIAL1.lock();
+    // SAFETY: This test runs in a disposable guest. The read faults in the
+    // verified guard page, and exception delivery faults on that same page.
+    unsafe {
+        core::arch::asm!(
+            "mov rsp, {guard}",
+            "mov eax, [rsp]",
+            "ud2",
+            guard = in(reg) TEST_FAULT_RSP,
+            options(noreturn),
+        )
     }
 }
 

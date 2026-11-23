@@ -86,10 +86,12 @@ pub fn main(boot_info: &'static mut BootInfo) -> ! {
     serial_println!("cap object table initialised.");
     advance_screen();
 
+    mm::exception_stack::map();
     #[allow(unsafe_code)]
-    // SAFETY: Single boot CPU, before interrupts and IDT initialization.
+    // SAFETY: Both supervisor stacks are mapped for the single boot CPU
+    // before interrupts and IDT initialization.
     unsafe {
-        ruzt_hal_x86_64::gdt::init();
+        ruzt_hal_x86_64::gdt::init(mm::exception_stack::TOP);
         ruzt_hal_x86_64::context::init_fp();
     }
     serial_println!("GDT+TSS initialised.");
@@ -104,6 +106,8 @@ pub fn main(boot_info: &'static mut BootInfo) -> ! {
     serial_println!("x86 supervisor protection (SMEP={smep}, SMAP={smap})");
     #[cfg(feature = "qemu-hardening-test")]
     assert!(smep && smap, "the hardening fixture requires SMEP and SMAP");
+    #[cfg(feature = "qemu-double-fault-test")]
+    exceptions::trigger_double_fault();
     syscall::init();
     serial_println!("IDT loaded.");
 

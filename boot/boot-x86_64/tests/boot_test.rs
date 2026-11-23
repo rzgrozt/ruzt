@@ -37,6 +37,21 @@ fn test_kernel_boots_and_schedules_blocking_ipc() {
 }
 
 #[test]
+fn test_double_fault_uses_an_emergency_stack_even_with_serial_locked() {
+    let temp = tempfile::tempdir().expect("create double-fault test directory");
+    let disk = build_image(temp.path(), "qemu-double-fault-test", Services::None);
+    let serial = run_smoke_test(&disk);
+    assert_markers(
+        &serial,
+        &[
+            "testing double fault with an unmapped stack",
+            "EXCEPTION: DOUBLE FAULT (0x0)",
+            "double fault entered the emergency stack while the serial lock was held",
+        ],
+    );
+}
+
+#[test]
 fn test_uefi_boots_user_services_with_a_randomized_kernel() {
     let temp = tempfile::tempdir().expect("create UEFI test directory");
     let disk = build_firmware_image(

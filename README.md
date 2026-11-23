@@ -18,6 +18,8 @@ User tasks can read the monotonic clock, supply an absolute deadline to a capabi
 
 The x86-64 kernel enables SMEP and SMAP when the CPU advertises them. Syscalls copy through supervisor-only aliases after checking access on every user page. Interrupt and syscall entry clear the live AC and DF flags and preserve the interrupted task's flags for return. The QEMU preemption test exercises this path with both protections enabled.
 
+Double faults switch to a dedicated supervisor stack with an unmapped guard page. The handler writes directly to COM1 before halting. The QEMU fixture reaches it with an unmapped interrupted stack and the normal serial lock held.
+
 UEFI images built with `uefi-kaslr` randomize the kernel image and stack within the supervisor half. The physical-memory map and kernel heap occupy fixed, disjoint ranges. The UEFI test boots the same image twice and verifies different kernel addresses while exercising console IPC, the framebuffer, and keyboard input. BIOS images use the default kernel build because the pinned BIOS loader exhausts its early stack while initializing ASLR.
 
 The boot server can claim and delegate exclusive device IRQ capabilities for the legacy x86 PIC. A driver binds a claim, waits through the device SDK or IPC wait list, and acknowledges it after servicing the device. The line stays masked between delivery and acknowledgement. Revoking the binding capability or reaping its driver removes the binding. QEMU also exercises delegation, re-arming, and reclamation with a real COM1 interrupt in `consoled`.
