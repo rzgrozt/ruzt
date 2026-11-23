@@ -63,7 +63,22 @@ struct Controller {
     domains: Mutex<domain::Domains>,
 }
 
+impl Controller {
+    fn protects_requester(&self, address: PciAddress) -> bool {
+        address.bits() >> 8 == 0 && self.scope.covers(address) && self.unit.can_drain()
+    }
+}
+
 static CONTROLLER: Once<Controller> = Once::new();
+
+/// Whether an unassigned requester is covered by active default-deny DMA.
+pub(crate) fn permits_pci_handoff(address: PciAddress) -> bool {
+    // Successful translation enable drained pre-remapping requests on this
+    // unit. A function without a device lease has no live DMA context.
+    CONTROLLER
+        .get()
+        .is_some_and(|controller| controller.protects_requester(address))
+}
 
 pub(crate) fn init(boot: &BootInfo) {
     match start(boot) {

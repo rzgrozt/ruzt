@@ -65,11 +65,13 @@ pub(crate) fn probe(address: PciAddress) -> Result<Bars, ErrorCode> {
     if policy.framebuffer.is_some() && read_config(address, 8)? >> 16 == 0x0300 {
         return Err(ErrorCode::NotFound);
     }
+    let allow_handoff = crate::iommu::permits_pci_handoff(address);
     #[allow(unsafe_code)]
     // SAFETY: The object table granted exclusive probe access after checking
     // that the function has no live lease. No other CPU or driver uses config.
-    let mut bars =
-        unsafe { ruzt_hal_x86_64::pci::probe_bars(address.bits()) }.ok_or(ErrorCode::NotFound)?;
+    // The handoff flag requires a live remapper that denies this requester.
+    let mut bars = unsafe { ruzt_hal_x86_64::pci::probe_bars(address.bits(), allow_handoff) }
+        .ok_or(ErrorCode::NotFound)?;
     for bar in &mut bars {
         *bar = bar.filter(|bar| allowed(*bar, policy));
     }

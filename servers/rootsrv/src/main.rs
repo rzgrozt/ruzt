@@ -470,7 +470,31 @@ fn check_pci_mmio() -> Result<(), ErrorCode> {
         read_pci_config(ROOTSRV_UNTYPED, address, 0),
         Err(ErrorCode::InvalidCap)
     );
-    claim_pci_device(ROOTSRV_PCI_CONTROL, DEVICE, address)?;
+    let firmware_master = read_pci_config(ROOTSRV_PCI_CONTROL, address, 4)? & PCI_BUS_MASTER;
+    match claim_pci_device(ROOTSRV_PCI_CONTROL, DEVICE, address) {
+        Ok(()) => {
+            assert_eq!(
+                read_pci_config(ROOTSRV_PCI_CONTROL, address, 4)? & PCI_BUS_MASTER,
+                0
+            );
+            if firmware_master != 0 {
+                write_line("rootsrv: cleared firmware-enabled PCI bus mastering before delegation");
+            }
+        }
+        Err(ErrorCode::NotFound) if firmware_master != 0 => {
+            assert_eq!(
+                read_pci_config(ROOTSRV_PCI_CONTROL, address, 4)? & PCI_BUS_MASTER,
+                firmware_master
+            );
+            assert_eq!(
+                open_pci_bar(DEVICE, BAR, 0, 0, 1),
+                Err(ErrorCode::InvalidCap)
+            );
+            write_line("rootsrv: refused to delegate a firmware-enabled PCI bus master");
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    }
     assert_eq!(
         claim_pci_device(ROOTSRV_PCI_CONTROL, SPARE, address),
         Err(ErrorCode::SlotOccupied)
@@ -543,6 +567,8 @@ fn check_pci_mmio() -> Result<(), ErrorCode> {
     Ok(())
 }
 
+const PCI_BUS_MASTER: u32 = 1 << 2;
+
 fn check_pci_dma(device: u64, bar: u64, address: PciAddress) -> Result<(), ErrorCode> {
     use ruzt_driver_sdk::{
         allocate_dma_buffer, bind_dma, map_dma_buffer, read_pci_config, unmap_dma_buffer, DMA_WRITE,
@@ -552,7 +578,6 @@ fn check_pci_dma(device: u64, bar: u64, address: PciAddress) -> Result<(), Error
     const SPARE: u64 = 38;
     const BUFFER_BITS: u8 = 13;
     const WINDOW: u64 = 0x5400_0000;
-    const BUS_MASTER: u32 = 1 << 2;
     let shared = CapRights::READ.union(CapRights::WRITE);
 
     ruzt_ipc::split_untyped(ROOTSRV_UNTYPED, BUDGET, BUFFER_BITS)?;
@@ -590,8 +615,8 @@ fn check_pci_dma(device: u64, bar: u64, address: PciAddress) -> Result<(), Error
     let transferred = match response.label {
         console::DMA_CHECKED => {
             assert_eq!(
-                read_pci_config(ROOTSRV_PCI_CONTROL, address, 4)? & BUS_MASTER,
-                BUS_MASTER
+                read_pci_config(ROOTSRV_PCI_CONTROL, address, 4)? & PCI_BUS_MASTER,
+                PCI_BUS_MASTER
             );
             ruzt_ipc::revoke(BUFFER)?;
             let request = IpcMessage {
@@ -607,7 +632,7 @@ fn check_pci_dma(device: u64, bar: u64, address: PciAddress) -> Result<(), Error
         _ => return Err(ErrorCode::BadMessage),
     };
     assert_eq!(
-        read_pci_config(ROOTSRV_PCI_CONTROL, address, 4)? & BUS_MASTER,
+        read_pci_config(ROOTSRV_PCI_CONTROL, address, 4)? & PCI_BUS_MASTER,
         0
     );
     ruzt_ipc::delete(BUFFER)?;

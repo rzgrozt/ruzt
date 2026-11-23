@@ -71,24 +71,37 @@ pub unsafe fn set_bus_master(function: u16, enabled: bool) -> bool {
 
 /// Size assigned memory BARs while the endpoint's memory decode is disabled.
 ///
-/// Returns `None` for non-endpoint functions, functions with memory decode
-/// disabled, or functions that can currently bus-master. The function's BAR
-/// and command registers are restored before returning.
+/// If `allow_handoff` is true, an endpoint may arrive with bus mastering
+/// enabled by firmware. The probe clears it and verifies that both memory
+/// decode and bus mastering are off before writing any BARs. It restores
+/// the BARs and the other command bits before returning.
 ///
 /// # Safety
 /// Mechanism one must be present, configuration operations must be
 /// serialized, and no driver may be using this PCI function.
-pub unsafe fn probe_bars(function: u16) -> Option<[Option<MemoryBar>; BAR_COUNT]> {
+/// Allow a handoff only while a draining IOMMU denies DMA from the endpoint.
+pub unsafe fn probe_bars(
+    function: u16,
+    allow_handoff: bool,
+) -> Option<[Option<MemoryBar>; BAR_COUNT]> {
     // SAFETY: The caller serializes the entire probe including these reads.
     let read = |offset| unsafe { read_config(function, offset) };
     if read(0) as u16 == u16::MAX || (read(0x0c) >> 16) as u8 & 0x7f != 0 {
         return None;
     }
-    let command = read(COMMAND) as u16;
-    if command & (MEMORY_DECODE | BUS_MASTER) != MEMORY_DECODE {
+    let command = read(COMMAND);
+    if command == u32::MAX
+        || command as u16 & MEMORY_DECODE == 0
+        || (!allow_handoff && command as u16 & BUS_MASTER != 0)
+    {
         return None;
     }
+    let command = command as u16 & !BUS_MASTER;
     write_command(function, command & !MEMORY_DECODE);
+    if read(COMMAND) as u16 & (MEMORY_DECODE | BUS_MASTER) != 0 {
+        write_command(function, command);
+        return None;
+    }
     let mut bars = [None; BAR_COUNT];
     let mut index = 0;
     while index < BAR_COUNT {
@@ -114,7 +127,7 @@ pub unsafe fn probe_bars(function: u16) -> Option<[Option<MemoryBar>; BAR_COUNT]
         index += 1;
     }
     write_command(function, command);
-    Some(bars)
+    (read(COMMAND) as u16 & (MEMORY_DECODE | BUS_MASTER) == MEMORY_DECODE).then_some(bars)
 }
 
 fn decode_bar(base: u64, mask: u64) -> Option<MemoryBar> {

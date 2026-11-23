@@ -207,8 +207,7 @@ pub(crate) fn bind(
 ) -> Result<(), ErrorCode> {
     let controller = CONTROLLER.get().ok_or(ErrorCode::NotImplemented)?;
     let address = device.1.address;
-    if address.bits() >> 8 != 0 || !controller.scope.covers(address) || !controller.unit.can_drain()
-    {
+    if !controller.protects_requester(address) {
         return Err(ErrorCode::NotImplemented);
     }
     let mut domains = controller.domains.lock();

@@ -65,13 +65,15 @@ fn test_uefi_boots_user_services_with_a_randomized_kernel() {
         let [first, code_arg, second, vars_arg] =
             boot_x86_64::ovmf_drives(code, vars, &temp.path().join(format!("vars-{index}.fd")))
                 .expect("copy OVMF variables");
-        let mut guest = start_guest_with_devices(
-            &disk,
-            &serial_path,
-            &[
-                "-machine", "q35", "-cpu", "max", &first, &code_arg, &second, &vars_arg,
-            ],
-        );
+        let isolated = index == 0;
+        let mut devices = vec![
+            "-machine", "q35", "-cpu", "max", &first, &code_arg, &second, &vars_arg, "-device",
+            "edu",
+        ];
+        if isolated {
+            devices.extend(["-device", "intel-iommu,caching-mode=on"]);
+        }
+        let mut guest = start_guest_with_devices(&disk, &serial_path, &devices);
         let serial = wait_for_serial(
             &mut guest.child,
             &serial_path,
@@ -92,6 +94,22 @@ fn test_uefi_boots_user_services_with_a_randomized_kernel() {
             !serial.contains("VT-d DMA translation unavailable"),
             "{serial}"
         );
+        if isolated {
+            assert_markers(
+                &serial,
+                &[
+                    "VT-d DMA translation enabled with an empty root table",
+                    "rootsrv: cleared firmware-enabled PCI bus mastering before delegation",
+                    "rootsrv: delegated DMA round trip, revocation and reclamation verified",
+                    "rootsrv: PCI BAR mapped, delegated read-only, revoked and reclaimed",
+                ],
+            );
+        } else {
+            assert!(
+                serial.contains("rootsrv: refused to delegate a firmware-enabled PCI bus master"),
+                "{serial}"
+            );
+        }
         *address = breakpoint_address(&serial);
         monitor(&mut guest.child, "sendkey spc");
         wait_for_serial(
