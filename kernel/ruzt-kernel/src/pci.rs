@@ -124,6 +124,8 @@ fn allowed(bar: MemoryBar, policy: &Policy) -> bool {
         || bar.bytes == 0
         || bar.base % page != 0
         || bar.bytes % page != 0
+        || crate::apic::overlaps_mmio(bar.base, end)
+        || crate::iommu::overlaps_mmio(bar.base, end)
     {
         return false;
     }

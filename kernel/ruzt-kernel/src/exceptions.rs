@@ -4,6 +4,7 @@ use crate::serial_println;
 use ruzt_abi::{ProcessStatus, PROCESS_FAULTED};
 use ruzt_hal::cpu::CpuOps;
 use ruzt_hal::time::Timer;
+use ruzt_hal_x86_64::{apic::SPURIOUS_VECTOR, irq::VECTOR_BASE};
 use spin::Once;
 use x86_64::{
     registers::rflags::RFlags,
@@ -50,6 +51,7 @@ interrupt_entry!(arithmetic_entry<VECTOR: u32> => arithmetic_fault);
 interrupt_entry!(instruction_entry<VECTOR: u32> => instruction_fault);
 interrupt_entry!(protection_entry<VECTOR: u32> => protection_fault);
 interrupt_entry!(timer_entry => timer_handler);
+interrupt_entry!(spurious_entry => spurious_handler);
 interrupt_entry!(device_entry<LINE: u8> => device_irq);
 
 /// Initialises the global IDT with breakpoint, double-fault, page-fault, timer,
@@ -85,22 +87,12 @@ pub fn init_idt() {
             gate!(idt.stack_segment_fault, protection_entry::<12>);
             gate!(idt.general_protection_fault, protection_entry::<13>);
             gate!(idt.alignment_check, protection_entry::<17>);
-            gate!(idt[32], timer_entry);
-            gate!(idt[33], device_entry::<1>);
-            gate!(idt[34], device_entry::<2>);
-            gate!(idt[35], device_entry::<3>);
-            gate!(idt[36], device_entry::<4>);
-            gate!(idt[37], device_entry::<5>);
-            gate!(idt[38], device_entry::<6>);
-            gate!(idt[39], device_entry::<7>);
-            gate!(idt[40], device_entry::<8>);
-            gate!(idt[41], device_entry::<9>);
-            gate!(idt[42], device_entry::<10>);
-            gate!(idt[43], device_entry::<11>);
-            gate!(idt[44], device_entry::<12>);
-            gate!(idt[45], device_entry::<13>);
-            gate!(idt[46], device_entry::<14>);
-            gate!(idt[47], device_entry::<15>);
+            gate!(idt[VECTOR_BASE], timer_entry);
+            macro_rules! device_gates {
+                ($($line:literal),*) => { $(gate!(idt[VECTOR_BASE + $line], device_entry::<$line>);)* };
+            }
+            device_gates!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+            gate!(idt[SPURIOUS_VECTOR], spurious_entry);
             gate!(idt[0x80], syscall_handler).set_privilege_level(x86_64::PrivilegeLevel::Ring3);
         }
         idt
@@ -270,7 +262,7 @@ extern "x86-interrupt" fn timer_handler(stack_frame: InterruptStackFrame) {
             ruzt_hal_x86_64::time::X86_64Timer::now_monotonic_ns()
         );
     });
-    ruzt_hal_x86_64::pic::send_eoi(0);
+    crate::irq::end_of_interrupt(0);
     // Kernel execution can hold locks and schedules at its own safe points.
     if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
         crate::sched::yield_thread();
@@ -282,4 +274,8 @@ extern "x86-interrupt" fn timer_handler(stack_frame: InterruptStackFrame) {
 #[allow(unsafe_code)]
 extern "x86-interrupt" fn device_irq<const LINE: u8>(_stack_frame: InterruptStackFrame) {
     crate::irq::on_interrupt(LINE);
+}
+
+extern "x86-interrupt" fn spurious_handler(_stack_frame: InterruptStackFrame) {
+    // The local APIC does not put its spurious vector in service.
 }

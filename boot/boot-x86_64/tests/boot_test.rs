@@ -21,13 +21,14 @@ fn qemu_slot() -> MutexGuard<'static, ()> {
 fn test_kernel_boots_and_schedules_blocking_ipc() {
     let temp = tempfile::tempdir().expect("Failed to create boot test directory");
     let disk_image = build_image(temp.path(), "qemu-smoke-test", Services::None);
-    let serial = run_smoke_test(&disk_image);
+    let serial = run_smoke_test(&disk_image, &["-no-acpi"]);
     assert_markers(
         &serial,
         &[
             "Ruzt booting...",
             "EXCEPTION: BREAKPOINT",
             "Breakpoint returned cleanly.",
+            "8259 PIC interrupt routing enabled",
             "thread A ticking",
             "thread B ticking",
             "ipc_test_receiver: got message: Hello, IPC!",
@@ -40,7 +41,7 @@ fn test_kernel_boots_and_schedules_blocking_ipc() {
 fn test_double_fault_uses_an_emergency_stack_even_with_serial_locked() {
     let temp = tempfile::tempdir().expect("create double-fault test directory");
     let disk = build_image(temp.path(), "qemu-double-fault-test", Services::None);
-    let serial = run_smoke_test(&disk);
+    let serial = run_smoke_test(&disk, &[]);
     assert_markers(
         &serial,
         &[
@@ -100,6 +101,7 @@ fn test_uefi_boots_user_services_with_a_randomized_kernel() {
             &[
                 "x86 supervisor protection (SMEP=true, SMAP=true)",
                 "Breakpoint returned cleanly.",
+                "Local APIC and I/O APIC interrupt routing enabled",
                 "rootsrv: console write acknowledged over IPC",
                 "rootsrv: framebuffer tile drawn",
             ],
@@ -194,6 +196,7 @@ fn test_rootsrv_updates_the_framebuffer_from_keyboard_input() {
         &serial,
         &[
             "Breakpoint returned cleanly.",
+            "Local APIC and I/O APIC interrupt routing enabled",
             "rootsrv process created, entering user mode...",
             "rootsrv: delegated UART IRQ delivered, re-armed and reclaimed",
             "rootsrv: PCI BAR mapped, delegated read-only, revoked and reclaimed",
@@ -246,6 +249,7 @@ fn test_timer_preempts_cpu_bound_user_code() {
         &serial,
         &[
             "x86 supervisor protection (SMEP=true, SMAP=true)",
+            "Local APIC and I/O APIC interrupt routing enabled",
             "consoled: syscall preserved user AC and DF",
             "kernel: timer entry cleared user AC",
         ],
@@ -447,7 +451,7 @@ fn build_firmware_image(
     disk_image
 }
 
-fn run_smoke_test(disk_image: &Path) -> String {
+fn run_smoke_test(disk_image: &Path, options: &[&str]) -> String {
     let _slot = qemu_slot();
     let output = Command::new("timeout")
         .arg(BOOT_TIMEOUT.as_secs().to_string())
@@ -462,6 +466,7 @@ fn run_smoke_test(disk_image: &Path) -> String {
             "-device",
             "isa-debug-exit,iobase=0xf4,iosize=0x04",
         ])
+        .args(options)
         .output()
         .expect("Failed to run QEMU");
 

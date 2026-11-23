@@ -30,6 +30,7 @@ fn convert_kind(kind: bootloader_api::info::MemoryRegionKind) -> MemoryRegionKin
         BlKind::UnknownUefi(8) => MemoryRegionKind::BadMemory,
         BlKind::UnknownUefi(9) => MemoryRegionKind::AcpiReclaimable,
         BlKind::UnknownUefi(10) => MemoryRegionKind::AcpiNvs,
+        BlKind::UnknownUefi(11) => MemoryRegionKind::Mmio,
         BlKind::UnknownUefi(tag) => MemoryRegionKind::Unknown(tag as u64),
         BlKind::UnknownBios(2) => MemoryRegionKind::Reserved,
         BlKind::UnknownBios(3) => MemoryRegionKind::AcpiReclaimable,

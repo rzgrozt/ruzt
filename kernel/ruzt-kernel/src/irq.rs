@@ -1,11 +1,8 @@
 //! Capability-owned device interrupt routes on the boot CPU.
 
 use ruzt_abi::ErrorCode;
-#[cfg(not(test))]
 use ruzt_hal::irq::{IrqController, IrqNumber};
-#[cfg(not(test))]
-use ruzt_hal_x86_64::irq::X86_64IrqController;
-use ruzt_hal_x86_64::pic::IRQ_COUNT;
+use ruzt_hal_x86_64::irq::{self as hardware, X86_64IrqController, IRQ_COUNT};
 use spin::Mutex;
 
 use crate::cap::cspace::CapabilityPath;
@@ -158,7 +155,7 @@ fn latch(line: u32) -> Option<ThreadId> {
 }
 
 pub(crate) fn on_interrupt(line: u8) {
-    if ruzt_hal_x86_64::pic::dismiss_spurious(line) {
+    if hardware::dismiss_spurious(line) {
         return;
     }
     if let Some(thread) = latch(u32::from(line)) {
@@ -172,7 +169,11 @@ pub(crate) fn on_interrupt(line: u8) {
         // Unclaimed lines stay masked, including stray interrupts.
         disable(u32::from(line));
     }
-    ruzt_hal_x86_64::pic::send_eoi(line);
+    end_of_interrupt(line);
+}
+
+pub(crate) fn end_of_interrupt(line: u8) {
+    X86_64IrqController::end_of_interrupt(IrqNumber(u32::from(line)));
 }
 
 #[cfg(test)]

@@ -15,6 +15,7 @@ extern crate std;
 
 mod boot_screen;
 mod acpi;
+mod apic;
 mod iommu;
 mod irq;
 mod pci;
@@ -118,15 +119,10 @@ pub fn main(boot_info: &'static mut BootInfo) -> ! {
 
     mm::heap::smoke_test();
 
-    #[allow(unsafe_code)]
-    // Safety: Called exactly once during early boot, before interrupts enabled.
-    unsafe {
-        ruzt_hal_x86_64::pic::init();
-    }
-    serial_println!("PIC initialised.");
+    apic::init(boot_info);
 
     #[allow(unsafe_code)]
-    // Safety: Called exactly once after PIC init, before interrupts enabled.
+    // Safety: Called once after IRQ routing is ready, before enabling interrupts.
     unsafe {
         ruzt_hal_x86_64::timer::init();
     }

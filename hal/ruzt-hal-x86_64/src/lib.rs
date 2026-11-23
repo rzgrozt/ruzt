@@ -38,6 +38,7 @@
 //! let _: unsafe fn(PhysFrame, usize, &[u8]) -> Result<(), MapError> = mapper::copy_to_frame;
 //! ```
 
+pub mod apic;
 pub mod boot;
 pub mod console;
 pub mod context;

@@ -57,6 +57,7 @@ enum Error {
 
 struct Controller {
     unit: vtd::Unit,
+    mmio: u64,
     root: PhysFrame,
     scope: Scope,
     host_bits: u8,
@@ -70,6 +71,12 @@ impl Controller {
 }
 
 static CONTROLLER: Once<Controller> = Once::new();
+
+pub(crate) fn overlaps_mmio(start: u64, end: u64) -> bool {
+    CONTROLLER.get().is_some_and(|controller| {
+        start < controller.mmio + PhysFrame::SIZE as u64 && controller.mmio < end
+    })
+}
 
 /// Whether an unassigned requester is covered by active default-deny DMA.
 pub(crate) fn permits_pci_handoff(address: PciAddress) -> bool {
@@ -117,7 +124,7 @@ fn start(boot: &BootInfo) -> Result<Option<Controller>, Error> {
     if boot.memory_map.iter().any(|region| {
         remapper.base < region.end.as_u64()
             && region.start.as_u64() < end
-            && region.kind != MemoryRegionKind::Reserved
+            && !matches!(region.kind, MemoryRegionKind::Reserved | MemoryRegionKind::Mmio)
     }) {
         return Err(Error::BadRegisters);
     }
@@ -155,6 +162,7 @@ fn start(boot: &BootInfo) -> Result<Option<Controller>, Error> {
     unsafe { unit.enable(root) }.map_err(Error::Hardware)?;
     Ok(Some(Controller {
         unit,
+        mmio: remapper.base,
         root,
         scope: remapper.scope,
         host_bits: remapper.host_bits,

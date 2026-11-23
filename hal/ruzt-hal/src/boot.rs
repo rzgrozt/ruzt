@@ -47,6 +47,8 @@ pub enum MemoryRegionKind {
     Usable,
     /// Reserved by firmware or hardware; must not be used.
     Reserved,
+    /// A firmware-described memory-mapped I/O aperture.
+    Mmio,
     /// ACPI reclaimable memory (usable after ACPI tables are parsed).
     AcpiReclaimable,
     /// ACPI non-volatile storage (must be preserved).

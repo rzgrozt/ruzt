@@ -183,7 +183,7 @@ pub(crate) fn allocate_program(
 }
 
 pub(super) fn allocate_irq(irq_num: u32) -> Result<KObjectId, ErrorCode> {
-    if !ruzt_hal_x86_64::pic::is_device_irq(irq_num) {
+    if !ruzt_hal_x86_64::irq::is_device_irq(irq_num) {
         return Err(ErrorCode::BadMessage);
     }
     let mut table = TABLE.lock();

@@ -11,12 +11,14 @@ const ICW1_INIT: u8 = 0x11;
 const ICW4_8086: u8 = 0x01;
 const CASCADE: u8 = 2;
 
-/// Number of lines across the two cascaded PICs.
-pub const IRQ_COUNT: usize = 16;
+use crate::irq::IRQ_COUNT;
 
-/// Whether a line can be delegated to a user device driver.
-pub const fn is_device_irq(line: u32) -> bool {
-    line > 0 && line < IRQ_COUNT as u32 && line != CASCADE as u32
+pub(crate) fn mask_all() {
+    // SAFETY: The kernel owns both PICs and is switching to APIC mode.
+    unsafe {
+        PortWriteOnly::new(MASTER_DATA).write(u8::MAX);
+        PortWriteOnly::new(SLAVE_DATA).write(u8::MAX);
+    }
 }
 
 /// Remap the PIC so IRQ0–7 map to vectors 32–39 and IRQ8–15 map to vectors 40–47,

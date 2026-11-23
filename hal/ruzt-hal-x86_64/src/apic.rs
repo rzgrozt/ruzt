@@ -1,0 +1,217 @@
+//! Local and I/O APIC register access on the boot CPU.
+
+use ruzt_hal::mem::VirtAddr;
+use x86_64::registers::model_specific::Msr;
+
+const APIC_BASE_MSR: u32 = 0x1b;
+const GLOBAL_ENABLE: u64 = 1 << 11;
+const X2APIC_MODE: u64 = 1 << 10;
+const APIC_ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
+const VERSION: usize = 0x30;
+const LVT_MASK: u32 = 1 << 16;
+const REDIRECTION_START: u8 = 0x10;
+const REDIRECTION_MASK: u32 = 1 << 16;
+
+/// Vector used for LAPIC spurious delivery. This vector needs no EOI.
+pub const SPURIOUS_VECTOR: u8 = 0xff;
+
+/// The boot CPU's local interrupt controller.
+pub struct LocalApic {
+    registers: LocalRegisters,
+    id: u8,
+    max_lvt: u32,
+}
+
+enum LocalRegisters {
+    Xapic(u64),
+    X2apic,
+}
+
+impl LocalRegisters {
+    fn read(&self, offset: usize) -> u32 {
+        match *self {
+            // SAFETY: Construction requires the live uncached LAPIC page.
+            Self::Xapic(base) => unsafe {
+                ((base as usize + offset) as *const u32).read_volatile()
+            },
+            // SAFETY: x2APIC mode was checked and these MSRs are readable.
+            Self::X2apic => unsafe { Msr::new(0x800 + (offset / 16) as u32).read() as u32 },
+        }
+    }
+
+    fn write(&self, offset: usize, value: u32) {
+        match *self {
+            // SAFETY: The register is aligned, writable and belongs to this CPU.
+            Self::Xapic(base) => unsafe {
+                ((base as usize + offset) as *mut u32).write_volatile(value);
+            },
+            // SAFETY: x2APIC mode was checked and these MSRs are writable.
+            Self::X2apic => unsafe {
+                Msr::new(0x800 + (offset / 16) as u32).write(u64::from(value))
+            },
+        }
+    }
+}
+
+impl LocalApic {
+    /// Report the enabled local APIC's physical base and whether it uses MSRs.
+    pub fn location() -> Option<(u64, bool)> {
+        let features = core::arch::x86_64::__cpuid(1);
+        if features.edx & (1 << 9) == 0 {
+            return None;
+        }
+        // SAFETY: CPUID reports a local APIC. This runs on the boot CPU in ring 0.
+        let base = unsafe { Msr::new(APIC_BASE_MSR).read() };
+        (base & GLOBAL_ENABLE != 0).then_some((base & APIC_ADDRESS_MASK, base & X2APIC_MODE != 0))
+    }
+
+    /// Inspect the boot processor's active local APIC.
+    ///
+    /// # Safety
+    /// Call on the boot CPU with interrupts disabled. Use a live, uncached
+    /// alias of the xAPIC register page, or `None` in active x2APIC mode.
+    pub unsafe fn inspect(alias: Option<VirtAddr>) -> Option<Self> {
+        let registers = match alias {
+            Some(alias) => LocalRegisters::Xapic(alias.as_u64()),
+            None => LocalRegisters::X2apic,
+        };
+        let version = registers.read(VERSION);
+        let id = match registers {
+            LocalRegisters::Xapic(_) => registers.read(0x20) >> 24,
+            LocalRegisters::X2apic => registers.read(0x20),
+        };
+        let max_lvt = (version >> 16) & 0xff;
+        if !(0x10..0xff).contains(&(version as u8)) || max_lvt < 3 || id >= 0xff {
+            return None;
+        }
+        Some(Self {
+            registers,
+            id: id as u8,
+            max_lvt,
+        })
+    }
+
+    pub(crate) fn enable(&self) {
+        // Leave the local timer and LINT inputs masked. The PIT will arrive
+        // through the I/O APIC, with no second delivery from the 8259 PIC.
+        for (index, register) in [0x320, 0x350, 0x360, 0x370, 0x340, 0x330, 0x2f0]
+            .into_iter()
+            .enumerate()
+        {
+            if index as u32 <= self.max_lvt {
+                self.registers.write(register, LVT_MASK);
+            }
+        }
+        self.registers.write(0x80, 0);
+        // EOI broadcast stays enabled for level-triggered I/O APIC lines.
+        self.registers
+            .write(0xf0, (1 << 8) | u32::from(SPURIOUS_VECTOR));
+    }
+
+    /// Physical destination ID usable by a legacy I/O APIC.
+    pub fn id(&self) -> u8 {
+        self.id
+    }
+
+    pub(crate) fn end_of_interrupt(&self) {
+        self.registers.write(0xb0, 0);
+    }
+}
+
+/// An I/O APIC register window and its hardware-reported pin count.
+#[derive(Clone, Copy)]
+pub struct IoApic {
+    registers: u64,
+    pins: u8,
+}
+
+impl IoApic {
+    /// Inspect an I/O APIC and verify the firmware-reported identity.
+    ///
+    /// # Safety
+    /// The alias must cover the live uncached page for this I/O APIC. The
+    /// caller owns and serializes the selector/data register pair.
+    pub unsafe fn inspect(alias: VirtAddr, id: u8) -> Option<Self> {
+        let mut unit = Self {
+            registers: alias.as_u64(),
+            pins: 0,
+        };
+        let version = unit.read(1);
+        let max_pin = ((version >> 16) & 0xff) as u8;
+        if !matches!(version as u8, 0x11..=0xfe)
+            || max_pin >= 120
+            || (unit.read(0) >> 24) as u8 != id
+        {
+            return None;
+        }
+        unit.pins = max_pin + 1;
+        Some(unit)
+    }
+
+    /// Count of implemented redirection entries.
+    pub fn pin_count(self) -> u8 {
+        self.pins
+    }
+
+    fn select(self, index: u8) {
+        // SAFETY: Construction requires a live uncached IOREGSEL page.
+        unsafe { (self.registers as *mut u32).write_volatile(u32::from(index)) };
+    }
+
+    fn read(self, index: u8) -> u32 {
+        self.select(index);
+        // SAFETY: The selector names a register and accesses are serialized.
+        unsafe { ((self.registers + 0x10) as *const u32).read_volatile() }
+    }
+
+    fn write(self, index: u8, value: u32) {
+        self.select(index);
+        // SAFETY: The selector names a writable redirection register.
+        unsafe { ((self.registers + 0x10) as *mut u32).write_volatile(value) };
+    }
+
+    pub(crate) fn mask_all(self) {
+        for pin in 0..self.pins {
+            let index = REDIRECTION_START + 2 * pin;
+            self.write(index, self.read(index) | REDIRECTION_MASK);
+        }
+    }
+
+    /// Resolve one firmware-described hardware input to a kernel route.
+    pub fn input(self, pin: u8, low: bool, level: bool) -> Option<Input> {
+        (pin < self.pins).then(|| Input {
+            unit: self,
+            register: REDIRECTION_START + 2 * pin,
+            flags: (u32::from(low) << 13) | (u32::from(level) << 15),
+        })
+    }
+}
+
+/// A physical I/O APIC input and its firmware-specified signal mode.
+#[derive(Clone, Copy)]
+pub struct Input {
+    unit: IoApic,
+    register: u8,
+    flags: u32,
+}
+
+impl Input {
+    pub(crate) fn configure(self, vector: u8, destination: u8) {
+        self.unit
+            .write(self.register + 1, u32::from(destination) << 24);
+        self.unit.write(
+            self.register,
+            REDIRECTION_MASK | self.flags | u32::from(vector),
+        );
+    }
+
+    pub(crate) fn set_enabled(self, enabled: bool) {
+        let old = self.unit.read(self.register);
+        let new = if enabled {
+            old & !REDIRECTION_MASK
+        } else {
+            old | REDIRECTION_MASK
+        };
+        self.unit.write(self.register, new);
+    }
+}

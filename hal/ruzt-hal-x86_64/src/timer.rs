@@ -19,7 +19,7 @@ const DIVISOR: u16 = 11_932;
 /// Configure PIT channel 0 for ~10 ms ticks in rate-generator mode.
 ///
 /// # Safety
-/// Must be called exactly once after PIC initialisation and before
+/// Must be called exactly once after IRQ routing is initialized and before
 /// interrupts are enabled.
 pub unsafe fn init() {
     // SAFETY: I/O ports 0x43 and 0x40 are the 8253/8254 PIT command and
