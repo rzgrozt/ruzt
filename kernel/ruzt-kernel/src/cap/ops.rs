@@ -40,7 +40,7 @@ pub enum CapOp {
         dest_cptr: u64,
         /// Wire tag for the kind of object to create.
         kind: u64,
-        /// Size exponent for an Untyped child.
+        /// Byte-size exponent for Untyped or slot-count exponent for CNode.
         size_bits: u64,
     },
     /// Revoke the derived capabilities of the invoked slot.
@@ -109,8 +109,7 @@ pub fn cap_mint(
     new_rights: CapRights,
     badge: u64,
 ) -> Result<(), ErrorCode> {
-    let source = cspace.capability_id(src_cptr)?;
-    cspace.derive(source, dest_cptr, new_rights, badge)
+    cspace.mint(src_cptr, dest_cptr, new_rights, badge)
 }
 
 /// Move a capability to an empty slot.

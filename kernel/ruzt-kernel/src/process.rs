@@ -159,7 +159,7 @@ pub(crate) fn spawn_program(
     .ok_or(ErrorCode::InvalidCap)??;
 
     let mut child_space = CSpace::try_new(4)?;
-    child_space.accept_grants(0, &packet.grants[..count])?;
+    child_space.accept_grants(0, None, &packet.grants[..count])?;
     let mut child = load(name, image, child_space, None, budget)?;
     child.exit_channels = channels;
     let (process, publisher) = ProcessExitPublisher::new()?;

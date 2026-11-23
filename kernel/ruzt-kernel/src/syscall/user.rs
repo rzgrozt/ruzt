@@ -101,9 +101,18 @@ pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
             if capacity > IPC_CAP_SLOTS {
                 return Err(ErrorCode::BadMessage);
             }
+            // Revalidate at delivery so a concurrent edit cannot redirect
+            // incoming grants to a different table while this thread waits.
+            let cnode = if capacity > 0 && args.arg3 > u64::from(u8::MAX) {
+                sched::with_current_user(|user| user.cspace.receive_cnode(args.arg3))
+                    .ok_or(ErrorCode::InvalidCap)??
+            } else {
+                None
+            };
             let slots = ipc::ReceiveSlots {
                 first: args.arg3,
                 capacity,
+                cnode,
             };
             let message = ipc::receive_packet(id, authority, slots)?;
             write_message(root, args.arg2, &message)

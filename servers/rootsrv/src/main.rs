@@ -388,6 +388,7 @@ fn verify_program_budget_reclaimed() {
 
 fn main() -> ! {
     run_console();
+    check_cspace();
     check_anonymous_memory();
     check_heap_growth();
 
@@ -428,6 +429,55 @@ fn main() -> ! {
             write_line("rootsrv: Space key received");
         }
     }
+}
+
+fn check_cspace() {
+    use ruzt_abi::cptr_path;
+
+    const BUDGET: u64 = 24;
+    const TABLE: u8 = 25;
+    const READER: u8 = 26;
+    const COPY: u64 = 27;
+    let table = u64::from(TABLE);
+    let reader = u64::from(READER);
+    let inner = cptr_path(&[TABLE, 0]).unwrap();
+    let notification = cptr_path(&[TABLE, 0, 1]).unwrap();
+    let read_path = cptr_path(&[READER, 0, 1]).unwrap();
+
+    ruzt_ipc::split_untyped(ROOTSRV_UNTYPED, BUDGET, 13).expect("reserve two CNode pages");
+    ruzt_ipc::create_cnode(BUDGET, table, 1).expect("create outer table");
+    ruzt_ipc::create_cnode(BUDGET, inner, 1).expect("create nested table");
+    assert_eq!(
+        ruzt_ipc::retype(BUDGET, notification, RetypeKind::Notification),
+        Err(ErrorCode::NoMemory)
+    );
+    ruzt_ipc::retype(ROOTSRV_UNTYPED, notification, RetypeKind::Notification)
+        .expect("place notification in the nested table");
+    ruzt_ipc::mint(table, reader, CapRights::READ, 0).expect("make a read-only view");
+    assert_eq!(
+        ruzt_ipc::delete(read_path),
+        Err(ErrorCode::CapRightsViolation)
+    );
+    ruzt_ipc::signal(notification).expect("signal through a nested path");
+    ruzt_ipc::wait(read_path).expect("wait through the read-only path");
+    assert_eq!(
+        ruzt_ipc::move_cap(table, cptr_path(&[TABLE, 1]).unwrap()),
+        Err(ErrorCode::BadMessage)
+    );
+    ruzt_ipc::mint(notification, COPY, CapRights::WRITE, 0).expect("mint from nested slot");
+    ruzt_ipc::revoke(notification).expect("revoke through a nested path");
+    assert_eq!(ruzt_ipc::signal(COPY), Err(ErrorCode::InvalidCap));
+
+    ruzt_ipc::revoke(BUDGET).expect("reclaim both CNodes and their slots");
+    assert_eq!(ruzt_ipc::signal(notification), Err(ErrorCode::InvalidCap));
+    assert_eq!(ruzt_ipc::signal(read_path), Err(ErrorCode::InvalidCap));
+    for slot in [table, reader] {
+        ruzt_ipc::retype(BUDGET, slot, RetypeKind::Endpoint).expect("reuse reclaimed CNode page");
+        // Keep the first page reserved until both allocations have succeeded.
+    }
+    ruzt_ipc::revoke(BUDGET).expect("release test endpoints");
+    ruzt_ipc::delete(BUDGET).expect("release the CNode budget");
+    write_line("rootsrv: nested capability lookup, revocation and budgets verified");
 }
 
 fn check_heap_growth() {

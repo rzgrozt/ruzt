@@ -55,6 +55,49 @@ pub const USER_HEAP_LIMIT: u64 = USER_HEAP_START + 16 * 1024 * 1024;
 /// Byte length of a frame supported by the user mapping ABI.
 pub const FRAME_BYTES: usize = 4096;
 
+/// Largest supported radix of a retyped capability table.
+pub const MAX_CNODE_RADIX: u8 = 8;
+
+const MAX_CPTR_DEPTH: usize = 7;
+const CPTR_DEPTH_TAG: u8 = 0x80;
+
+/// Encode a path from the caller's root capability table to a slot.
+///
+/// A single index uses its original root-slot number. Multi-level paths
+/// contain two to seven indices, with the root index first and the leaf
+/// index in the low byte. The high byte is 0x80 plus the number of indices.
+pub fn cptr_path(indices: &[u8]) -> Result<u64, ErrorCode> {
+    let depth = indices.len();
+    if !(1..=MAX_CPTR_DEPTH).contains(&depth) {
+        return Err(ErrorCode::InvalidCap);
+    }
+    let path = indices
+        .iter()
+        .fold(0u64, |path, &index| (path << 8) | u64::from(index));
+    if depth == 1 {
+        Ok(path)
+    } else {
+        Ok(u64::from(CPTR_DEPTH_TAG | depth as u8) << 56 | path)
+    }
+}
+
+/// Validate a slot pointer's encoding and return its number of indices.
+pub fn cptr_depth(cptr: u64) -> Result<usize, ErrorCode> {
+    if cptr <= u64::from(u8::MAX) {
+        return Ok(1);
+    }
+    let tag = (cptr >> 56) as u8;
+    let depth = usize::from(tag & !CPTR_DEPTH_TAG);
+    if tag & CPTR_DEPTH_TAG == 0 || !(2..=MAX_CPTR_DEPTH).contains(&depth) {
+        return Err(ErrorCode::InvalidCap);
+    }
+    let payload = cptr & ((1u64 << 56) - 1);
+    if payload >> (depth * 8) != 0 {
+        return Err(ErrorCode::InvalidCap);
+    }
+    Ok(depth)
+}
+
 /// Boot console service protocol and capability slots.
 pub mod console {
     /// Receive requests from the initial process.
@@ -130,6 +173,7 @@ pub enum CapOp {
     Send = 0,
     /// Receive an IPC message through an endpoint. For capability transfer,
     /// `arg3` is the first receiving slot and `arg4` is the slot capacity.
+    /// Grants in one message must fit in the same capability table.
     /// The output buffer must be in a non-revocable mapping.
     Recv = 1,
     /// Signal a notification object.
@@ -140,7 +184,8 @@ pub enum CapOp {
     Delete = 4,
     /// Create a child object from an Untyped capability. `arg2` is the
     /// empty destination slot and `arg3` is a [`RetypeKind`]. For an Untyped
-    /// child, `arg4` is the base-two exponent of its size in bytes.
+    /// child, `arg4` is the base-two exponent of its size in bytes. For a
+    /// CNode, `arg4` is the base-two exponent of the number of slots.
     Retype = 5,
     /// Mint a derived capability.
     Mint = 6,
@@ -210,6 +255,8 @@ pub enum RetypeKind {
     Notification = 2,
     /// A smaller, naturally aligned Untyped RAM region.
     Untyped = 3,
+    /// A capability table with up to 256 slots.
+    CNode = 4,
 }
 
 impl TryFrom<u64> for RetypeKind {
@@ -221,6 +268,7 @@ impl TryFrom<u64> for RetypeKind {
             1 => Ok(Self::Endpoint),
             2 => Ok(Self::Notification),
             3 => Ok(Self::Untyped),
+            4 => Ok(Self::CNode),
             _ => Err(ErrorCode::BadMessage),
         }
     }
@@ -529,7 +577,24 @@ mod tests {
         assert_eq!(RetypeKind::try_from(1), Ok(RetypeKind::Endpoint));
         assert_eq!(RetypeKind::try_from(2), Ok(RetypeKind::Notification));
         assert_eq!(RetypeKind::try_from(3), Ok(RetypeKind::Untyped));
-        assert_eq!(RetypeKind::try_from(4), Err(ErrorCode::BadMessage));
+        assert_eq!(RetypeKind::try_from(4), Ok(RetypeKind::CNode));
+        assert_eq!(RetypeKind::try_from(5), Err(ErrorCode::BadMessage));
+    }
+
+    #[test]
+    fn cptr_paths_preserve_root_slots_and_reject_noncanonical_encodings() {
+        assert_eq!(cptr_path(&[200]), Ok(200));
+        let path = cptr_path(&[0, 23, 255]).unwrap();
+        assert_eq!(path, 0x8300_0000_0000_17ff);
+        assert_eq!(cptr_depth(path), Ok(3));
+        assert_eq!(cptr_depth(path | (1 << 24)), Err(ErrorCode::InvalidCap));
+        assert_eq!(
+            cptr_depth(0x8100_0000_0000_0001),
+            Err(ErrorCode::InvalidCap)
+        );
+        assert_eq!(cptr_path(&[255; 7]).and_then(cptr_depth), Ok(7));
+        assert_eq!(cptr_path(&[0; 8]), Err(ErrorCode::InvalidCap));
+        assert_eq!(cptr_path(&[]), Err(ErrorCode::InvalidCap));
     }
 
     #[test]

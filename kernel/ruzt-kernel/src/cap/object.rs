@@ -1,10 +1,7 @@
 //! Kernel object table — every capability references a stable entry here.
 
-use alloc::vec::Vec;
-use ruzt_abi::{ErrorCode, ProcessStatus, RetypeKind};
-use ruzt_cap::{
-    AddressSpaceId, CapType, EndpointId, FrameSize, NotificationId, ProcessId, NULL_SLOT,
-};
+use ruzt_abi::{ErrorCode, ProcessStatus, RetypeKind, MAX_CNODE_RADIX};
+use ruzt_cap::{AddressSpaceId, CapType, EndpointId, FrameSize, NotificationId, ProcessId};
 use ruzt_hal::mem::{PhysAddr, PhysFrame};
 use ruzt_hal_x86_64::mapper::{self, UserPageFrames};
 use spin::Mutex;
@@ -13,22 +10,17 @@ use super::region::FreePages;
 use crate::mm::frame;
 
 /// Maximum number of kernel objects in the table.
-const MAX_OBJECTS: usize = 256;
+pub(super) const MAX_OBJECTS: usize = 256;
 const _: () = assert!(MAX_OBJECTS.is_power_of_two());
 
 /// Opaque handle for a kernel object entry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(transparent)]
 pub struct KObjectId(pub u64);
 
 /// A kernel object stored in the global table.
 ///
 /// All variants are `Copy` so the table can be initialised with `[None; N]`.
-///
-/// # Safety
-/// `Sync` is implemented manually because the enum contains a raw pointer
-/// (`*mut CapSlot`). All access to the table is gated by `spin::Mutex`, so
-/// the pointer is never shared across threads unsafely.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KernelObject {
     /// Empty slot.
@@ -70,14 +62,10 @@ pub enum KernelObject {
         /// Physical frame backing this mapping.
         phys: PhysFrame,
     },
-    /// Capability table node.
+    /// Capability table node whose slots are managed by the derivation tree.
     CNode {
-        /// Raw pointer to the heap-allocated slot array.
-        slots: *mut ruzt_cap::CapSlot,
         /// Number of bits used to index into this node.
         radix_bits: u8,
-        /// Number of slots (`1 << radix_bits`).
-        count: usize,
     },
     /// Untyped physical memory.
     Untyped {
@@ -92,11 +80,6 @@ pub enum KernelObject {
         irq_num: u32,
     },
 }
-
-// SAFETY: All access to `KernelObject` values is gated by `spin::Mutex`, so
-// the raw pointer inside `CNode` is never shared across threads unsafely.
-unsafe impl Send for KernelObject {}
-unsafe impl Sync for KernelObject {}
 
 const INDEX_BITS: u32 = MAX_OBJECTS.trailing_zeros();
 const INDEX_MASK: u64 = MAX_OBJECTS as u64 - 1;
@@ -140,7 +123,7 @@ impl Entry {
 }
 
 impl KObjectId {
-    fn index(self) -> usize {
+    pub(super) fn index(self) -> usize {
         (self.0 & INDEX_MASK) as usize
     }
 }
@@ -257,6 +240,7 @@ pub(super) fn retype(
             }
             bits
         }
+        RetypeKind::CNode if requested_size_bits <= u64::from(MAX_CNODE_RADIX) => PAGE_BITS,
         _ if requested_size_bits == 0 => PAGE_BITS,
         _ => return Err(ErrorCode::BadMessage),
     };
@@ -301,6 +285,16 @@ pub(super) fn retype(
             KernelObject::Untyped { phys, size_bits },
             CapType::Untyped { phys, size_bits },
         ),
+        RetypeKind::CNode => {
+            let radix_bits = requested_size_bits as u8;
+            (
+                KernelObject::CNode { radix_bits },
+                CapType::CNode {
+                    radix_bits,
+                    ptr: id.0,
+                },
+            )
+        }
     };
     parent.references = references;
     let entry = &mut table[id.index()];
@@ -362,7 +356,8 @@ pub(super) fn retain(id: KObjectId) -> Result<(), ErrorCode> {
     Ok(())
 }
 
-pub(super) fn release(id: KObjectId) {
+/// Release an object reference and report whether it was the last one.
+pub(super) fn release(id: KObjectId) -> bool {
     let object = {
         let mut table = TABLE.lock();
         let entry = &mut table[id.index()];
@@ -376,6 +371,9 @@ pub(super) fn release(id: KObjectId) {
     };
     if let Some((object, backing)) = object {
         destroy(object, backing);
+        true
+    } else {
+        false
     }
 }
 
@@ -504,14 +502,6 @@ impl Drop for ProcessExitPublisher {
 
 fn destroy(object: KernelObject, backing: Option<UntypedAllocation>) {
     match object {
-        KernelObject::CNode { slots, count, .. } => {
-            // SAFETY: This is the unique boxed slice from CNode allocation.
-            unsafe {
-                drop(alloc::boxed::Box::from_raw(
-                    core::ptr::slice_from_raw_parts_mut(slots, count),
-                ))
-            };
-        }
         KernelObject::Frame { phys } => {
             // SAFETY: The final reference is gone, including every mapping,
             // and the page is still reserved in the parent region.
@@ -570,22 +560,10 @@ fn kernel_object_from_cap_type(cap_type: CapType) -> Result<KernelObject, ErrorC
         CapType::AddressSpace(_) => Err(ErrorCode::InvalidCap),
         CapType::Frame { .. } | CapType::Untyped { .. } => Err(ErrorCode::InvalidCap),
         CapType::Process(_) | CapType::Program(_) => Err(ErrorCode::InvalidCap),
-        CapType::CNode { radix_bits, .. } => {
-            let count = 1usize
-                .checked_shl(u32::from(radix_bits))
-                .ok_or(ErrorCode::BadMessage)?;
-            let mut slots = Vec::new();
-            slots
-                .try_reserve_exact(count)
-                .map_err(|_| ErrorCode::NoMemory)?;
-            slots.resize(count, NULL_SLOT);
-            let ptr = alloc::boxed::Box::into_raw(slots.into_boxed_slice()).cast();
-            Ok(KernelObject::CNode {
-                slots: ptr,
-                radix_bits,
-                count,
-            })
-        }
+        #[cfg(test)]
+        CapType::CNode { radix_bits, .. } => Ok(KernelObject::CNode { radix_bits }),
+        #[cfg(not(test))]
+        CapType::CNode { .. } => Err(ErrorCode::InvalidCap),
         CapType::Irq { irq_num } => Ok(KernelObject::Irq { irq_num }),
         // Boot device capabilities are only provisioned at process creation.
         CapType::IoPort { .. } | CapType::Framebuffer => Err(ErrorCode::NotImplemented),
@@ -595,6 +573,7 @@ fn kernel_object_from_cap_type(cap_type: CapType) -> Result<KernelObject, ErrorC
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
 
     #[test]
     fn deallocate_works() {
@@ -668,28 +647,6 @@ mod tests {
             }),
             Err(ErrorCode::InvalidCap)
         );
-    }
-
-    #[test]
-    fn allocate_cnode() {
-        let _state = crate::isolated_kernel_state();
-        let id = allocate(CapType::CNode {
-            radix_bits: 4,
-            ptr: 0,
-        })
-        .unwrap();
-        let obj = get(id).unwrap();
-        if let KernelObject::CNode {
-            radix_bits, count, ..
-        } = obj
-        {
-            assert_eq!(radix_bits, 4);
-            assert_eq!(count, 16);
-        } else {
-            panic!("expected CNode");
-        }
-        deallocate(id);
-        assert!(get(id).is_none());
     }
 
     #[test]

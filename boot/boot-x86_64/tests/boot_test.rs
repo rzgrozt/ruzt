@@ -85,6 +85,7 @@ fn test_rootsrv_updates_the_framebuffer_from_keyboard_input() {
             "rootsrv: console allocation and mapping revoked through its Untyped budget",
             "rootsrv: Untyped budget enforced and reclaimed after revocation",
             "rootsrv: both delegated budgets reclaimed",
+            "rootsrv: nested capability lookup, revocation and budgets verified",
             "rootsrv: anonymous memory rolled back and reused zeroed",
             "rootsrv: aligned allocation grew the runtime heap",
             "rootsrv: framebuffer tile drawn",

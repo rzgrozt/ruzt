@@ -322,6 +322,9 @@ pub(crate) fn reap_retired_user() {
     let name = user.name;
     let publisher = user.exit_publisher.take();
     drop(user);
+    // A shared CNode can contain caps owned by the reaped task that other
+    // tasks have used for wait operations or shared mappings.
+    apply_capability_removals();
     drop(stack);
     crate::serial_println!("reaped user process {name}");
     if let Some(publisher) = publisher {

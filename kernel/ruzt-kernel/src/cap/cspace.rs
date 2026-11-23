@@ -1,11 +1,12 @@
-//! Per-process slots and the kernel-wide capability derivation tree.
+//! Per-process capability tables and the kernel-wide derivation tree.
 
 use alloc::{collections::BTreeMap, vec::Vec};
-use ruzt_abi::{ErrorCode, RetypeKind, IPC_CAP_SLOTS};
+use core::ops::Bound::{Excluded, Unbounded};
+use ruzt_abi::{cptr_depth, ErrorCode, RetypeKind, IPC_CAP_SLOTS, MAX_CNODE_RADIX};
 use ruzt_cap::{CapRights, CapSlot, CapType, NULL_SLOT};
 use spin::Mutex;
 
-use super::object::{self, FramePin, KObjectId, UntypedBudget};
+use super::object::{self, FramePin, KObjectId, UntypedBudget, MAX_OBJECTS};
 
 /// A capability identity that survives moves between slots.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -27,11 +28,27 @@ struct Node {
     slot: CapSlot,
     object: Option<KObjectId>,
     parent: Option<CapabilityId>,
+    owner: u64,
+}
+
+impl Node {
+    fn cnode(self) -> Option<KObjectId> {
+        match self.slot.cap_type {
+            CapType::CNode { .. } => self.object,
+            _ => None,
+        }
+    }
+
+    fn visible_to(self, owner: u64) -> bool {
+        self.owner == owner || self.slot.rights.contains(CapRights::GRANT)
+    }
 }
 
 struct DerivationTree {
     nodes: BTreeMap<CapabilityId, Node>,
+    cnodes: BTreeMap<KObjectId, Vec<Option<CapabilityId>>>,
     next: u64,
+    next_space: u64,
 }
 
 impl DerivationTree {
@@ -47,6 +64,14 @@ impl DerivationTree {
     }
 
     fn remove(&mut self, id: CapabilityId) -> Option<CapSlot> {
+        let (slot, retired) = self.remove_one(id)?;
+        if let Some(cnode) = retired {
+            self.drain_cnodes(cnode);
+        }
+        Some(slot)
+    }
+
+    fn remove_one(&mut self, id: CapabilityId) -> Option<(CapSlot, Option<KObjectId>)> {
         let node = self.nodes.remove(&id)?;
         // Deleting a cap leaves its children live. Link them to the nearest
         // surviving ancestor so revocation still reaches them.
@@ -55,31 +80,38 @@ impl DerivationTree {
                 child.parent = node.parent;
             }
         }
-        if let Some(object) = node.object {
-            object::release(object);
-        }
-        Some(node.slot)
+        let destroyed = node.object.is_some_and(object::release);
+        Some((node.slot, node.cnode().filter(|_| destroyed)))
     }
 
-    fn derive(
-        &mut self,
-        source: CapabilityId,
-        rights: CapRights,
-        badge: u64,
-    ) -> Result<CapabilityId, ErrorCode> {
-        let parent = self.validate_grant(CapGrant {
-            source,
-            rights,
-            badge,
-        })?;
-        self.install(Node {
+    fn drain_cnodes(&mut self, first: KObjectId) {
+        // Each retired CNode enters the worklist once. New CNodes cannot
+        // be installed while the caller holds the derivation lock.
+        let mut pending = [first; MAX_OBJECTS];
+        let mut len = 1;
+        while len > 0 {
+            len -= 1;
+            let slots = self.cnodes.remove(&pending[len]).expect("retired CNode");
+            for id in slots.into_iter().flatten() {
+                if let Some((_, Some(cnode))) = self.remove_one(id) {
+                    pending[len] = cnode;
+                    len += 1;
+                }
+            }
+        }
+    }
+
+    fn grant_node(&self, grant: CapGrant, owner: u64) -> Result<Node, ErrorCode> {
+        let parent = self.validate_grant(grant)?;
+        Ok(Node {
             slot: CapSlot {
-                rights,
-                badge,
+                rights: grant.rights,
+                badge: grant.badge,
                 ..parent.slot
             },
-            object: parent.object,
-            parent: Some(source),
+            parent: Some(grant.source),
+            owner,
+            ..parent
         })
     }
 
@@ -95,6 +127,37 @@ impl DerivationTree {
         Ok(parent)
     }
 
+    fn require_acyclic(&self, dest: Option<KObjectId>, node: Node) -> Result<(), ErrorCode> {
+        let (Some(dest), Some(source)) = (dest, node.cnode()) else {
+            return Ok(());
+        };
+        // All CNodes have different live object-table indices. Mark each
+        // one at discovery so the worklist fits even when aliases converge.
+        let mut pending = [source; MAX_OBJECTS];
+        let mut visited = [false; MAX_OBJECTS];
+        visited[source.index()] = true;
+        let mut len = 1;
+        while len > 0 {
+            len -= 1;
+            let current = pending[len];
+            if current == dest {
+                return Err(ErrorCode::BadMessage);
+            }
+            for child in self.cnodes[&current]
+                .iter()
+                .flatten()
+                .filter_map(|id| self.nodes.get(id)?.cnode())
+            {
+                if !visited[child.index()] {
+                    visited[child.index()] = true;
+                    pending[len] = child;
+                    len += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn revoke(&mut self, source: CapabilityId) {
         // Remove one immediate child at a time. Removing it reparents its
         // own children, so this visits the entire subtree without recursion.
@@ -106,16 +169,44 @@ impl DerivationTree {
             self.remove(id);
         }
     }
+
+    fn owned_after(&self, owner: u64, previous: CapabilityId) -> Option<CapabilityId> {
+        self.nodes
+            .range((Excluded(previous), Unbounded))
+            .find_map(|(&id, node)| (node.owner == owner).then_some(id))
+    }
 }
 
 static DERIVATIONS: Mutex<DerivationTree> = Mutex::new(DerivationTree {
     nodes: BTreeMap::new(),
+    cnodes: BTreeMap::new(),
     next: 1,
+    next_space: 1,
 });
 
-/// A process's capability namespace, initially a single CNode.
+#[derive(Clone, Copy)]
+struct SlotAddress {
+    cnode: Option<KObjectId>,
+    index: usize,
+}
+
+/// A process's capability namespace with an implicit root table.
 pub struct CSpace {
     slots: Vec<Option<CapabilityId>>,
+    id: u64,
+}
+
+fn empty_slots(radix_bits: u64) -> Result<Vec<Option<CapabilityId>>, ErrorCode> {
+    if radix_bits > u64::from(MAX_CNODE_RADIX) {
+        return Err(ErrorCode::BadMessage);
+    }
+    let count = 1 << radix_bits;
+    let mut slots = Vec::new();
+    slots
+        .try_reserve_exact(count)
+        .map_err(|_| ErrorCode::NoMemory)?;
+    slots.resize(count, None);
+    Ok(slots)
 }
 
 static KERNEL_CSPACE: Mutex<Option<CSpace>> = Mutex::new(None);
@@ -137,51 +228,108 @@ impl CSpace {
     }
 
     pub(crate) fn try_new(radix_bits: u8) -> Result<Self, ErrorCode> {
-        let count = 1usize
-            .checked_shl(u32::from(radix_bits))
-            .ok_or(ErrorCode::BadMessage)?;
-        let mut slots = Vec::new();
-        slots
-            .try_reserve_exact(count)
-            .map_err(|_| ErrorCode::NoMemory)?;
-        slots.resize(count, None);
-        Ok(Self { slots })
+        let slots = empty_slots(u64::from(radix_bits))?;
+        let mut tree = DERIVATIONS.lock();
+        let id = tree.next_space;
+        tree.next_space = id.checked_add(1).ok_or(ErrorCode::NoMemory)?;
+        Ok(Self { slots, id })
     }
 
-    fn index(&self, cptr: u64) -> Result<usize, ErrorCode> {
-        let index = usize::try_from(cptr).map_err(|_| ErrorCode::InvalidCap)?;
-        if index < self.slots.len() {
-            Ok(index)
-        } else {
-            Err(ErrorCode::InvalidCap)
+    fn slots<'a>(
+        &'a self,
+        tree: &'a DerivationTree,
+        cnode: Option<KObjectId>,
+    ) -> &'a [Option<CapabilityId>] {
+        match cnode {
+            Some(cnode) => &tree.cnodes[&cnode],
+            None => &self.slots,
         }
     }
 
-    fn vacant(&self, index: usize, tree: &DerivationTree) -> Result<(), ErrorCode> {
-        match self.slots[index] {
+    fn slot_mut<'a>(
+        &'a mut self,
+        tree: &'a mut DerivationTree,
+        address: SlotAddress,
+    ) -> &'a mut Option<CapabilityId> {
+        let slots = match address.cnode {
+            Some(cnode) => tree.cnodes.get_mut(&cnode).expect("resolved CNode"),
+            None => &mut self.slots,
+        };
+        &mut slots[address.index]
+    }
+
+    fn resolve(
+        &self,
+        tree: &DerivationTree,
+        cptr: u64,
+        writable: bool,
+    ) -> Result<SlotAddress, ErrorCode> {
+        let depth = cptr_depth(cptr)?;
+        let rights = if writable {
+            CapRights::READ.union(CapRights::WRITE)
+        } else {
+            CapRights::READ
+        };
+        let mut cnode = None;
+        for level in (1..depth).rev() {
+            let index = ((cptr >> (level * 8)) as u8) as usize;
+            let (_, node) = self.live_node(tree, SlotAddress { cnode, index })?;
+            cnode = Some(node.cnode().ok_or(ErrorCode::InvalidCap)?);
+            if !node.slot.rights.contains(rights) {
+                return Err(ErrorCode::CapRightsViolation);
+            }
+        }
+        let index = cptr as u8 as usize;
+        if index >= self.slots(tree, cnode).len() {
+            return Err(ErrorCode::InvalidCap);
+        }
+        Ok(SlotAddress { cnode, index })
+    }
+
+    fn live_node(
+        &self,
+        tree: &DerivationTree,
+        address: SlotAddress,
+    ) -> Result<(CapabilityId, Node), ErrorCode> {
+        let id = self
+            .slots(tree, address.cnode)
+            .get(address.index)
+            .copied()
+            .flatten()
+            .ok_or(ErrorCode::InvalidCap)?;
+        let node = *tree.nodes.get(&id).ok_or(ErrorCode::InvalidCap)?;
+        // Sharing a CNode cannot expose capabilities that their holders
+        // could not grant directly.
+        if !node.visible_to(self.id) {
+            return Err(ErrorCode::CapRightsViolation);
+        }
+        Ok((id, node))
+    }
+
+    fn lookup_node(
+        &self,
+        tree: &DerivationTree,
+        cptr: u64,
+    ) -> Result<(CapabilityId, Node), ErrorCode> {
+        self.live_node(tree, self.resolve(tree, cptr, false)?)
+    }
+
+    fn vacant(&self, address: SlotAddress, tree: &DerivationTree) -> Result<(), ErrorCode> {
+        match self.slots(tree, address.cnode)[address.index] {
             Some(id) if tree.nodes.contains_key(&id) => Err(ErrorCode::SlotOccupied),
             _ => Ok(()),
         }
     }
 
     pub(crate) fn capability_id(&self, cptr: u64) -> Result<CapabilityId, ErrorCode> {
-        let id = self.slots[self.index(cptr)?].ok_or(ErrorCode::InvalidCap)?;
-        if is_live(id) {
-            Ok(id)
-        } else {
-            Err(ErrorCode::InvalidCap)
-        }
+        self.lookup_node(&DERIVATIONS.lock(), cptr)
+            .map(|(id, _)| id)
     }
 
     /// Resolve a live slot to its descriptor.
     pub fn lookup(&self, cptr: u64) -> Result<CapSlot, ErrorCode> {
-        let id = self.slots[self.index(cptr)?].ok_or(ErrorCode::InvalidCap)?;
-        DERIVATIONS
-            .lock()
-            .nodes
-            .get(&id)
-            .map(|node| node.slot)
-            .ok_or(ErrorCode::InvalidCap)
+        self.lookup_node(&DERIVATIONS.lock(), cptr)
+            .map(|(_, node)| node.slot)
     }
 
     pub(crate) fn shared_frame(
@@ -189,9 +337,8 @@ impl CSpace {
         cptr: u64,
         rights: CapRights,
     ) -> Result<(CapabilityId, FramePin), ErrorCode> {
-        let id = self.slots[self.index(cptr)?].ok_or(ErrorCode::InvalidCap)?;
         let tree = DERIVATIONS.lock();
-        let node = tree.nodes.get(&id).ok_or(ErrorCode::InvalidCap)?;
+        let (id, node) = self.lookup_node(&tree, cptr)?;
         let object = node.object.ok_or(ErrorCode::InvalidCap)?;
         if !matches!(node.slot.cap_type, CapType::Frame { .. }) {
             return Err(ErrorCode::InvalidCap);
@@ -203,9 +350,8 @@ impl CSpace {
     }
 
     pub(crate) fn untyped_budget(&self, cptr: u64) -> Result<UntypedBudget, ErrorCode> {
-        let id = self.slots[self.index(cptr)?].ok_or(ErrorCode::InvalidCap)?;
         let tree = DERIVATIONS.lock();
-        let node = tree.nodes.get(&id).ok_or(ErrorCode::InvalidCap)?;
+        let (_, node) = self.lookup_node(&tree, cptr)?;
         if !matches!(node.slot.cap_type, CapType::Untyped { .. }) {
             return Err(ErrorCode::InvalidCap);
         }
@@ -239,10 +385,9 @@ impl CSpace {
         kind: RetypeKind,
         size_bits: u64,
     ) -> Result<(), ErrorCode> {
-        let source = self.slots[self.index(cptr)?].ok_or(ErrorCode::InvalidCap)?;
-        let dest = self.index(destination)?;
         let mut tree = DERIVATIONS.lock();
-        let node = tree.nodes.get(&source).ok_or(ErrorCode::InvalidCap)?;
+        let (source, node) = self.lookup_node(&tree, cptr)?;
+        let dest = self.resolve(&tree, destination, true)?;
         if !matches!(node.slot.cap_type, CapType::Untyped { .. }) {
             return Err(ErrorCode::InvalidCap);
         }
@@ -252,6 +397,11 @@ impl CSpace {
         let region = node.object.ok_or(ErrorCode::InvalidCap)?;
         self.vacant(dest, &tree)?;
 
+        let cnode_slots = if kind == RetypeKind::CNode {
+            Some(empty_slots(size_bits)?)
+        } else {
+            None
+        };
         let (object, cap_type) = object::retype(region, kind, size_bits)?;
         let mut rights = CapRights::WRITE.union(CapRights::GRANT);
         if kind != RetypeKind::Untyped {
@@ -265,10 +415,14 @@ impl CSpace {
             },
             object: Some(object),
             parent: Some(source),
+            owner: self.id,
         });
         match installed {
             Ok(id) => {
-                self.slots[dest] = Some(id);
+                if let Some(slots) = cnode_slots {
+                    tree.cnodes.insert(object, slots);
+                }
+                *self.slot_mut(&mut tree, dest) = Some(id);
                 Ok(())
             }
             Err(error) => {
@@ -302,39 +456,78 @@ impl CSpace {
         slot: CapSlot,
         object: Option<KObjectId>,
     ) -> Result<(), ErrorCode> {
-        let index = self.index(cptr)?;
         let mut tree = DERIVATIONS.lock();
-        self.vacant(index, &tree)?;
-        self.slots[index] = Some(tree.install(Node {
+        let dest = self.resolve(&tree, cptr, true)?;
+        self.vacant(dest, &tree)?;
+        let node = Node {
             slot,
             object,
             parent: None,
-        })?);
+            owner: self.id,
+        };
+        if let Some(cnode) = node.cnode() {
+            if !tree.cnodes.contains_key(&cnode) {
+                return Err(ErrorCode::InvalidCap);
+            }
+        }
+        tree.require_acyclic(dest.cnode, node)?;
+        let id = tree.install(node)?;
+        *self.slot_mut(&mut tree, dest) = Some(id);
         Ok(())
     }
 
     /// Delete the slot. Object storage is reclaimed after its last reference.
     pub fn delete(&mut self, cptr: u64) -> Result<CapSlot, ErrorCode> {
-        let index = self.index(cptr)?;
-        let Some(id) = self.slots[index].take() else {
+        let mut tree = DERIVATIONS.lock();
+        let address = self.resolve(&tree, cptr, true)?;
+        if let Some(id) = self.slots(&tree, address.cnode)[address.index] {
+            if tree
+                .nodes
+                .get(&id)
+                .is_some_and(|node| !node.visible_to(self.id))
+            {
+                return Err(ErrorCode::CapRightsViolation);
+            }
+        }
+        let Some(id) = self.slot_mut(&mut tree, address).take() else {
             return Ok(NULL_SLOT);
         };
-        Ok(DERIVATIONS.lock().remove(id).unwrap_or(NULL_SLOT))
+        Ok(tree.remove(id).unwrap_or(NULL_SLOT))
     }
 
     pub(super) fn move_cap(&mut self, source: u64, dest: u64) -> Result<(), ErrorCode> {
-        let source_index = self.index(source)?;
-        let dest_index = self.index(dest)?;
-        let id = self.slots[source_index].ok_or(ErrorCode::InvalidCap)?;
-        let tree = DERIVATIONS.lock();
-        if !tree.nodes.contains_key(&id) {
-            return Err(ErrorCode::InvalidCap);
-        }
-        self.vacant(dest_index, &tree)?;
-        self.slots[dest_index] = self.slots[source_index].take();
+        let mut tree = DERIVATIONS.lock();
+        let source = self.resolve(&tree, source, true)?;
+        let (id, node) = self.live_node(&tree, source)?;
+        let dest = self.resolve(&tree, dest, true)?;
+        self.vacant(dest, &tree)?;
+        tree.require_acyclic(dest.cnode, node)?;
+        *self.slot_mut(&mut tree, source) = None;
+        *self.slot_mut(&mut tree, dest) = Some(id);
         Ok(())
     }
 
+    pub(super) fn mint(
+        &mut self,
+        source: u64,
+        dest: u64,
+        rights: CapRights,
+        badge: u64,
+    ) -> Result<(), ErrorCode> {
+        let mut tree = DERIVATIONS.lock();
+        let (source, _) = self.lookup_node(&tree, source)?;
+        self.install_grant(
+            &mut tree,
+            dest,
+            CapGrant {
+                source,
+                rights,
+                badge,
+            },
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn derive(
         &mut self,
         source: CapabilityId,
@@ -342,23 +535,49 @@ impl CSpace {
         rights: CapRights,
         badge: u64,
     ) -> Result<(), ErrorCode> {
-        let index = self.index(dest)?;
         let mut tree = DERIVATIONS.lock();
-        self.vacant(index, &tree)?;
-        self.slots[index] = Some(tree.derive(source, rights, badge)?);
+        self.install_grant(
+            &mut tree,
+            dest,
+            CapGrant {
+                source,
+                rights,
+                badge,
+            },
+        )
+    }
+
+    fn install_grant(
+        &mut self,
+        tree: &mut DerivationTree,
+        dest: u64,
+        grant: CapGrant,
+    ) -> Result<(), ErrorCode> {
+        let dest = self.resolve(tree, dest, true)?;
+        self.vacant(dest, tree)?;
+        let node = tree.grant_node(grant, self.id)?;
+        tree.require_acyclic(dest.cnode, node)?;
+        let id = tree.install(node)?;
+        *self.slot_mut(tree, dest) = Some(id);
         Ok(())
     }
 
     pub(crate) fn revoke(&mut self, source: u64) -> Result<(), ErrorCode> {
-        let id = self.capability_id(source)?;
-        DERIVATIONS.lock().revoke(id);
+        let mut tree = DERIVATIONS.lock();
+        let address = self.resolve(&tree, source, true)?;
+        let (id, _) = self.live_node(&tree, address)?;
+        tree.revoke(id);
         Ok(())
     }
 
     pub(crate) fn revoke_all_descendants(&mut self) {
         let mut tree = DERIVATIONS.lock();
-        for id in self.slots.iter().flatten() {
-            tree.revoke(*id);
+        // A move into a shared CNode does not change who installed the cap.
+        // Reap this space's derivations wherever its slots now reside.
+        let mut previous = CapabilityId(0);
+        while let Some(id) = tree.owned_after(self.id, previous) {
+            tree.revoke(id);
+            previous = id;
         }
     }
 
@@ -368,18 +587,20 @@ impl CSpace {
         rights: CapRights,
         badge: u64,
     ) -> Result<CapGrant, ErrorCode> {
+        let tree = DERIVATIONS.lock();
         let grant = CapGrant {
-            source: self.capability_id(source)?,
+            source: self.lookup_node(&tree, source)?.0,
             rights,
             badge,
         };
-        DERIVATIONS.lock().validate_grant(grant)?;
+        tree.validate_grant(grant)?;
         Ok(grant)
     }
 
     pub(crate) fn accept_grants(
         &mut self,
         first: u64,
+        expected_cnode: Option<KObjectId>,
         grants: &[Option<CapGrant>],
     ) -> Result<(), ErrorCode> {
         if grants.is_empty() {
@@ -388,21 +609,27 @@ impl CSpace {
         if grants.len() > IPC_CAP_SLOTS {
             return Err(ErrorCode::BadMessage);
         }
-        let first = self.index(first)?;
-        let end = first
-            .checked_add(grants.len())
-            .filter(|&end| end <= self.slots.len())
-            .ok_or(ErrorCode::InvalidCap)?;
         let mut tree = DERIVATIONS.lock();
-        for index in first..end {
-            self.vacant(index, &tree)?;
+        let first = self.resolve(&tree, first, true)?;
+        if first.cnode != expected_cnode {
+            return Err(ErrorCode::InvalidCap);
+        }
+        let end = first
+            .index
+            .checked_add(grants.len())
+            .filter(|&end| end <= self.slots(&tree, first.cnode).len())
+            .ok_or(ErrorCode::InvalidCap)?;
+        for index in first.index..end {
+            self.vacant(SlotAddress { index, ..first }, &tree)?;
         }
 
         let mut installed = [None; IPC_CAP_SLOTS];
         for (slot, grant) in installed.iter_mut().zip(grants) {
-            let result = grant
-                .ok_or(ErrorCode::BadMessage)
-                .and_then(|grant| tree.derive(grant.source, grant.rights, grant.badge));
+            let result = (|| {
+                let node = tree.grant_node(grant.ok_or(ErrorCode::BadMessage)?, self.id)?;
+                tree.require_acyclic(first.cnode, node)?;
+                tree.install(node)
+            })();
             match result {
                 Ok(id) => *slot = Some(id),
                 Err(error) => {
@@ -413,8 +640,15 @@ impl CSpace {
                 }
             }
         }
-        self.slots[first..end].copy_from_slice(&installed[..grants.len()]);
+        for (index, id) in (first.index..end).zip(installed) {
+            *self.slot_mut(&mut tree, SlotAddress { index, ..first }) = id;
+        }
         Ok(())
+    }
+
+    pub(crate) fn receive_cnode(&self, first: u64) -> Result<Option<KObjectId>, ErrorCode> {
+        let tree = DERIVATIONS.lock();
+        Ok(self.resolve(&tree, first, true)?.cnode)
     }
 
     /// Find the first usable slot, including slots invalidated by revocation.
@@ -428,15 +662,18 @@ impl CSpace {
     }
 
     pub(crate) fn require_vacant(&self, cptr: u64) -> Result<(), ErrorCode> {
-        self.vacant(self.index(cptr)?, &DERIVATIONS.lock())
+        let tree = DERIVATIONS.lock();
+        self.vacant(self.resolve(&tree, cptr, true)?, &tree)
     }
 }
 
 impl Drop for CSpace {
     fn drop(&mut self) {
         let mut tree = DERIVATIONS.lock();
-        for id in self.slots.iter().flatten() {
-            tree.remove(*id);
+        let mut previous = CapabilityId(0);
+        while let Some(id) = tree.owned_after(self.id, previous) {
+            tree.remove(id);
+            previous = id;
         }
     }
 }
@@ -444,7 +681,30 @@ impl Drop for CSpace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ruzt_abi::cptr_path;
     use ruzt_cap::EndpointId;
+
+    fn cnode(space: &mut CSpace, cptr: u64, radix_bits: u8) -> KObjectId {
+        let object = object::allocate(CapType::CNode { radix_bits, ptr: 0 }).unwrap();
+        DERIVATIONS
+            .lock()
+            .cnodes
+            .insert(object, empty_slots(u64::from(radix_bits)).unwrap());
+        space
+            .insert(
+                cptr,
+                CapSlot {
+                    cap_type: CapType::CNode {
+                        radix_bits,
+                        ptr: object.0,
+                    },
+                    rights: CapRights::new(),
+                    badge: 0,
+                },
+            )
+            .unwrap();
+        object
+    }
 
     fn endpoint(space: &mut CSpace, cptr: u64) -> KObjectId {
         let id = object::allocate(CapType::Endpoint(EndpointId(0))).unwrap();
@@ -565,12 +825,109 @@ mod tests {
         ];
         sender.revoke(1).unwrap();
         assert_eq!(
-            receiver.accept_grants(0, &grants),
+            receiver.accept_grants(0, None, &grants),
             Err(ErrorCode::InvalidCap)
         );
         assert_eq!(receiver.lookup(0), Err(ErrorCode::InvalidCap));
         assert_eq!(receiver.lookup(1), Err(ErrorCode::InvalidCap));
         sender.delete(0).unwrap();
         assert_eq!(object::get(first), None);
+    }
+
+    #[test]
+    fn cnode_cycles_fail_and_final_references_drain_nested_tables() {
+        let _state = crate::isolated_kernel_state();
+        let mut space = CSpace::new(2);
+        let child = cptr_path(&[0, 1]).unwrap();
+        let leaf = cptr_path(&[0, 1, 0]).unwrap();
+        let outer = cnode(&mut space, 0, 1);
+        let inner = cnode(&mut space, child, 1);
+        assert_eq!(space.move_cap(0, leaf), Err(ErrorCode::BadMessage));
+        assert_eq!(
+            space.mint(child, cptr_path(&[0, 1, 1]).unwrap(), CapRights::READ, 0),
+            Err(ErrorCode::BadMessage)
+        );
+        let endpoint = endpoint(&mut space, leaf);
+        space.delete(0).unwrap();
+        assert_eq!(space.lookup(leaf), Err(ErrorCode::InvalidCap));
+        for object in [outer, inner, endpoint] {
+            assert_eq!(object::get(object), None);
+        }
+    }
+
+    #[test]
+    fn shared_cnode_views_preserve_slot_rights_and_exit_ownership() {
+        let _state = crate::isolated_kernel_state();
+        let mut owner = CSpace::new(2);
+        let mut peer = CSpace::new(2);
+        cnode(&mut owner, 0, 2);
+        cnode(&mut owner, cptr_path(&[0, 0]).unwrap(), 2);
+        let id = owner.capability_id(0).unwrap();
+        peer.derive(id, 0, CapRights::READ, 0).unwrap();
+        peer.derive(id, 1, CapRights::READ.union(CapRights::WRITE), 0)
+            .unwrap();
+
+        let owned = cptr_path(&[0, 0, 0]).unwrap();
+        let peer_rw = cptr_path(&[1, 0, 0]).unwrap();
+        let original = endpoint(&mut owner, owned);
+        assert_eq!(
+            peer.lookup(owned).unwrap().cap_type,
+            CapType::Endpoint(EndpointId(original.0))
+        );
+        assert_eq!(peer.move_cap(owned, 2), Err(ErrorCode::CapRightsViolation));
+
+        let private = cptr_path(&[0, 0, 1]).unwrap();
+        owner.mint(owned, private, CapRights::READ, 0).unwrap();
+        assert_eq!(
+            peer.lookup(cptr_path(&[1, 0, 1]).unwrap()),
+            Err(ErrorCode::CapRightsViolation)
+        );
+        assert_eq!(
+            peer.delete(cptr_path(&[1, 0, 1]).unwrap()),
+            Err(ErrorCode::CapRightsViolation)
+        );
+        peer.mint(peer_rw, 2, CapRights::READ, 0).unwrap();
+        peer.revoke_all_descendants();
+        assert!(owner.lookup(owned).is_ok());
+        owner.revoke_all_descendants();
+        assert_eq!(peer.lookup(2), Err(ErrorCode::InvalidCap));
+        assert_eq!(peer.lookup(peer_rw), Err(ErrorCode::InvalidCap));
+    }
+
+    #[test]
+    fn receiving_into_cnodes_checks_cycles_boundaries_and_retargeting() {
+        let _state = crate::isolated_kernel_state();
+        let mut space = CSpace::new(2);
+        let table = cnode(&mut space, 0, 1);
+        cnode(&mut space, 1, 1);
+        endpoint(&mut space, 2);
+        let grant = space.prepare_grant(2, CapRights::READ, 1).unwrap();
+        let cycle = space.prepare_grant(0, CapRights::READ, 0).unwrap();
+        let first = cptr_path(&[0, 0]).unwrap();
+        let last = cptr_path(&[0, 1]).unwrap();
+        assert_eq!(space.receive_cnode(first), Ok(Some(table)));
+        assert_eq!(
+            space.accept_grants(last, Some(table), &[Some(grant), Some(grant)]),
+            Err(ErrorCode::InvalidCap)
+        );
+        assert_eq!(
+            space.accept_grants(first, Some(table), &[Some(grant), Some(cycle)]),
+            Err(ErrorCode::BadMessage)
+        );
+        assert_eq!(space.lookup(first), Err(ErrorCode::InvalidCap));
+        space.move_cap(0, 3).unwrap();
+        space.move_cap(1, 0).unwrap();
+        assert_eq!(
+            space.accept_grants(first, Some(table), &[Some(grant)]),
+            Err(ErrorCode::InvalidCap)
+        );
+        space
+            .accept_grants(
+                cptr_path(&[3, 0]).unwrap(),
+                Some(table),
+                &[Some(grant), Some(grant)],
+            )
+            .unwrap();
+        assert_eq!(space.lookup(cptr_path(&[3, 1]).unwrap()).unwrap().badge, 1);
     }
 }

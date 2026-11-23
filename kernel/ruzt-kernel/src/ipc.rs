@@ -12,6 +12,7 @@ use crate::syscall::user_mem;
 pub(crate) struct ReceiveSlots {
     pub first: u64,
     pub capacity: usize,
+    pub cnode: Option<KObjectId>,
 }
 
 pub(crate) struct Packet {
@@ -40,7 +41,7 @@ impl Packet {
             return Err(ErrorCode::BadMessage);
         }
         let space = space.ok_or(ErrorCode::InvalidCap)?;
-        space.accept_grants(slots.first, &self.grants[..count])?;
+        space.accept_grants(slots.first, slots.cnode, &self.grants[..count])?;
         for (index, cap) in self.message.caps[..count].iter_mut().enumerate() {
             cap.cptr = slots.first + index as u64;
         }
