@@ -1,7 +1,9 @@
 #![no_std]
 #![deny(unsafe_code)]
 
-use ruzt_abi::{CapOp, CapRights, ErrorCode, IpcMessage, ProcessStatus, RetypeKind, SyscallNumber};
+use ruzt_abi::{
+    CapOp, CapRights, ErrorCode, IpcMessage, ProcessStatus, RetypeKind, SyscallNumber, WaitEvent,
+};
 
 pub fn send(endpoint_cptr: u64, message: &IpcMessage) -> Result<(), ErrorCode> {
     let return_value = {
@@ -66,6 +68,43 @@ pub fn signal(notification: u64) -> Result<(), ErrorCode> {
 /// Block until the notification has been signalled.
 pub fn wait(notification: u64) -> Result<(), ErrorCode> {
     control(notification, CapOp::Wait, 0, 0, 0)
+}
+
+/// Block until one of the supplied capabilities delivers an event.
+///
+/// Accepts endpoints, notifications, driver IRQs, and process status caps.
+/// If several sources are ready, the first in the list wins. A returned
+/// message, notification, or IRQ has already been consumed.
+pub fn wait_any(sources: &[u64]) -> Result<WaitEvent, ErrorCode> {
+    wait_any_with_caps(sources, 0, 0)
+}
+
+/// Wait for an event and accept grants in one contiguous receive window.
+///
+/// Each endpoint in the list uses the same window, as in [`recv_with_caps`].
+/// Losing authority to any wait source cancels the wait.
+pub fn wait_any_with_caps(
+    sources: &[u64],
+    first: u64,
+    capacity: u8,
+) -> Result<WaitEvent, ErrorCode> {
+    let mut event = WaitEvent::default();
+    #[allow(unsafe_code)]
+    // SAFETY: The slice is readable and the local event is exclusively
+    // writable for the duration of the call.
+    let status = unsafe {
+        ruzt_runtime::syscall::syscall(
+            SyscallNumber::WaitAny,
+            sources.as_ptr() as u64,
+            sources.len() as u64,
+            (&raw mut event) as u64,
+            first,
+            u64::from(capacity),
+            0,
+        )
+    };
+    ErrorCode::from_u64(status)?;
+    Ok(event)
 }
 
 /// Derive a capability in an empty slot of the caller's capability space.

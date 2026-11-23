@@ -3,7 +3,7 @@
 use core::mem::{offset_of, size_of};
 use ruzt_abi::{
     CapOp, CapRights, CapTransferSlot, ErrorCode, FramebufferInfo, IpcMessage, ProcessStatus,
-    RetypeKind, SyscallArgs, IPC_CAP_SLOTS,
+    RetypeKind, SyscallArgs, WaitEvent, IPC_CAP_SLOTS, MAX_WAIT_SOURCES,
 };
 use ruzt_cap::CapType;
 use ruzt_hal::mem::PhysFrame;
@@ -97,23 +97,7 @@ pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
             require(capability.rights, CapRights::READ)?;
             // Reject bad buffers before consuming a pending sender or blocking.
             validate_blocking_output(root, args.arg2, size_of::<IpcMessage>())?;
-            let capacity = usize::try_from(args.arg4).map_err(|_| ErrorCode::BadMessage)?;
-            if capacity > IPC_CAP_SLOTS {
-                return Err(ErrorCode::BadMessage);
-            }
-            // Revalidate at delivery so a concurrent edit cannot redirect
-            // incoming grants to a different table while this thread waits.
-            let cnode = if capacity > 0 && args.arg3 > u64::from(u8::MAX) {
-                sched::with_current_user(|user| user.cspace.receive_cnode(args.arg3))
-                    .ok_or(ErrorCode::InvalidCap)??
-            } else {
-                None
-            };
-            let slots = ipc::ReceiveSlots {
-                first: args.arg3,
-                capacity,
-                cnode,
-            };
+            let slots = receive_slots(args.arg3, args.arg4)?;
             let message = ipc::receive_packet(id, authority, slots)?;
             write_message(root, args.arg2, &message)
         }
@@ -181,8 +165,7 @@ pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
             irq_num: keyboard::IRQ,
         } if args.arg1 == CapOp::Wait as u64 => {
             require(capability.rights, CapRights::READ)?;
-            keyboard::wait_irq();
-            Ok(())
+            keyboard::wait_irq(authority)
         }
         CapType::IoPort { port } if args.arg1 == CapOp::ReadPort8 as u64 => {
             require(capability.rights, CapRights::READ)?;
@@ -215,6 +198,57 @@ pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
         }
         _ => Err(ErrorCode::InvalidCap),
     }
+}
+
+pub(crate) fn wait_any(args: &SyscallArgs) -> Result<(), ErrorCode> {
+    let count = usize::try_from(args.arg1).map_err(|_| ErrorCode::BadMessage)?;
+    if !(1..=MAX_WAIT_SOURCES).contains(&count) {
+        return Err(ErrorCode::BadMessage);
+    }
+    let root = sched::with_current_user(|process| process.root()).ok_or(ErrorCode::InvalidCap)?;
+    let mut cptrs = [0u8; size_of::<u64>() * MAX_WAIT_SOURCES];
+    let cptrs = &mut cptrs[..count * size_of::<u64>()];
+    user_mem::read_user_buffer(root, args.arg0, cptrs)?;
+    validate_blocking_output(root, args.arg2, size_of::<WaitEvent>())?;
+    let slots = receive_slots(args.arg3, args.arg4)?;
+    let thread = sched::current_thread_id();
+    let sources = sched::with_current_user(|user| {
+        let mut sources = [None; MAX_WAIT_SOURCES];
+        for (entry, bytes) in sources.iter_mut().zip(cptrs.chunks_exact(size_of::<u64>())) {
+            let cptr = u64::from_ne_bytes(bytes.try_into().unwrap());
+            let (authority, slot) = user.cspace.lookup_path(cptr)?;
+            *entry = Some(ipc::wait::Source::new(authority, slot, thread)?);
+        }
+        Ok(sources)
+    })
+    .ok_or(ErrorCode::InvalidCap)??;
+    let event = ipc::wait::wait_any(&sources, slots)?;
+    let mut bytes = [0; size_of::<WaitEvent>()];
+    bytes[offset_of!(WaitEvent, index)..][..8].copy_from_slice(&event.index.to_ne_bytes());
+    bytes[offset_of!(WaitEvent, kind)..][..8].copy_from_slice(&event.kind.to_ne_bytes());
+    bytes[offset_of!(WaitEvent, message)..][..size_of::<IpcMessage>()]
+        .copy_from_slice(&encode_message(&event.message));
+    user_mem::write_user_buffer(root, args.arg2, &bytes)
+}
+
+fn receive_slots(first: u64, capacity: u64) -> Result<ipc::ReceiveSlots, ErrorCode> {
+    let capacity = usize::try_from(capacity).map_err(|_| ErrorCode::BadMessage)?;
+    if capacity > IPC_CAP_SLOTS {
+        return Err(ErrorCode::BadMessage);
+    }
+    // Revalidate at delivery so an edit cannot redirect incoming grants to a
+    // different table while this thread waits.
+    let cnode = if capacity > 0 && first > u64::from(u8::MAX) {
+        sched::with_current_user(|user| user.cspace.receive_cnode(first))
+            .ok_or(ErrorCode::InvalidCap)??
+    } else {
+        None
+    };
+    Ok(ipc::ReceiveSlots {
+        first,
+        capacity,
+        cnode,
+    })
 }
 
 fn validate_blocking_output(root: PhysFrame, address: u64, length: usize) -> Result<(), ErrorCode> {
@@ -295,6 +329,10 @@ fn cap_offset(index: usize) -> usize {
 }
 
 fn write_message(root: PhysFrame, address: u64, message: &IpcMessage) -> Result<(), ErrorCode> {
+    user_mem::write_user_buffer(root, address, &encode_message(message))
+}
+
+fn encode_message(message: &IpcMessage) -> [u8; size_of::<IpcMessage>()] {
     let mut bytes = [0; size_of::<IpcMessage>()];
     bytes[LABEL_OFFSET..][..8].copy_from_slice(&message.label.to_le_bytes());
     bytes[LENGTH_OFFSET..][..2].copy_from_slice(&message.length.to_le_bytes());
@@ -310,5 +348,5 @@ fn write_message(root: PhysFrame, address: u64, message: &IpcMessage) -> Result<
         bytes[offset + RIGHTS_OFFSET] = cap.rights.bits();
         bytes[offset + BADGE_OFFSET..][..8].copy_from_slice(&cap.badge.to_le_bytes());
     }
-    user_mem::write_user_buffer(root, address, &bytes)
+    bytes
 }

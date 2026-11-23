@@ -6,6 +6,7 @@ extern crate alloc;
 
 use ruzt_abi::{
     console, CapRights, ErrorCode, IpcMessage, RetypeKind, FRAME_BYTES, ROOTSRV_FRAMEBUFFER,
+    WAIT_ENDPOINT_CLOSED, WAIT_MESSAGE,
 };
 use ruzt_driver_sdk::{read_port_u8, write_port_u8};
 
@@ -26,15 +27,14 @@ fn main() -> ! {
         Err(ErrorCode::InvalidCap)
     ));
     loop {
-        let mut request = IpcMessage::default();
-        match ruzt_ipc::recv_with_caps(
-            console::REQUEST,
-            &mut request,
+        let request = match ruzt_ipc::wait_any_with_caps(
+            &[console::REQUEST],
             console::RECEIVED_NOTIFICATION,
             3,
         ) {
-            Ok(()) => {}
-            Err(ErrorCode::NotFound) => ruzt_runtime::syscall::exit(0),
+            Ok(event) if event.kind == WAIT_MESSAGE => event.message,
+            Ok(event) if event.kind == WAIT_ENDPOINT_CLOSED => ruzt_runtime::syscall::exit(0),
+            Ok(event) => panic!("unexpected console event {}", event.kind),
             Err(ErrorCode::InvalidCap) => ruzt_runtime::syscall::exit(1),
             Err(
                 ErrorCode::BadMessage | ErrorCode::SlotOccupied | ErrorCode::CapRightsViolation,
@@ -42,7 +42,7 @@ fn main() -> ! {
                 continue;
             }
             Err(error) => panic!("console receive failed: {error:?}"),
-        }
+        };
         let label = match (request.label, request.cap_count) {
             (console::WRITE, 0) => {
                 uart_write(&request.data[..usize::from(request.length)]);

@@ -30,6 +30,9 @@ pub(crate) extern "C" fn syscall_dispatch(args: &SyscallArgs, caller_cs: u64) ->
             user::invoke(args).map_or_else(ErrorCode::as_u64, |()| ErrorCode::Ok.as_u64())
         }
         SyscallNumber::Invoke => invoke::invoke(args),
+        SyscallNumber::WaitAny if from_user => {
+            user::wait_any(args).map_or_else(ErrorCode::as_u64, |()| ErrorCode::Ok.as_u64())
+        }
         SyscallNumber::DebugPutChar => {
             crate::serial::SERIAL1.lock().send(args.arg0 as u8);
             ErrorCode::Ok.as_u64()
@@ -45,6 +48,7 @@ pub(crate) extern "C" fn syscall_dispatch(args: &SyscallArgs, caller_cs: u64) ->
             )
         }
         SyscallNumber::Exit
+        | SyscallNumber::WaitAny
         | SyscallNumber::NotImplemented
         | SyscallNumber::_Reply
         | SyscallNumber::_Yield => ErrorCode::NotImplemented.as_u64(),

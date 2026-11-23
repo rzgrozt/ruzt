@@ -58,7 +58,8 @@ pub const FRAME_BYTES: usize = 4096;
 /// Largest supported radix of a retyped capability table.
 pub const MAX_CNODE_RADIX: u8 = 8;
 
-const MAX_CPTR_DEPTH: usize = 7;
+/// Maximum number of slot indices in one capability pointer.
+pub const MAX_CPTR_DEPTH: usize = 7;
 const CPTR_DEPTH_TAG: u8 = 0x80;
 
 /// Encode a path from the caller's root capability table to a slot.
@@ -150,6 +151,13 @@ pub enum SyscallNumber {
     NotImplemented = 4,
     /// Terminate the calling user task with the status in `arg0`.
     Exit = 5,
+    /// Wait on a list of endpoint, notification, IRQ, or process capabilities.
+    ///
+    /// `arg0` points to the array of `u64` capability pointers, `arg1`
+    /// gives its length, and `arg2` points to a writable [`WaitEvent`] in
+    /// a non-revocable mapping. `arg3` and `arg4` describe a contiguous
+    /// capability receive window, as for [`CapOp::Recv`].
+    WaitAny = 6,
 }
 
 impl From<u64> for SyscallNumber {
@@ -160,6 +168,7 @@ impl From<u64> for SyscallNumber {
             2 => Self::_Yield,
             3 => Self::DebugPutChar,
             5 => Self::Exit,
+            6 => Self::WaitAny,
             _ => Self::NotImplemented,
         }
     }
@@ -239,6 +248,32 @@ pub struct ProcessStatus {
     pub kind: u32,
     /// Process exit code or architecture exception number.
     pub code: u32,
+}
+
+/// Maximum number of sources in one [`SyscallNumber::WaitAny`] call.
+pub const MAX_WAIT_SOURCES: usize = 8;
+
+/// The selected endpoint delivered a message.
+pub const WAIT_MESSAGE: u64 = 1;
+/// The selected notification was signalled and consumed.
+pub const WAIT_NOTIFICATION: u64 = 2;
+/// The selected IRQ was pending and is ready for the driver to handle.
+pub const WAIT_IRQ: u64 = 3;
+/// The selected endpoint was closed.
+pub const WAIT_ENDPOINT_CLOSED: u64 = 4;
+/// The selected process has been reaped and its status can be read.
+pub const WAIT_PROCESS_EXITED: u64 = 5;
+
+/// The first ready event in a caller's ordered wait list.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(C)]
+pub struct WaitEvent {
+    /// Zero-based index in the input list.
+    pub index: u64,
+    /// One of the `WAIT_*` event kinds.
+    pub kind: u64,
+    /// The received message for [`WAIT_MESSAGE`], empty for other kinds.
+    pub message: IpcMessage,
 }
 
 const _: () = assert!(core::mem::size_of::<ProcessStatus>() == 8);

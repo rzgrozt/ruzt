@@ -1,6 +1,8 @@
 //! PS/2 keyboard scancode handling.
 
+use crate::cap::cspace::CapabilityId;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use ruzt_abi::ErrorCode;
 use x86_64::instructions::port::PortReadOnly;
 
 static SCANCODE_READY: AtomicBool = AtomicBool::new(false);
@@ -18,24 +20,48 @@ pub(crate) fn enable_user_driver(thread: crate::sched::ThreadId) {
 }
 
 pub(crate) fn detach_user_driver(thread: crate::sched::ThreadId) {
-    if USER_DRIVER.compare_exchange(thread, 0, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+    if USER_DRIVER
+        .compare_exchange(thread, 0, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
         IRQ_PENDING.store(false, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn is_user_driver(thread: crate::sched::ThreadId) -> bool {
+    thread != 0 && USER_DRIVER.load(Ordering::Relaxed) == thread
+}
+
+pub(crate) fn take_irq() -> bool {
+    IRQ_PENDING.swap(false, Ordering::Relaxed)
+}
+
+pub(crate) fn trace_wait() {
+    #[cfg(feature = "qemu-rootsrv-test")]
+    {
+        static PROBE: spin::Once<()> = spin::Once::new();
+        PROBE.call_once(|| crate::serial_println!("rootsrv thread waiting for keyboard IRQ"));
     }
 }
 
 /// Sleep until the driver has an interrupt to handle.
 /// Called from the syscall interrupt gate with interrupts disabled.
-pub(crate) fn wait_irq() {
-    while !IRQ_PENDING.swap(false, Ordering::Relaxed) {
+pub(crate) fn wait_irq(authority: Option<CapabilityId>) -> Result<(), ErrorCode> {
+    if !is_user_driver(crate::sched::current_thread_id()) {
+        return Err(ErrorCode::InvalidCap);
+    }
+    while !take_irq() {
         // This check and the scheduler's blocked transition are atomic
         // with respect to this CPU's keyboard IRQ.
-        #[cfg(feature = "qemu-rootsrv-test")]
-        {
-            static PROBE: spin::Once<()> = spin::Once::new();
-            PROBE.call_once(|| crate::serial_println!("rootsrv thread waiting for keyboard IRQ"));
-        }
-        crate::sched::block_current(crate::sched::ThreadState::BlockedIrq(IRQ));
+        trace_wait();
+        crate::sched::block_with_authority(
+            crate::sched::ThreadState::BlockedIrq(IRQ),
+            authority,
+            Default::default(),
+        );
+        crate::sched::check_ipc_completion()?;
     }
+    Ok(())
 }
 
 /// Called from the keyboard ISR (vector 33).

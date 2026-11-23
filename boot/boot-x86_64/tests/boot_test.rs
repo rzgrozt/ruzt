@@ -79,6 +79,7 @@ fn test_rootsrv_updates_the_framebuffer_from_keyboard_input() {
             "rootsrv: moved capability revoked transitively",
             "Hello from ring 3, rootsrv alive.",
             "rootsrv: console write acknowledged over IPC",
+            "rootsrv: wait selected both console notification and reply",
             "rootsrv: console endpoint rights verified",
             "rootsrv: notification transferred and revoked across capability spaces",
             "rootsrv: shared frame mapped read-only by console and unmapped on revocation",

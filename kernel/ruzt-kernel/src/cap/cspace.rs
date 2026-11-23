@@ -2,7 +2,7 @@
 
 use alloc::{collections::BTreeMap, vec::Vec};
 use core::ops::Bound::{Excluded, Unbounded};
-use ruzt_abi::{cptr_depth, ErrorCode, RetypeKind, IPC_CAP_SLOTS, MAX_CNODE_RADIX};
+use ruzt_abi::{cptr_depth, ErrorCode, RetypeKind, IPC_CAP_SLOTS, MAX_CNODE_RADIX, MAX_CPTR_DEPTH};
 use ruzt_cap::{CapRights, CapSlot, CapType, NULL_SLOT};
 use spin::Mutex;
 
@@ -11,6 +11,19 @@ use super::object::{self, FramePin, KObjectId, UntypedBudget, MAX_OBJECTS};
 /// A capability identity that survives moves between slots.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct CapabilityId(u64);
+
+/// The authorities exercised while traversing a slot path.
+#[derive(Clone, Copy)]
+pub(crate) struct CapabilityPath([u64; MAX_CPTR_DEPTH]);
+
+impl CapabilityPath {
+    pub(crate) fn is_live(&self) -> bool {
+        let tree = DERIVATIONS.lock();
+        self.0
+            .iter()
+            .all(|&id| id == 0 || tree.nodes.contains_key(&CapabilityId(id)))
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct CapGrant {
@@ -264,6 +277,16 @@ impl CSpace {
         cptr: u64,
         writable: bool,
     ) -> Result<SlotAddress, ErrorCode> {
+        self.resolve_with(tree, cptr, writable, |_, _| {})
+    }
+
+    fn resolve_with(
+        &self,
+        tree: &DerivationTree,
+        cptr: u64,
+        writable: bool,
+        mut visit: impl FnMut(usize, CapabilityId),
+    ) -> Result<SlotAddress, ErrorCode> {
         let depth = cptr_depth(cptr)?;
         let rights = if writable {
             CapRights::READ.union(CapRights::WRITE)
@@ -273,17 +296,27 @@ impl CSpace {
         let mut cnode = None;
         for level in (1..depth).rev() {
             let index = ((cptr >> (level * 8)) as u8) as usize;
-            let (_, node) = self.live_node(tree, SlotAddress { cnode, index })?;
+            let (id, node) = self.live_node(tree, SlotAddress { cnode, index })?;
             cnode = Some(node.cnode().ok_or(ErrorCode::InvalidCap)?);
             if !node.slot.rights.contains(rights) {
                 return Err(ErrorCode::CapRightsViolation);
             }
+            visit(level, id);
         }
         let index = cptr as u8 as usize;
         if index >= self.slots(tree, cnode).len() {
             return Err(ErrorCode::InvalidCap);
         }
         Ok(SlotAddress { cnode, index })
+    }
+
+    pub(crate) fn lookup_path(&self, cptr: u64) -> Result<(CapabilityPath, CapSlot), ErrorCode> {
+        let tree = DERIVATIONS.lock();
+        let mut path = [0; MAX_CPTR_DEPTH];
+        let address = self.resolve_with(&tree, cptr, false, |level, id| path[level] = id.0)?;
+        let (id, node) = self.live_node(&tree, address)?;
+        path[0] = id.0;
+        Ok((CapabilityPath(path), node.slot))
     }
 
     fn live_node(
@@ -870,6 +903,9 @@ mod tests {
         let owned = cptr_path(&[0, 0, 0]).unwrap();
         let peer_rw = cptr_path(&[1, 0, 0]).unwrap();
         let original = endpoint(&mut owner, owned);
+        let (owner_path, _) = owner.lookup_path(owned).unwrap();
+        let (peer_path, _) = peer.lookup_path(owned).unwrap();
+        assert!(peer_path.is_live());
         assert_eq!(
             peer.lookup(owned).unwrap().cap_type,
             CapType::Endpoint(EndpointId(original.0))
@@ -890,6 +926,8 @@ mod tests {
         peer.revoke_all_descendants();
         assert!(owner.lookup(owned).is_ok());
         owner.revoke_all_descendants();
+        assert!(owner_path.is_live());
+        assert!(!peer_path.is_live());
         assert_eq!(peer.lookup(2), Err(ErrorCode::InvalidCap));
         assert_eq!(peer.lookup(peer_rw), Err(ErrorCode::InvalidCap));
     }

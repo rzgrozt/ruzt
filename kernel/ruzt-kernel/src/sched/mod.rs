@@ -2,6 +2,7 @@
 
 use crate::cap::cspace::{self, CapabilityId};
 use crate::cap::object::KObjectId;
+use crate::ipc::wait::{Sources, Target};
 use crate::ipc::{Packet, ReceiveSlots};
 use crate::process::UserProcess;
 use alloc::collections::VecDeque;
@@ -29,6 +30,8 @@ pub enum ThreadState {
     BlockedProcess(KObjectId),
     /// A user driver is blocked waiting for a device interrupt.
     BlockedIrq(u32),
+    /// Thread is blocked until any source in its wait list becomes ready.
+    BlockedAny,
     /// The task has terminated and will never run again.
     Exited,
 }
@@ -47,10 +50,22 @@ struct Thread {
     message: Option<Packet>,
     receive_slots: ReceiveSlots,
     wait_capability: Option<CapabilityId>,
+    wait_sources: Option<Sources>,
     /// A failure delivered instead of a message when an endpoint closes.
     ipc_error: Option<ErrorCode>,
     /// Address space and capabilities of a user-mode thread.
     user: Option<UserProcess>,
+}
+
+impl Thread {
+    fn waits_for(&self, target: Target) -> bool {
+        self.wait_sources.as_ref().is_some_and(|sources| {
+            sources
+                .iter()
+                .flatten()
+                .any(|source| source.target == target)
+        })
+    }
 }
 
 /// Scheduler state.
@@ -79,9 +94,14 @@ impl Scheduler {
             self.wait_queue.retain(|&thread| thread != id);
             self.threads[id].state = ThreadState::Runnable;
             self.threads[id].wait_capability = None;
+            self.threads[id].wait_sources = None;
             self.threads[id].receive_slots = ReceiveSlots::default();
             self.run_queue.push_back(id);
         }
+    }
+
+    fn wake_wait_any(&mut self, target: Target) {
+        self.finish_waiters(None, |thread| thread.waits_for(target));
     }
     fn finish_waiters(&mut self, error: Option<ErrorCode>, matches: impl Fn(&Thread) -> bool) {
         loop {
@@ -137,6 +157,7 @@ pub fn init() {
         message: None,
         receive_slots: ReceiveSlots::default(),
         wait_capability: None,
+        wait_sources: None,
         ipc_error: None,
         user: None,
     }));
@@ -155,6 +176,24 @@ pub(crate) fn block_with_authority(
     capability: Option<CapabilityId>,
     slots: ReceiveSlots,
 ) {
+    block(reason, capability, slots, None);
+}
+
+pub(crate) fn block_wait_any(sources: &Sources) {
+    block(
+        ThreadState::BlockedAny,
+        None,
+        ReceiveSlots::default(),
+        Some(sources),
+    );
+}
+
+fn block(
+    reason: ThreadState,
+    capability: Option<CapabilityId>,
+    slots: ReceiveSlots,
+    sources: Option<&Sources>,
+) {
     #[cfg(feature = "qemu-smoke-test")]
     crate::serial_println!(
         "block_current: thread={} reason={:?}",
@@ -169,7 +208,12 @@ pub(crate) fn block_with_authority(
     assert_ne!(current_id, 0, "the idle thread cannot block");
     sched.threads[current_id].wait_capability = capability;
     sched.threads[current_id].receive_slots = slots;
+    sched.threads[current_id].wait_sources = sources.copied();
     sched.mark_blocked(current_id, reason);
+    if let ThreadState::BlockedSend(endpoint) = reason {
+        // A selector can consume the sender only after it joins the queue.
+        sched.wake_wait_any(Target::Endpoint(endpoint));
+    }
 
     // Switch to next runnable thread.
     let next_id = sched.run_queue.front().copied().unwrap_or(0);
@@ -203,6 +247,13 @@ pub(crate) fn cancel_endpoint_waiters(endpoint: KObjectId) {
                 if object == endpoint
         )
     });
+    sched.wake_wait_any(Target::Endpoint(endpoint));
+}
+
+pub(crate) fn wake_wait_any(target: Target) {
+    if let Some(sched) = SCHEDULER.lock().as_mut() {
+        sched.wake_wait_any(target);
+    }
 }
 
 pub(crate) fn apply_capability_removals() {
@@ -217,6 +268,12 @@ pub(crate) fn apply_capability_removals() {
         thread
             .wait_capability
             .is_some_and(|id| !cspace::is_live(id))
+            || thread.wait_sources.as_ref().is_some_and(|sources| {
+                sources
+                    .iter()
+                    .flatten()
+                    .any(|source| !source.authority.is_live())
+            })
     });
 }
 
@@ -226,6 +283,7 @@ pub(crate) fn wake_process_waiters(process: KObjectId) {
     sched.finish_waiters(None, |thread| {
         thread.state == ThreadState::BlockedProcess(process)
     });
+    sched.wake_wait_any(Target::Process(process));
 }
 
 pub(crate) fn complete_ipc(id: ThreadId, error: Option<ErrorCode>) {
@@ -269,7 +327,8 @@ pub(crate) fn check_ipc_completion() -> Result<(), ErrorCode> {
 pub(crate) fn wake_irq(thread_id: ThreadId, irq: u32) {
     let mut guard = SCHEDULER.lock();
     let sched = guard.as_mut().expect("scheduler not initialised");
-    if sched.threads[thread_id].state == ThreadState::BlockedIrq(irq) {
+    let thread = &sched.threads[thread_id];
+    if thread.state == ThreadState::BlockedIrq(irq) || thread.waits_for(Target::Irq(irq)) {
         sched.mark_runnable(thread_id);
         request_switch();
     }
@@ -399,6 +458,7 @@ fn spawn_thread(f: fn() -> !, user: Option<UserProcess>) -> Result<ThreadId, Err
         message: None,
         receive_slots: ReceiveSlots::default(),
         wait_capability: None,
+        wait_sources: None,
         ipc_error: None,
         user,
     };
@@ -649,6 +709,72 @@ mod tests {
         );
         drop(caps);
         assert!(object::get(id).is_none());
+    }
+
+    #[test]
+    fn wait_any_wakes_for_matching_sources_and_cancels_revoked_authority() {
+        use crate::cap::object;
+        use crate::ipc::wait::Source;
+        use ruzt_cap::{CapRights, CapSlot, CapType, EndpointId, NotificationId};
+
+        let _state = crate::isolated_kernel_state();
+        let endpoint = object::allocate(CapType::Endpoint(EndpointId(0))).unwrap();
+        let notification = object::allocate(CapType::Notification(NotificationId(0))).unwrap();
+        let mut caps = cspace::CSpace::new(1);
+        for (cptr, cap_type) in [
+            CapType::Endpoint(EndpointId(endpoint.0)),
+            CapType::Notification(NotificationId(notification.0)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            caps.insert(
+                cptr as u64,
+                CapSlot {
+                    cap_type,
+                    rights: CapRights::READ,
+                    badge: 0,
+                },
+            )
+            .unwrap();
+        }
+        fn entry() -> ! {
+            panic!("host tests do not switch stacks")
+        }
+        let endpoint_waiter = spawn(entry);
+        let notification_waiter = spawn(entry);
+        {
+            let mut guard = SCHEDULER.lock();
+            let scheduler = guard.as_mut().unwrap();
+            for (cptr, thread) in [endpoint_waiter, notification_waiter]
+                .into_iter()
+                .enumerate()
+            {
+                let (path, slot) = caps.lookup_path(cptr as u64).unwrap();
+                let mut sources = Sources::default();
+                sources[0] = Some(Source::new(path, slot, thread).unwrap());
+                scheduler.threads[thread].wait_sources = Some(sources);
+                scheduler.mark_blocked(thread, ThreadState::BlockedAny);
+            }
+        }
+        crate::ipc::close_endpoint(EndpointId(endpoint.0));
+        {
+            let guard = SCHEDULER.lock();
+            let scheduler = guard.as_ref().unwrap();
+            assert_eq!(scheduler.run_queue, [endpoint_waiter]);
+            assert_eq!(scheduler.wait_queue, [notification_waiter]);
+            assert_eq!(scheduler.threads[endpoint_waiter].ipc_error, None);
+        }
+        caps.delete(1).unwrap();
+        apply_capability_removals();
+        let guard = SCHEDULER.lock();
+        let scheduler = guard.as_ref().unwrap();
+        assert_eq!(scheduler.run_queue, [endpoint_waiter, notification_waiter]);
+        assert!(scheduler.wait_queue.is_empty());
+        assert_eq!(
+            scheduler.threads[notification_waiter].ipc_error,
+            Some(ErrorCode::InvalidCap)
+        );
     }
 
     #[test]

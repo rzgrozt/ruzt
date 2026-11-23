@@ -11,6 +11,7 @@ use ruzt_abi::{
     ROOTSRV_CONSOLE_NOTIFICATION, ROOTSRV_CONSOLE_PROCESS, ROOTSRV_CONSOLE_PROGRAM,
     ROOTSRV_CONSOLE_REPLY, ROOTSRV_CONSOLE_REQUEST, ROOTSRV_FRAMEBUFFER, ROOTSRV_KEYBOARD_DATA,
     ROOTSRV_KEYBOARD_IRQ, ROOTSRV_UART_DATA, ROOTSRV_UART_STATUS, ROOTSRV_UNTYPED,
+    WAIT_ENDPOINT_CLOSED, WAIT_IRQ, WAIT_MESSAGE, WAIT_NOTIFICATION, WAIT_PROCESS_EXITED,
 };
 use ruzt_runtime::{debug_print, runtime_init};
 
@@ -97,11 +98,21 @@ fn greet_via_console() -> Result<(), ErrorCode> {
     }
 
     ruzt_ipc::send(ROOTSRV_CONSOLE_REQUEST, &request)?;
-    ruzt_ipc::recv(ROOTSRV_CONSOLE_REPLY, &mut reply)?;
+    let signal = ruzt_ipc::wait_any(&[ROOTSRV_CONSOLE_NOTIFICATION, ROOTSRV_CONSOLE_REPLY])?;
+    if signal.kind == WAIT_ENDPOINT_CLOSED {
+        return Err(ErrorCode::NotFound);
+    }
+    assert_eq!((signal.index, signal.kind), (0, WAIT_NOTIFICATION));
+    let response = ruzt_ipc::wait_any(&[ROOTSRV_CONSOLE_REPLY, ROOTSRV_CONSOLE_NOTIFICATION])?;
+    if response.kind == WAIT_ENDPOINT_CLOSED {
+        return Err(ErrorCode::NotFound);
+    }
+    assert_eq!((response.index, response.kind), (0, WAIT_MESSAGE));
+    reply = response.message;
     assert_eq!(reply.label, console::WRITTEN);
     assert_eq!(reply.length, 0);
-    ruzt_ipc::wait(ROOTSRV_CONSOLE_NOTIFICATION)?;
     write_line("rootsrv: console write acknowledged over IPC");
+    write_line("rootsrv: wait selected both console notification and reply");
     write_line("rootsrv: console endpoint rights verified");
 
     ruzt_ipc::revoke(ROOTSRV_CONSOLE_NOTIFICATION)?;
@@ -306,7 +317,7 @@ fn confirm_console_ready() -> Result<(), ErrorCode> {
     Ok(())
 }
 
-fn run_console() {
+fn run_console() -> bool {
     ruzt_ipc::split_untyped(ROOTSRV_UNTYPED, PROGRAM_BUDGET, PROGRAM_BUDGET_BITS)
         .expect("reserve console address-space memory");
     ruzt_ipc::split_untyped(ROOTSRV_UNTYPED, SESSION_BUDGET, SERVICE_BUDGET_BITS + 1)
@@ -343,13 +354,15 @@ fn run_console() {
         write_line("rootsrv: both delegated budgets reclaimed");
 
         match result {
-            Ok(()) => return,
+            Ok(()) => return true,
             Err(ErrorCode::NotFound) => write_line("rootsrv: console disconnected"),
             Err(error) => panic!("console IPC failed: {error:?}"),
         }
-        let status = ruzt_ipc::wait_process(ROOTSRV_CONSOLE_PROCESS)
+        let event = ruzt_ipc::wait_any(&[ROOTSRV_CONSOLE_PROCESS])
             .expect("wait for the console to be reaped");
-        assert_eq!(ruzt_ipc::poll_process(ROOTSRV_CONSOLE_PROCESS), Ok(status));
+        assert_eq!((event.index, event.kind), (0, WAIT_PROCESS_EXITED));
+        let status = ruzt_ipc::poll_process(ROOTSRV_CONSOLE_PROCESS)
+            .expect("read console status after the process event");
         let reason = match status.kind {
             PROCESS_EXITED => "exit status",
             PROCESS_FAULTED => "fault vector",
@@ -367,12 +380,13 @@ fn run_console() {
         }
         ruzt_ipc::delete(ROOTSRV_CONSOLE_PROCESS).expect("release old console status");
         if status.kind == PROCESS_EXITED && status.code == 0 {
-            return;
+            return false;
         }
         if attempt == 0 {
             write_line("rootsrv: restarting console with fresh endpoints");
         }
     }
+    false
 }
 
 fn verify_program_budget_reclaimed() {
@@ -387,7 +401,7 @@ fn verify_program_budget_reclaimed() {
 }
 
 fn main() -> ! {
-    run_console();
+    let mut console_is_open = run_console();
     check_cspace();
     check_anonymous_memory();
     check_heap_growth();
@@ -417,16 +431,25 @@ fn main() -> ! {
         write_line("rootsrv: framebuffer tile drawn");
     }
     write_line("rootsrv: press Space to test keyboard input");
+    let sources = [ROOTSRV_KEYBOARD_IRQ, ROOTSRV_CONSOLE_REPLY];
     loop {
-        ruzt_driver_sdk::wait_irq(ROOTSRV_KEYBOARD_IRQ).expect("wait for PS/2 keyboard IRQ");
-        let scancode =
-            ruzt_driver_sdk::read_port_u8(ROOTSRV_KEYBOARD_DATA).expect("read PS/2 keyboard data");
-        // The boot firmware configures translated set-1 scancodes.
-        if scancode == 0x39 {
-            if let Some(tile) = &mut tile {
-                tile.toggle();
+        let count = 1 + usize::from(console_is_open);
+        let event = ruzt_ipc::wait_any(&sources[..count]).expect("wait for keyboard or console");
+        match event.kind {
+            WAIT_ENDPOINT_CLOSED => console_is_open = false,
+            WAIT_MESSAGE => {}
+            WAIT_IRQ => {
+                let scancode = ruzt_driver_sdk::read_port_u8(ROOTSRV_KEYBOARD_DATA)
+                    .expect("read PS/2 keyboard data");
+                // The boot firmware configures translated set-1 scancodes.
+                if scancode == 0x39 {
+                    if let Some(tile) = &mut tile {
+                        tile.toggle();
+                    }
+                    write_line("rootsrv: Space key received");
+                }
             }
-            write_line("rootsrv: Space key received");
+            kind => panic!("unexpected keyboard loop event {kind}"),
         }
     }
 }
@@ -458,8 +481,18 @@ fn check_cspace() {
         ruzt_ipc::delete(read_path),
         Err(ErrorCode::CapRightsViolation)
     );
+    assert_eq!(ruzt_ipc::wait_any(&[]), Err(ErrorCode::BadMessage));
+    assert_eq!(
+        ruzt_ipc::wait_any(&[read_path; ruzt_abi::MAX_WAIT_SOURCES + 1]),
+        Err(ErrorCode::BadMessage)
+    );
     ruzt_ipc::signal(notification).expect("signal through a nested path");
-    ruzt_ipc::wait(read_path).expect("wait through the read-only path");
+    assert_eq!(
+        ruzt_ipc::wait_any(&[read_path, u64::MAX]),
+        Err(ErrorCode::InvalidCap)
+    );
+    let event = ruzt_ipc::wait_any(&[read_path]).expect("wait through the read-only path");
+    assert_eq!((event.index, event.kind), (0, WAIT_NOTIFICATION));
     assert_eq!(
         ruzt_ipc::move_cap(table, cptr_path(&[TABLE, 1]).unwrap()),
         Err(ErrorCode::BadMessage)
