@@ -23,6 +23,8 @@ pub fn init() {
 /// Returns the value to be written back into `rax`.
 #[inline(never)]
 pub(crate) extern "C" fn syscall_dispatch(args: &SyscallArgs, caller_cs: u64) -> u64 {
+    #[cfg(feature = "qemu-hardening-test")]
+    crate::exceptions::assert_entry_flags();
     let from_user = caller_cs & 3 == 3;
     match SyscallNumber::from(args.number) {
         // The shared kernel CSpace serves only the internal IPC self-test.

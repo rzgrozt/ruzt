@@ -97,6 +97,13 @@ pub fn main(boot_info: &'static mut BootInfo) -> ! {
     serial_println!("Ruzt booting...");
 
     exceptions::init_idt();
+    #[allow(unsafe_code)]
+    // SAFETY: The kernel and physmap use supervisor mappings. Every IDT
+    // entry clears AC and DF before entering Rust, and interrupts are off.
+    let (smep, smap) = unsafe { ruzt_hal_x86_64::cpu::enable_supervisor_protection() };
+    serial_println!("x86 supervisor protection (SMEP={smep}, SMAP={smap})");
+    #[cfg(feature = "qemu-hardening-test")]
+    assert!(smep && smap, "the hardening fixture requires SMEP and SMAP");
     syscall::init();
     serial_println!("IDT loaded.");
 

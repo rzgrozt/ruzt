@@ -22,6 +22,7 @@ default = ["arch-x86_64"]
 qemu-smoke-test = []
 qemu-rootsrv-test = []
 qemu-vtd-test = []
+qemu-hardening-test = []
 arch-x86_64 = ["ruzt-hal", "ruzt-hal-x86_64"]
 arch-aarch64 = ["ruzt-hal", "ruzt-hal-aarch64"]
 

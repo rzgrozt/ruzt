@@ -103,9 +103,13 @@ fn test_rootsrv_updates_the_framebuffer_from_keyboard_input() {
 #[test]
 fn test_timer_preempts_cpu_bound_user_code() {
     let temp = tempfile::tempdir().expect("Failed to create boot test directory");
-    let disk_image = build_image(temp.path(), "qemu-rootsrv-test", Services::CpuBoundConsole);
+    let disk_image = build_image(
+        temp.path(),
+        "qemu-rootsrv-test,qemu-hardening-test",
+        Services::CpuBoundConsole,
+    );
     let serial_path = temp.path().join("serial.log");
-    let mut vm = start_guest(&disk_image, &serial_path);
+    let mut vm = start_guest_with_devices(&disk_image, &serial_path, &["-cpu", "max"]);
     let boot_deadline = Instant::now() + BOOT_TIMEOUT;
     wait_for_serial(
         &mut vm.child,
@@ -121,7 +125,18 @@ fn test_timer_preempts_cpu_bound_user_code() {
     );
     assert_markers(
         &serial,
-        &["rootsrv: timed wait and sleep woke at monotonic deadlines"],
+        &[
+            "x86 supervisor protection (SMEP=true, SMAP=true)",
+            "consoled: syscall preserved user AC and DF",
+            "kernel: timer entry cleared user AC",
+        ],
+    );
+    assert_markers(
+        &serial,
+        &[
+            "rootsrv: timed wait and sleep woke at monotonic deadlines",
+            "rootsrv: syscall copy checked both pages before writing",
+        ],
     );
     monitor(&mut vm.child, "sendkey spc");
     wait_for_serial(

@@ -833,12 +833,50 @@ fn check_anonymous_memory() {
     );
     // SAFETY: The failed range operations preserved this existing mapping.
     assert_eq!(unsafe { (SECOND as *const u8).read_volatile() }, 0xa5);
+    let crossing = SECOND - 4;
+    let earliest = ruzt_runtime::syscall::monotonic_ns().expect("read clock before split copy");
+    assert_eq!(read_clock_at(crossing), Ok(()));
+    // SAFETY: The syscall wrote the two aligned halves in writable private pages.
+    let copied = unsafe {
+        let low = (crossing as *const u32).read_volatile();
+        let high = (SECOND as *const u32).read_volatile();
+        u64::from(low) | (u64::from(high) << 32)
+    };
+    let latest = ruzt_runtime::syscall::monotonic_ns().expect("read clock after split copy");
+    assert!((earliest..=latest).contains(&copied));
+
     ruzt_ipc::unmap_anonymous(space, SECOND, 1).expect("unmap part of the private range");
     ruzt_ipc::map_anonymous(space, SECOND, 1, false).expect("remap as read-only");
+    // SAFETY: The first page stays writable across the second-page remap.
+    unsafe { (crossing as *mut u32).write_volatile(u32::MAX) };
+    assert_eq!(read_clock_at(crossing), Err(ErrorCode::BadMessage));
+    // SAFETY: The first page stays mapped and should not have been modified.
+    assert_eq!(
+        unsafe { (crossing as *const u32).read_volatile() },
+        u32::MAX
+    );
     // SAFETY: The second page is mapped readable after remapping.
     assert_eq!(unsafe { (SECOND as *const u8).read_volatile() }, 0);
     ruzt_ipc::unmap_anonymous(space, BASE, 2).expect("return both private pages");
     write_line("rootsrv: anonymous memory rolled back and reused zeroed");
+    write_line("rootsrv: syscall copy checked both pages before writing");
+}
+
+fn read_clock_at(address: u64) -> Result<(), ErrorCode> {
+    // SAFETY: The caller supplies a controlled address in private pages. It
+    // exercises the kernel's validation of the entire output range.
+    let status = unsafe {
+        ruzt_runtime::syscall::syscall(
+            ruzt_abi::SyscallNumber::MonotonicTime,
+            address,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    };
+    ErrorCode::from_u64(status)
 }
 
 fn split_service_budgets() {

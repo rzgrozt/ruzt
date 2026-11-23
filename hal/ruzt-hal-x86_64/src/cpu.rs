@@ -2,6 +2,10 @@
 
 use ruzt_hal::cpu::{CpuOps, InterruptGuard};
 use x86_64::instructions::interrupts;
+use x86_64::registers::{
+    control::{Cr4, Cr4Flags},
+    rflags::{self, RFlags},
+};
 
 /// Stores the prior interrupt-enable flag and restores it on drop.
 pub struct X86_64InterruptGuard {
@@ -54,6 +58,38 @@ impl CpuOps for X86_64Cpu {
         interrupts::disable();
         X86_64InterruptGuard { if_enabled }
     }
+}
+
+/// Enable SMEP and SMAP on the current CPU when CPUID reports support.
+///
+/// Returns the active state of SMEP and SMAP, in that order.
+///
+/// # Safety
+/// Call in ring zero after installing entry handlers that clear AC and DF.
+/// Kernel code and data, including syscall buffer aliases, must be mapped
+/// supervisor-only. Interrupts must be disabled during setup.
+pub unsafe fn enable_supervisor_protection() -> (bool, bool) {
+    let mut enabled = Cr4Flags::empty();
+    if core::arch::x86_64::__cpuid(0).eax >= 7 {
+        let features = core::arch::x86_64::__cpuid_count(7, 0).ebx;
+        if features & (1 << 7) != 0 {
+            enabled |= Cr4Flags::SUPERVISOR_MODE_EXECUTION_PROTECTION;
+        }
+        if features & (1 << 20) != 0 {
+            enabled |= Cr4Flags::SUPERVISOR_MODE_ACCESS_PREVENTION;
+        }
+    }
+    // SAFETY: The caller established the supervisor mappings and entry path.
+    // Keep unrelated RFLAGS and CR4 bits as established at boot.
+    unsafe {
+        rflags::update(|flags| flags.remove(RFlags::ALIGNMENT_CHECK));
+        Cr4::update(|flags| flags.insert(enabled));
+    }
+    let active = Cr4::read();
+    (
+        active.contains(Cr4Flags::SUPERVISOR_MODE_EXECUTION_PROTECTION),
+        active.contains(Cr4Flags::SUPERVISOR_MODE_ACCESS_PREVENTION),
+    )
 }
 
 /// Trigger QEMU isa-debug-exit shutdown.

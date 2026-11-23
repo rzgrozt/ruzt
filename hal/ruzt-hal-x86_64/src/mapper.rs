@@ -550,31 +550,101 @@ pub fn active_user_range_accessible(
     len: usize,
     writable: bool,
 ) -> bool {
-    let Some(last) = address.checked_add(len as u64).and_then(|end| end.checked_sub(1)) else {
-        return false;
-    };
-    if len == 0 || address == 0 || last >= 1 << 47 {
-        return false;
-    }
-    if !root_is_active(root) {
-        return false;
-    }
-
-    let mut required = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
-    if writable {
-        required |= PageTableFlags::WRITABLE;
-    }
-    let page_mask = !(PhysFrame::SIZE as u64 - 1);
-    (address & page_mask..=last & page_mask)
-        .step_by(PhysFrame::SIZE)
-        .all(|page| user_page_accessible(root, X64VirtAddr::new(page), required))
+    UserRange::check(root, address, len, writable).is_some()
 }
 
-fn user_page_accessible(
+struct UserRange {
+    root: PhysFrame,
+    address: u64,
+    len: usize,
+    required: PageTableFlags,
+}
+
+impl UserRange {
+    fn check(root: PhysFrame, address: u64, len: usize, writable: bool) -> Option<Self> {
+        let last = address.checked_add(len as u64)?.checked_sub(1)?;
+        if len == 0 || address == 0 || last >= 1 << 47 || !root_is_active(root) {
+            return None;
+        }
+
+        let mut required = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+        if writable {
+            required |= PageTableFlags::WRITABLE;
+        }
+        let page_mask = !(PhysFrame::SIZE as u64 - 1);
+        (address & page_mask..=last & page_mask)
+            .step_by(PhysFrame::SIZE)
+            .all(|page| user_page_frame(root, X64VirtAddr::new(page), required).is_some())
+            .then_some(Self { root, address, len, required })
+    }
+
+    fn visit_pieces(&self, mut visit: impl FnMut(*mut u8, usize, usize)) {
+        let mut consumed = 0;
+        while consumed < self.len {
+            let address = X64VirtAddr::new(self.address + consumed as u64);
+            let frame = user_page_frame(self.root, address, self.required)
+                .expect("checked user mappings must remain stable");
+            let offset = usize::from(address.page_offset());
+            let length = (PhysFrame::SIZE - offset).min(self.len - consumed);
+            visit(frame_pointer(frame).wrapping_add(offset), consumed, length);
+            consumed += length;
+        }
+    }
+}
+
+/// Read a checked user buffer through supervisor-only aliases.
+///
+/// Return false without copying if any page is outside the accessible range.
+///
+/// # Safety
+/// The caller must keep the root, mappings, and backing frames stable for the
+/// call. The source must be ordinary RAM and disjoint from the destination.
+pub unsafe fn copy_from_active_user(root: PhysFrame, address: u64, buf: &mut [u8]) -> bool {
+    let Some(range) = UserRange::check(root, address, buf.len(), false) else {
+        return false;
+    };
+    range.visit_pieces(|source, offset, length| {
+        // SAFETY: The checked source piece is in a live RAM frame, and the
+        // caller provides a disjoint destination with room for every piece.
+        unsafe { ptr::copy_nonoverlapping(source, buf.as_mut_ptr().add(offset), length) };
+    });
+    true
+}
+
+/// Write a checked user buffer through supervisor-only aliases.
+///
+/// Return false without calling `produce` or writing if any page is outside
+/// the accessible range. The produced buffer must contain exactly `len` bytes.
+///
+/// # Safety
+/// The caller must keep the root, mappings, and backing frames stable for the
+/// call, including during `produce`. The destination must be ordinary RAM
+/// exclusively writable during the copy and disjoint from the source.
+pub unsafe fn copy_to_active_user_with<T: AsRef<[u8]>>(
+    root: PhysFrame,
+    address: u64,
+    len: usize,
+    produce: impl FnOnce() -> T,
+) -> bool {
+    let Some(range) = UserRange::check(root, address, len, true) else {
+        return false;
+    };
+    let output = produce();
+    let buf = output.as_ref();
+    assert_eq!(buf.len(), len);
+    range.visit_pieces(|destination, offset, length| {
+        // SAFETY: The checked destination piece is in a live, exclusively
+        // writable RAM frame, and the caller provides a disjoint source.
+        unsafe { ptr::copy_nonoverlapping(buf.as_ptr().add(offset), destination, length) };
+    });
+    true
+}
+
+fn user_page_frame(
     root: PhysFrame,
     addr: X64VirtAddr,
     required: PageTableFlags,
-) -> bool {
+) -> Option<PhysFrame> {
     let mut physical = root.base.as_u64();
     for (level, index) in [addr.p4_index(), addr.p3_index(), addr.p2_index(), addr.p1_index()]
         .into_iter()
@@ -585,24 +655,22 @@ fn user_page_accessible(
         // non-huge entry names a live table. The boot physmap covers them.
         let table = unsafe { &*virtual_addr.as_ptr::<PageTable>() };
         let entry = &table[index];
-        if !entry.flags().contains(required) {
-            return false;
+        let flags = entry.flags();
+        if !flags.contains(required) {
+            return None;
         }
-        if level == 3
-            && entry
-                .flags()
-                .intersects(PageTableFlags::NO_CACHE | DMA_PAGE)
-        {
-            return false;
-        }
-        if level != 3 {
-            if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-                return false;
+        if level == 3 {
+            if flags.intersects(PageTableFlags::NO_CACHE | DMA_PAGE) {
+                return None;
             }
-            physical = entry.addr().as_u64();
+            return PhysFrame::from_base(PhysAddr::new(entry.addr().as_u64()));
         }
+        if flags.contains(PageTableFlags::HUGE_PAGE) {
+            return None;
+        }
+        physical = entry.addr().as_u64();
     }
-    true
+    unreachable!("four-level walk has a leaf")
 }
 
 /// Zero exactly one 4 KiB physical frame through the boot physmap.

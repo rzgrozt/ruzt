@@ -83,10 +83,53 @@ fn main() -> ! {
         ruzt_ipc::send(console::REPLY, &reply).expect("reply to console request");
         #[cfg(feature = "qemu-preemption-test")]
         if reply.label == console::REVOKED {
-            loop {
-                core::hint::spin_loop();
-            }
+            run_preemption_test();
         }
+    }
+}
+
+#[cfg(feature = "qemu-preemption-test")]
+fn run_preemption_test() -> ! {
+    const AC: u64 = 1 << 18;
+    const DF: u64 = 1 << 10;
+    let mut timestamp = 0u64;
+    let (status, returned_flags): (u64, u64);
+    // SAFETY: The syscall writes one u64 to our live stack. AC and DF are set
+    // for the transition and cleared before control returns to Rust.
+    unsafe {
+        core::arch::asm!(
+            "pushfq",
+            "or qword ptr [rsp], {test_flags}",
+            "popfq",
+            "int 0x80",
+            "pushfq",
+            "pop {returned_flags}",
+            "pushfq",
+            "and qword ptr [rsp], {clear_flags}",
+            "popfq",
+            test_flags = const AC | DF,
+            clear_flags = const !((AC | DF) as i32),
+            returned_flags = lateout(reg) returned_flags,
+            inlateout("rax") ruzt_abi::SyscallNumber::MonotonicTime as u64 => status,
+            in("rdi") &mut timestamp,
+        );
+    }
+    assert_eq!(ErrorCode::from_u64(status), Ok(()));
+    assert_ne!(timestamp, 0);
+    assert_eq!(returned_flags & (AC | DF), AC | DF);
+    uart_write(b"consoled: syscall preserved user AC and DF\n");
+
+    // SAFETY: The loop touches no user data and never returns to Rust.
+    unsafe {
+        core::arch::asm!(
+            "pushfq",
+            "or qword ptr [rsp], {ac}",
+            "popfq",
+            "2: pause",
+            "jmp 2b",
+            ac = const AC,
+            options(noreturn),
+        )
     }
 }
 

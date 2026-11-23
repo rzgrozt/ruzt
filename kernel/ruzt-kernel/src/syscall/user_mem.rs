@@ -1,16 +1,13 @@
 //! User memory copy helpers.
 
 use ruzt_abi::ErrorCode;
+use ruzt_hal_x86_64::mapper;
 #[cfg(not(test))]
 use ruzt_hal::mem::Mapper;
 
 #[cfg(not(test))]
 #[allow(unsafe_code)]
-/// Copy `kernel_buf.len()` bytes from a user-space virtual address into a
-/// kernel buffer.
-///
-/// For Phase 2.3 the kernel and user share the same address space, so this
-/// is a direct memory copy with a page table bounds check.
+/// Copy from the trusted kernel-only IPC diagnostic's payload.
 pub fn copy_from_user(user_ptr: u64, kernel_buf: &mut [u8]) -> Result<(), ErrorCode> {
     crate::serial_println!("copy_from_user: user_ptr={:x} len={}", user_ptr, kernel_buf.len());
     // Check that the user pointer is valid (mapped in the page tables).
@@ -26,8 +23,7 @@ pub fn copy_from_user(user_ptr: u64, kernel_buf: &mut [u8]) -> Result<(), ErrorC
     }
     crate::serial_println!("copy_from_user: translation ok, copying");
 
-    // SAFETY: The range has been verified as mapped. The kernel has full
-    // access to all memory in Phase 2.3 (no SMAP yet).
+    // SAFETY: The only caller supplies a live kernel payload with this length.
     unsafe {
         core::ptr::copy_nonoverlapping(
             user_ptr as *const u8,
@@ -55,8 +51,7 @@ pub fn copy_from_user(user_ptr: u64, kernel_buf: &mut [u8]) -> Result<(), ErrorC
 
 #[cfg(not(test))]
 #[allow(unsafe_code)]
-/// Copy `kernel_buf.len()` bytes from a kernel buffer into a user-space
-/// virtual address.
+/// Copy into the trusted kernel-only IPC diagnostic's receive buffer.
 pub fn copy_to_user(kernel_buf: &[u8], user_ptr: u64) -> Result<(), ErrorCode> {
     let start = user_ptr;
     let end = user_ptr + kernel_buf.len() as u64;
@@ -67,7 +62,7 @@ pub fn copy_to_user(kernel_buf: &[u8], user_ptr: u64) -> Result<(), ErrorCode> {
         }
     }
 
-    // SAFETY: The range has been verified as mapped.
+    // SAFETY: The only caller supplies a live kernel buffer of this length.
     unsafe {
         core::ptr::copy_nonoverlapping(
             kernel_buf.as_ptr(),
@@ -100,7 +95,7 @@ pub(crate) fn validate_user_buffer(
     len: usize,
     writable: bool,
 ) -> Result<(), ErrorCode> {
-    if ruzt_hal_x86_64::mapper::active_user_range_accessible(root, address, len, writable) {
+    if mapper::active_user_range_accessible(root, address, len, writable) {
         Ok(())
     } else {
         Err(ErrorCode::BadMessage)
@@ -113,16 +108,15 @@ pub(crate) fn read_user_buffer(
     address: u64,
     buf: &mut [u8],
 ) -> Result<(), ErrorCode> {
-    validate_user_buffer(root, address, buf.len(), false)?;
-    // SAFETY: The complete active user range is readable and disjoint from
-    // the higher-half kernel buffer. Its mappings are stable during the copy.
-    unsafe {
-        core::ptr::copy_nonoverlapping(address as *const u8, buf.as_mut_ptr(), buf.len());
+    // SAFETY: The syscall executes on the only CPU with interrupts disabled.
+    // User RAM frames are separate from the kernel's scratch buffers.
+    if unsafe { mapper::copy_from_active_user(root, address, buf) } {
+        Ok(())
+    } else {
+        Err(ErrorCode::BadMessage)
     }
-    Ok(())
 }
 
-#[allow(unsafe_code)]
 pub(crate) fn write_user_buffer(
     root: ruzt_hal::mem::PhysFrame,
     address: u64,
@@ -138,14 +132,12 @@ pub(crate) fn write_user_buffer_with<T: AsRef<[u8]>>(
     len: usize,
     produce: impl FnOnce() -> T,
 ) -> Result<(), ErrorCode> {
-    validate_user_buffer(root, address, len, true)?;
-    let output = produce();
-    let buf = output.as_ref();
-    assert_eq!(buf.len(), len);
-    // SAFETY: The complete active user range is writable and disjoint from
-    // the higher-half kernel buffer. Its mappings are stable during the copy.
-    unsafe {
-        core::ptr::copy_nonoverlapping(buf.as_ptr(), address as *mut u8, buf.len());
+    // SAFETY: The only CPU is in the syscall gate with interrupts disabled.
+    // The producer runs synchronously without changing mappings or scheduling,
+    // and its output lives in kernel RAM separate from the user frames.
+    if unsafe { mapper::copy_to_active_user_with(root, address, len, produce) } {
+        Ok(())
+    } else {
+        Err(ErrorCode::BadMessage)
     }
-    Ok(())
 }

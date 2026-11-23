@@ -16,6 +16,8 @@ The IPC library can block on up to eight endpoints, notifications, driver IRQs, 
 
 User tasks can read the monotonic clock, supply an absolute deadline to a capability wait, or sleep until a deadline without waiting on any capability. x86-64 wakes these tasks at scheduler safe points using the PIT's roughly 10 ms tick.
 
+The x86-64 kernel enables SMEP and SMAP when the CPU advertises them. Syscalls copy through supervisor-only aliases after checking access on every user page. Interrupt and syscall entry clear the live AC and DF flags and preserve the interrupted task's flags for return. The QEMU preemption test exercises this path with both protections enabled.
+
 The boot server can claim and delegate exclusive device IRQ capabilities for the legacy x86 PIC. A driver binds a claim, waits through the device SDK or IPC wait list, and acknowledges it after servicing the device. The line stays masked between delivery and acknowledgement. Revoking the binding capability or reaping its driver removes the binding. QEMU also exercises delegation, re-arming, and reclamation with a real COM1 interrupt in `consoled`.
 
 The boot server can enumerate conventional PCI configuration space and claim firmware-programmed memory BARs on endpoint functions with bus mastering disabled. It can delegate individual page-aligned BAR ranges with read or write rights. Device mappings are uncached and non-executable, and revocation removes their page-table entries. The QEMU EDU guest checks a real PCI register read and write, read-only delegation, rollback on an occupied page, and reclamation after revocation.
