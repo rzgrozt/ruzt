@@ -30,8 +30,6 @@ pub enum ThreadState {
     BlockedWait(KObjectId),
     /// Thread is waiting for a process to exit and be reaped.
     BlockedProcess(KObjectId),
-    /// A user driver is blocked waiting for a device interrupt.
-    BlockedIrq(u32),
     /// Thread is blocked until any source in its wait list becomes ready.
     BlockedAny,
     /// The task has terminated and will never run again.
@@ -301,6 +299,7 @@ pub(crate) fn wake_wait_any(target: Target) {
 }
 
 pub(crate) fn apply_capability_removals() {
+    crate::irq::detach_revoked();
     let mut guard = SCHEDULER.lock();
     let Some(sched) = guard.as_mut() else { return };
     for thread in &mut sched.threads {
@@ -372,8 +371,11 @@ pub(crate) fn wake_irq(thread_id: ThreadId, irq: u32) {
     let mut guard = SCHEDULER.lock();
     let sched = guard.as_mut().expect("scheduler not initialised");
     sched.expire_waits();
-    let thread = &sched.threads[thread_id];
-    if thread.state == ThreadState::BlockedIrq(irq) || thread.waits_for(Target::Irq(irq)) {
+    if sched
+        .threads
+        .get(thread_id)
+        .is_some_and(|thread| thread.waits_for(Target::Irq(irq)))
+    {
         sched.mark_runnable(thread_id);
         request_switch();
     }

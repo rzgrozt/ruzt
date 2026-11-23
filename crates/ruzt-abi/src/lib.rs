@@ -17,7 +17,7 @@ pub const SYS_SYSCALL: u32 = 0x80;
 /// Slot where the root process creates its console request capability.
 pub const ROOTSRV_CONSOLE_REQUEST: u64 = 0;
 
-/// Capability slot granted to the initial process for PS/2 keyboard interrupts.
+/// Slot for the initial process's claimed PS/2 keyboard interrupt.
 pub const ROOTSRV_KEYBOARD_IRQ: u64 = 1;
 
 /// Capability slot granted to the initial process for the PS/2 data port.
@@ -43,6 +43,12 @@ pub const ROOTSRV_CONSOLE_PROGRAM: u64 = 14;
 pub const ROOTSRV_UART_DATA: u64 = 18;
 /// Delegable authority for the console's UART status port.
 pub const ROOTSRV_UART_STATUS: u64 = 19;
+/// Boot authority to claim device interrupt lines.
+pub const ROOTSRV_IRQ_CONTROL: u64 = 28;
+/// Authority to configure the console UART's interrupt enable register.
+pub const ROOTSRV_UART_IRQ_ENABLE: u64 = 29;
+/// Authority to read the console UART's interrupt identification register.
+pub const ROOTSRV_UART_IRQ_IDENTIFY: u64 = 30;
 /// Self address-space capability installed at process startup.
 pub const PROCESS_ADDRESS_SPACE: u64 = 15;
 /// Base virtual address of the initial runtime heap.
@@ -130,6 +136,10 @@ pub mod console {
     /// a read-only frame, and an Untyped budget. The inline payload is a
     /// little-endian u16 byte count.
     pub const WRITE_SHARED: u64 = 6;
+    /// Exercise two interrupts on a delegated UART line.
+    pub const CHECK_IRQ: u64 = 7;
+    /// A UART interrupt was received and acknowledged.
+    pub const IRQ_CHECKED: u64 = 8;
 }
 
 /// System-call numbers.
@@ -243,6 +253,14 @@ pub enum CapOp {
     /// Extend the runtime heap with zeroed writable pages.
     /// `arg2` is the current heap end and `arg3` is the number of pages to add.
     GrowHeap = 18,
+    /// Claim the hardware line in `arg3` into slot `arg2` using IRQ control.
+    ClaimIrq = 19,
+    /// Bind the invoked IRQ to the calling driver.
+    BindIrq = 20,
+    /// Re-arm the invoked IRQ after consuming its event and servicing the device.
+    AckIrq = 21,
+    /// Remove the caller's binding and mask the invoked IRQ.
+    UnbindIrq = 22,
 }
 
 /// The process invoked `Exit`.
@@ -617,6 +635,10 @@ mod tests {
         assert_eq!(CapOp::MapAnonymous as u64, 16);
         assert_eq!(CapOp::UnmapAnonymous as u64, 17);
         assert_eq!(CapOp::GrowHeap as u64, 18);
+        assert_eq!(CapOp::ClaimIrq as u64, 19);
+        assert_eq!(CapOp::BindIrq as u64, 20);
+        assert_eq!(CapOp::AckIrq as u64, 21);
+        assert_eq!(CapOp::UnbindIrq as u64, 22);
     }
 
     #[test]

@@ -9,9 +9,10 @@ use ruzt_abi::{
     console, CapRights, CapTransferSlot, ErrorCode, IpcMessage, RetypeKind, FRAME_BYTES,
     PROCESS_ADDRESS_SPACE, PROCESS_EXITED, PROCESS_FAULTED, ROOTSRV_CONSOLE_FRAME,
     ROOTSRV_CONSOLE_NOTIFICATION, ROOTSRV_CONSOLE_PROCESS, ROOTSRV_CONSOLE_PROGRAM,
-    ROOTSRV_CONSOLE_REPLY, ROOTSRV_CONSOLE_REQUEST, ROOTSRV_FRAMEBUFFER, ROOTSRV_KEYBOARD_DATA,
-    ROOTSRV_KEYBOARD_IRQ, ROOTSRV_UART_DATA, ROOTSRV_UART_STATUS, ROOTSRV_UNTYPED,
-    WAIT_ENDPOINT_CLOSED, WAIT_IRQ, WAIT_MESSAGE, WAIT_NOTIFICATION, WAIT_PROCESS_EXITED,
+    ROOTSRV_CONSOLE_REPLY, ROOTSRV_CONSOLE_REQUEST, ROOTSRV_FRAMEBUFFER, ROOTSRV_IRQ_CONTROL,
+    ROOTSRV_KEYBOARD_DATA, ROOTSRV_KEYBOARD_IRQ, ROOTSRV_UART_DATA, ROOTSRV_UART_IRQ_ENABLE,
+    ROOTSRV_UART_IRQ_IDENTIFY, ROOTSRV_UART_STATUS, ROOTSRV_UNTYPED, WAIT_ENDPOINT_CLOSED,
+    WAIT_IRQ, WAIT_MESSAGE, WAIT_NOTIFICATION, WAIT_PROCESS_EXITED,
 };
 use ruzt_runtime::{debug_print, runtime_init};
 
@@ -326,6 +327,9 @@ fn run_console() -> bool {
         start_console();
         let ready = confirm_console_ready();
         if ready.is_ok() {
+            if ruzt_driver_sdk::read_port_u8(ROOTSRV_UART_IRQ_ENABLE).is_ok() {
+                check_console_irq().expect("delegate and reclaim the console UART IRQ");
+            }
             assert_eq!(
                 ruzt_ipc::split_untyped(
                     PROGRAM_BUDGET,
@@ -389,6 +393,62 @@ fn run_console() -> bool {
     false
 }
 
+fn check_console_irq() -> Result<(), ErrorCode> {
+    const UART_CAP: u64 = 31;
+    const VACANT: u64 = 24;
+    const COM1_LINE: u32 = 4;
+    let read_write = CapRights::READ.union(CapRights::WRITE);
+    assert_eq!(
+        ruzt_driver_sdk::claim_irq(ROOTSRV_UNTYPED, VACANT, COM1_LINE),
+        Err(ErrorCode::InvalidCap)
+    );
+    ruzt_driver_sdk::claim_irq(ROOTSRV_IRQ_CONTROL, UART_CAP, COM1_LINE)?;
+    assert_eq!(
+        ruzt_driver_sdk::claim_irq(ROOTSRV_IRQ_CONTROL, VACANT, COM1_LINE),
+        Err(ErrorCode::SlotOccupied)
+    );
+
+    let mut request = IpcMessage {
+        label: console::CHECK_IRQ,
+        cap_count: 3,
+        ..IpcMessage::default()
+    };
+    for (cap, (cptr, rights)) in request.caps.iter_mut().zip([
+        (UART_CAP, read_write),
+        (ROOTSRV_UART_IRQ_ENABLE, read_write),
+        (ROOTSRV_UART_IRQ_IDENTIFY, CapRights::READ),
+    ]) {
+        *cap = CapTransferSlot {
+            cptr,
+            rights,
+            badge: 0,
+        };
+    }
+    ruzt_ipc::send(ROOTSRV_CONSOLE_REQUEST, &request)?;
+    let mut response = IpcMessage::default();
+    ruzt_ipc::recv(ROOTSRV_CONSOLE_REPLY, &mut response)?;
+    if response.label != console::IRQ_CHECKED {
+        return Err(ErrorCode::BadMessage);
+    }
+    assert_eq!(
+        ruzt_driver_sdk::bind_irq(UART_CAP),
+        Err(ErrorCode::SlotOccupied)
+    );
+    assert_eq!(
+        ruzt_driver_sdk::acknowledge_irq(UART_CAP),
+        Err(ErrorCode::InvalidCap)
+    );
+    ruzt_ipc::revoke(UART_CAP)?;
+    ruzt_driver_sdk::bind_irq(UART_CAP)?;
+    ruzt_ipc::delete(UART_CAP)?;
+    ruzt_driver_sdk::claim_irq(ROOTSRV_IRQ_CONTROL, VACANT, COM1_LINE)?;
+    ruzt_driver_sdk::bind_irq(VACANT)?;
+    ruzt_driver_sdk::unbind_irq(VACANT)?;
+    ruzt_ipc::delete(VACANT)?;
+    write_line("rootsrv: delegated UART IRQ delivered, re-armed and reclaimed");
+    Ok(())
+}
+
 fn verify_program_budget_reclaimed() {
     for slot in PROGRAM_BUDGET_HALVES {
         ruzt_ipc::split_untyped(PROGRAM_BUDGET, slot, PROGRAM_BUDGET_BITS - 1)
@@ -401,6 +461,9 @@ fn verify_program_budget_reclaimed() {
 }
 
 fn main() -> ! {
+    ruzt_driver_sdk::claim_irq(ROOTSRV_IRQ_CONTROL, ROOTSRV_KEYBOARD_IRQ, 1)
+        .expect("claim PS/2 keyboard IRQ");
+    ruzt_driver_sdk::bind_irq(ROOTSRV_KEYBOARD_IRQ).expect("bind PS/2 keyboard IRQ");
     let mut console_is_open = run_console();
     check_cspace();
     check_anonymous_memory();
@@ -441,6 +504,8 @@ fn main() -> ! {
             WAIT_IRQ => {
                 let scancode = ruzt_driver_sdk::read_port_u8(ROOTSRV_KEYBOARD_DATA)
                     .expect("read PS/2 keyboard data");
+                ruzt_driver_sdk::acknowledge_irq(ROOTSRV_KEYBOARD_IRQ)
+                    .expect("re-arm PS/2 keyboard IRQ");
                 // The boot firmware configures translated set-1 scancodes.
                 if scancode == 0x39 {
                     if let Some(tile) = &mut tile {

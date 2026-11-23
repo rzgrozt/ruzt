@@ -6,7 +6,7 @@ Ruzt is an experimental, privacy-first operating system built around a Rust micr
 
 The x86_64 kernel contains early boot code, serial diagnostics, interrupt handling, memory management, and a scheduler. The kernel boots `rootsrv`, which launches `consoled` in a separate ring-3 address space through an executable capability from the boot archive. The child receives four explicit startup grants for IPC and UART access. `rootsrv` transfers its greeting through a read-only shared frame, and `consoled` acknowledges it on a separate reply endpoint. The AArch64 boot path is a stub.
 
-Each service has its own capability space. The console endpoints grant send and receive rights separately. The kernel forwards PS/2 interrupts to `rootsrv` and hands it the boot framebuffer. The server sleeps while waiting for an interrupt, then decodes the Space key and draws a status tile in ring 3.
+Each service has its own capability space. The console endpoints grant send and receive rights separately. `rootsrv` claims and binds the PS/2 interrupt and receives the boot framebuffer. It draws a status tile in ring 3 and changes the tile when Space is pressed.
 
 Capabilities keep kernel objects alive while copies exist. A caller with grant rights can derive a capability with reduced rights. Moving a capability preserves its ancestry, and revoking it removes all its descendants, unmaps their shared pages, and wakes waiters that lost their authority. IPC transfers install capabilities only in empty slots designated by the receiver. Each frame capability can establish one non-executable mapping in the caller, and mapped memory stays allocated until the final page-table alias is removed.
 
@@ -15,6 +15,8 @@ Processes can retype Untyped memory into capability tables, or CNodes, with up t
 The IPC library can block on up to eight endpoints, notifications, driver IRQs, and process status capabilities in one call. The kernel selects the first ready source in list order and consumes its message or signal as part of the wait. Endpoint messages can include capability grants, and a closed endpoint or reaped process wakes the waiter. Revoking a wait source or a CNode capability on its path cancels the wait.
 
 User tasks can read the monotonic clock, supply an absolute deadline to a capability wait, or sleep until a deadline without waiting on any capability. x86-64 wakes these tasks at scheduler safe points using the PIT's roughly 10 ms tick.
+
+The boot server can claim and delegate exclusive device IRQ capabilities for the legacy x86 PIC. A driver binds a claim, waits through the device SDK or IPC wait list, and acknowledges it after servicing the device. The line stays masked between delivery and acknowledgement. Revoking the binding capability or reaping its driver removes the binding. QEMU also exercises delegation, re-arming, and reclamation with a real COM1 interrupt in `consoled`.
 
 The root server receives an 8 MiB Untyped RAM budget at boot. Each process's image, user stack, heap, and private page tables draw from its address-space budget. `rootsrv` reserves 2 MiB for the console address space and delegates a separate 8 KiB region to the service for its scratch buffer. Copies of an Untyped capability draw from the same budget. A reserved region returns to its parent after the region cap and its last live allocation are gone.
 

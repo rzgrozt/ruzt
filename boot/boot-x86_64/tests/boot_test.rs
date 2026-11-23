@@ -76,6 +76,7 @@ fn test_rootsrv_updates_the_framebuffer_from_keyboard_input() {
         &[
             "Breakpoint returned cleanly.",
             "rootsrv process created, entering user mode...",
+            "rootsrv: delegated UART IRQ delivered, re-armed and reclaimed",
             "rootsrv: moved capability revoked transitively",
             "Hello from ring 3, rootsrv alive.",
             "rootsrv: console write acknowledged over IPC",

@@ -96,6 +96,8 @@ pub enum CapType {
     Irq {
         /// Hardware IRQ line number.
         irq_num: u32,
+        /// Generation-qualified kernel object identity.
+        id: u64,
     },
     /// Read or write access to a single I/O port.
     IoPort {
@@ -108,6 +110,8 @@ pub enum CapType {
     Process(ProcessId),
     /// An executable image issued by the trusted loader.
     Program(u64),
+    /// Authority to claim unassigned device interrupt lines.
+    IrqControl,
 }
 
 /// A capability as it lives in a CNode slot.
@@ -171,7 +175,7 @@ mod tests {
             phys: PhysFrame::from_base(PhysAddr::new(0x2000)).unwrap(),
             size: FrameSize::Size4K,
         };
-        let _irq = CapType::Irq { irq_num: 32 };
+        let _irq = CapType::Irq { irq_num: 4, id: 5 };
     }
 
     #[test]

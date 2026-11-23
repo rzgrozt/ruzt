@@ -11,7 +11,7 @@ use ruzt_hal_x86_64::time::X86_64Timer;
 use super::{poll_packet, take_notification, ReceiveSlots};
 use crate::cap::cspace::CapabilityPath;
 use crate::cap::object::{self, KObjectId, KernelObject};
-use crate::{keyboard, sched};
+use crate::{irq, keyboard, sched};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum Target {
@@ -39,9 +39,9 @@ impl Source {
             CapType::Endpoint(id) => Target::Endpoint(KObjectId(id.0)),
             CapType::Notification(id) => Target::Notification(KObjectId(id.0)),
             CapType::Process(id) => Target::Process(KObjectId(id.0)),
-            CapType::Irq {
-                irq_num: keyboard::IRQ,
-            } if keyboard::is_user_driver(thread) => Target::Irq(keyboard::IRQ),
+            CapType::Irq { irq_num, .. } if irq::is_bound_to(irq_num, thread) => {
+                Target::Irq(irq_num)
+            }
             _ => return Err(ErrorCode::InvalidCap),
         };
         if !slot.rights.contains(CapRights::READ) {
@@ -101,7 +101,7 @@ fn poll(target: Target, slots: ReceiveSlots) -> Result<Option<WaitEvent>, ErrorC
             Err(error) => return Err(error),
         },
         Target::Notification(id) if take_notification(id)? => WAIT_NOTIFICATION,
-        Target::Irq(_) if keyboard::take_irq() => WAIT_IRQ,
+        Target::Irq(line) if irq::consume(line, sched::current_thread_id())? => WAIT_IRQ,
         Target::Process(id) => match object::get(id) {
             Some(KernelObject::Process { status: Some(_) }) => WAIT_PROCESS_EXITED,
             Some(KernelObject::Process { status: None }) => return Ok(None),

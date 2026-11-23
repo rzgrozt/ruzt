@@ -1,8 +1,9 @@
 //! Capabilities granted by the boot policy.
 
 use ruzt_abi::{
-    CapRights, ROOTSRV_CONSOLE_PROGRAM, ROOTSRV_KEYBOARD_DATA, ROOTSRV_KEYBOARD_IRQ,
-    ROOTSRV_UART_DATA, ROOTSRV_UART_STATUS, ROOTSRV_UNTYPED,
+    CapRights, ROOTSRV_CONSOLE_PROGRAM, ROOTSRV_IRQ_CONTROL, ROOTSRV_KEYBOARD_DATA,
+    ROOTSRV_UART_DATA, ROOTSRV_UART_IRQ_ENABLE, ROOTSRV_UART_IRQ_IDENTIFY, ROOTSRV_UART_STATUS,
+    ROOTSRV_UNTYPED,
 };
 use ruzt_cap::{CapSlot, CapType};
 
@@ -15,11 +16,9 @@ pub(super) fn root_space(console_image: &'static [u8]) -> CSpace {
     let mut rootsrv = CSpace::new(5);
     grant(
         &mut rootsrv,
-        ROOTSRV_KEYBOARD_IRQ,
-        CapType::Irq {
-            irq_num: keyboard::IRQ,
-        },
-        CapRights::READ,
+        ROOTSRV_IRQ_CONTROL,
+        CapType::IrqControl,
+        CapRights::WRITE,
     );
     grant(
         &mut rootsrv,
@@ -54,6 +53,26 @@ pub(super) fn root_space(console_image: &'static [u8]) -> CSpace {
         },
         CapRights::READ.union(CapRights::GRANT),
     );
+    if cfg!(feature = "qemu-rootsrv-test") {
+        grant(
+            &mut rootsrv,
+            ROOTSRV_UART_IRQ_ENABLE,
+            CapType::IoPort {
+                port: serial::COM1 + 1,
+            },
+            CapRights::READ
+                .union(CapRights::WRITE)
+                .union(CapRights::GRANT),
+        );
+        grant(
+            &mut rootsrv,
+            ROOTSRV_UART_IRQ_IDENTIFY,
+            CapType::IoPort {
+                port: serial::COM1 + 2,
+            },
+            CapRights::READ.union(CapRights::GRANT),
+        );
+    }
     rootsrv
 }
 

@@ -13,7 +13,7 @@ use x86_64::instructions::port::{PortReadOnly, PortWriteOnly};
 
 use super::user_mem;
 use crate::cap::ops::{cap_delete, cap_mint, cap_move};
-use crate::{ipc, keyboard, process, sched};
+use crate::{ipc, irq, process, sched};
 
 const DATA_OFFSET: usize = offset_of!(IpcMessage, data);
 const LABEL_OFFSET: usize = offset_of!(IpcMessage, label);
@@ -26,6 +26,11 @@ const BADGE_OFFSET: usize = offset_of!(CapTransferSlot, badge);
 
 pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
     let operation = args.arg1;
+    if operation == CapOp::ClaimIrq as u64 {
+        let line = u32::try_from(args.arg3).map_err(|_| ErrorCode::BadMessage)?;
+        return sched::with_current_user(|user| user.cspace.claim_irq(args.arg0, args.arg2, line))
+            .ok_or(ErrorCode::InvalidCap)?;
+    }
     if operation == CapOp::Retype as u64 {
         let kind = RetypeKind::try_from(args.arg3)?;
         return sched::with_current_user(|process| {
@@ -163,12 +168,7 @@ pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
             require(capability.rights, CapRights::READ)?;
             ipc::wait_notification(id, authority)
         }
-        CapType::Irq {
-            irq_num: keyboard::IRQ,
-        } if args.arg1 == CapOp::Wait as u64 => {
-            require(capability.rights, CapRights::READ)?;
-            keyboard::wait_irq(authority)
-        }
+        CapType::Irq { irq_num, .. } => invoke_irq(args, irq_num, capability.rights),
         CapType::IoPort { port } if args.arg1 == CapOp::ReadPort8 as u64 => {
             require(capability.rights, CapRights::READ)?;
             user_mem::write_user_buffer_with(root, args.arg2, 1, || {
@@ -197,6 +197,38 @@ pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
             // SAFETY: The C-layout integer fields occupy all 40 bytes.
             let bytes: [u8; size_of::<FramebufferInfo>()] = unsafe { core::mem::transmute(info) };
             user_mem::write_user_buffer(root, args.arg2, &bytes)
+        }
+        _ => Err(ErrorCode::InvalidCap),
+    }
+}
+
+fn invoke_irq(args: &SyscallArgs, line: u32, rights: CapRights) -> Result<(), ErrorCode> {
+    let thread = sched::current_thread_id();
+    match args.arg1 {
+        operation if operation == CapOp::Wait as u64 || operation == CapOp::BindIrq as u64 => {
+            let is_bind = operation == CapOp::BindIrq as u64;
+            let required = if is_bind {
+                CapRights::READ.union(CapRights::WRITE)
+            } else {
+                CapRights::READ
+            };
+            require(rights, required)?;
+            let (path, slot) = sched::with_current_user(|user| user.cspace.lookup_path(args.arg0))
+                .ok_or(ErrorCode::InvalidCap)??;
+            if is_bind {
+                return irq::bind(line, thread, path);
+            }
+            let mut sources = ipc::wait::Sources::default();
+            sources[0] = Some(ipc::wait::Source::new(path, slot, thread)?);
+            ipc::wait::wait_any(&sources, Default::default(), None).map(|_| ())
+        }
+        operation if operation == CapOp::AckIrq as u64 => {
+            require(rights, CapRights::WRITE)?;
+            irq::acknowledge(line, thread)
+        }
+        operation if operation == CapOp::UnbindIrq as u64 => {
+            require(rights, CapRights::WRITE)?;
+            irq::unbind(line, thread)
         }
         _ => Err(ErrorCode::InvalidCap),
     }

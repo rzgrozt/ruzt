@@ -43,7 +43,21 @@ pub fn init_idt() {
             .set_handler_fn(protection_fault::<13>);
         idt.alignment_check.set_handler_fn(protection_fault::<17>);
         idt[32].set_handler_fn(timer_handler);
-        idt[33].set_handler_fn(keyboard_handler);
+        idt[33].set_handler_fn(device_irq::<1>);
+        idt[34].set_handler_fn(device_irq::<2>);
+        idt[35].set_handler_fn(device_irq::<3>);
+        idt[36].set_handler_fn(device_irq::<4>);
+        idt[37].set_handler_fn(device_irq::<5>);
+        idt[38].set_handler_fn(device_irq::<6>);
+        idt[39].set_handler_fn(device_irq::<7>);
+        idt[40].set_handler_fn(device_irq::<8>);
+        idt[41].set_handler_fn(device_irq::<9>);
+        idt[42].set_handler_fn(device_irq::<10>);
+        idt[43].set_handler_fn(device_irq::<11>);
+        idt[44].set_handler_fn(device_irq::<12>);
+        idt[45].set_handler_fn(device_irq::<13>);
+        idt[46].set_handler_fn(device_irq::<14>);
+        idt[47].set_handler_fn(device_irq::<15>);
         unsafe {
             idt[0x80]
                 .set_handler_addr(x86_64::VirtAddr::from_ptr(syscall_handler as *const ()))
@@ -158,7 +172,6 @@ extern "x86-interrupt" fn timer_handler(stack_frame: InterruptStackFrame) {
 }
 
 #[allow(unsafe_code)]
-extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
-    crate::keyboard::on_interrupt();
-    ruzt_hal_x86_64::pic::send_eoi(1);
+extern "x86-interrupt" fn device_irq<const LINE: u8>(_stack_frame: InterruptStackFrame) {
+    crate::irq::on_interrupt(LINE);
 }

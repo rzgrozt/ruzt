@@ -6,7 +6,7 @@ extern crate alloc;
 
 use ruzt_abi::{
     console, CapRights, ErrorCode, IpcMessage, RetypeKind, FRAME_BYTES, ROOTSRV_FRAMEBUFFER,
-    WAIT_ENDPOINT_CLOSED, WAIT_MESSAGE,
+    WAIT_ENDPOINT_CLOSED, WAIT_IRQ, WAIT_MESSAGE,
 };
 use ruzt_driver_sdk::{read_port_u8, write_port_u8};
 
@@ -50,6 +50,7 @@ fn main() -> ! {
             }
             (console::WRITE_SHARED, 3) => write_shared(&request).map(|()| console::WRITTEN),
             (console::CHECK_REVOCATION, 1) => check_revocation().map(|()| console::REVOKED),
+            (console::CHECK_IRQ, 3) => check_irq(&request).map(|()| console::IRQ_CHECKED),
             _ => Err(ErrorCode::BadMessage),
         };
         if label.is_err() {
@@ -76,6 +77,40 @@ fn main() -> ! {
             }
         }
     }
+}
+
+fn check_irq(request: &IpcMessage) -> Result<(), ErrorCode> {
+    // TL16C550D IER bit 1 enables THRE IRQs. IIR encodes THRE as 0b0010.
+    const THRE_ENABLE: u8 = 1 << 1;
+    const INTERRUPT_ID_MASK: u8 = 0x0f;
+    let irq = request.caps[0].cptr;
+    let enable = request.caps[1].cptr;
+    let identify = request.caps[2].cptr;
+    let prior_enable = read_port_u8(enable)?;
+    write_port_u8(enable, 0)?;
+    let probe = (|| {
+        ruzt_driver_sdk::bind_irq(irq)?;
+        assert_eq!(
+            ruzt_driver_sdk::acknowledge_irq(irq),
+            Err(ErrorCode::BadMessage)
+        );
+        for _ in 0..2 {
+            write_port_u8(enable, THRE_ENABLE)?;
+            let deadline = ruzt_runtime::syscall::monotonic_ns()? + 1_000_000_000;
+            let event = ruzt_ipc::wait_any_until(&[irq], deadline)?;
+            if event.kind != WAIT_IRQ || read_port_u8(identify)? & INTERRUPT_ID_MASK != 2 {
+                return Err(ErrorCode::BadMessage);
+            }
+            write_port_u8(enable, 0)?;
+            ruzt_driver_sdk::acknowledge_irq(irq)?;
+        }
+        Ok(())
+    })();
+    probe.and(write_port_u8(enable, prior_enable))?;
+    ruzt_ipc::delete(enable)?;
+    ruzt_ipc::delete(identify)?;
+    // The supervisor revokes the remaining bound IRQ from its original cap.
+    Ok(())
 }
 
 fn write_shared(request: &IpcMessage) -> Result<(), ErrorCode> {

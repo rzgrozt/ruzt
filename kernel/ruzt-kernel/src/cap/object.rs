@@ -160,6 +160,22 @@ pub(crate) fn allocate_program(
     allocate_with(|| Ok(KernelObject::Program { name, image }))
 }
 
+pub(super) fn allocate_irq(irq_num: u32) -> Result<KObjectId, ErrorCode> {
+    if !ruzt_hal_x86_64::pic::is_device_irq(irq_num) {
+        return Err(ErrorCode::BadMessage);
+    }
+    let mut table = TABLE.lock();
+    let object = KernelObject::Irq { irq_num };
+    if table.iter().any(|entry| entry.object == Some(object)) {
+        return Err(ErrorCode::SlotOccupied);
+    }
+    let id = vacant_id(&table[..])?;
+    let entry = &mut table[id.index()];
+    entry.object = Some(object);
+    entry.generation += 1;
+    Ok(id)
+}
+
 /// Register a descriptor for a user-owned page table root.
 pub(crate) fn register_address_space(root: PhysFrame) -> Result<AddressSpaceId, ErrorCode> {
     allocate_with(|| {
@@ -512,6 +528,7 @@ fn destroy(object: KernelObject, backing: Option<UntypedAllocation>) {
                 frame::deallocate_contiguous(phys, 1 << (size_bits - PAGE_BITS));
             }
         }
+        KernelObject::Irq { irq_num } => crate::irq::release(irq_num),
         _ => {}
     }
     if let Some(allocation) = backing {
@@ -564,7 +581,7 @@ fn kernel_object_from_cap_type(cap_type: CapType) -> Result<KernelObject, ErrorC
         CapType::CNode { radix_bits, .. } => Ok(KernelObject::CNode { radix_bits }),
         #[cfg(not(test))]
         CapType::CNode { .. } => Err(ErrorCode::InvalidCap),
-        CapType::Irq { irq_num } => Ok(KernelObject::Irq { irq_num }),
+        CapType::Irq { .. } | CapType::IrqControl => Err(ErrorCode::InvalidCap),
         // Boot device capabilities are only provisioned at process creation.
         CapType::IoPort { .. } | CapType::Framebuffer => Err(ErrorCode::NotImplemented),
     }

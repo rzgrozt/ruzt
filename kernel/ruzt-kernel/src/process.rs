@@ -112,8 +112,7 @@ pub(crate) fn enqueue_initial(archive: &'static [u8], framebuffer: Option<Frameb
         .untyped_budget(ROOTSRV_UNTYPED)
         .expect("rootsrv RAM budget");
     let root = load("rootsrv", rootsrv, root_space, framebuffer, budget).expect("load rootsrv");
-    let root = sched::spawn_user(root, enter_user).expect("schedule rootsrv");
-    crate::keyboard::enable_user_driver(root);
+    sched::spawn_user(root, enter_user).expect("schedule rootsrv");
 }
 
 pub(crate) fn spawn_program(
@@ -196,7 +195,7 @@ pub(crate) fn terminate_current(status: ProcessStatus, reason: core::fmt::Argume
     for channel in channels.into_iter().flatten() {
         crate::ipc::close_endpoint(channel);
     }
-    crate::keyboard::detach_user_driver(crate::sched::current_thread_id());
+    crate::irq::detach_thread(crate::sched::current_thread_id());
     crate::sched::retire_current_user(status)
 }
 

@@ -5,10 +5,44 @@
 use ruzt_abi::{CapOp, ErrorCode, FramebufferInfo, SyscallNumber};
 use ruzt_runtime::syscall::syscall;
 
-/// Sleep until an interrupt is pending, then consume the notification.
+/// Claim a device interrupt line into an empty capability slot.
+pub fn claim_irq(control: u64, destination: u64, line: u32) -> Result<(), ErrorCode> {
+    invoke_irq(control, CapOp::ClaimIrq, destination, u64::from(line))
+}
+
+/// Bind an exclusively claimed interrupt to the calling driver.
+pub fn bind_irq(cap: u64) -> Result<(), ErrorCode> {
+    invoke_irq(cap, CapOp::BindIrq, 0, 0)
+}
+
+/// Sleep until the bound interrupt is pending, then consume the event.
 pub fn wait_irq(cap: u64) -> Result<(), ErrorCode> {
+    invoke_irq(cap, CapOp::Wait, 0, 0)
+}
+
+/// Re-arm the line after servicing the device and clearing its interrupt.
+pub fn acknowledge_irq(cap: u64) -> Result<(), ErrorCode> {
+    invoke_irq(cap, CapOp::AckIrq, 0, 0)
+}
+
+/// Mask and release the calling driver's binding.
+pub fn unbind_irq(cap: u64) -> Result<(), ErrorCode> {
+    invoke_irq(cap, CapOp::UnbindIrq, 0, 0)
+}
+
+fn invoke_irq(cap: u64, operation: CapOp, arg2: u64, arg3: u64) -> Result<(), ErrorCode> {
     // SAFETY: This operation has no memory operands.
-    let status = unsafe { syscall(SyscallNumber::Invoke, cap, CapOp::Wait as u64, 0, 0, 0, 0) };
+    let status = unsafe {
+        syscall(
+            SyscallNumber::Invoke,
+            cap,
+            operation as u64,
+            arg2,
+            arg3,
+            0,
+            0,
+        )
+    };
     ErrorCode::from_u64(status)
 }
 

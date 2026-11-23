@@ -465,6 +465,50 @@ impl CSpace {
         }
     }
 
+    pub(crate) fn claim_irq(
+        &mut self,
+        control: u64,
+        destination: u64,
+        irq_num: u32,
+    ) -> Result<(), ErrorCode> {
+        let mut tree = DERIVATIONS.lock();
+        let (source, node) = self.lookup_node(&tree, control)?;
+        if node.slot.cap_type != CapType::IrqControl {
+            return Err(ErrorCode::InvalidCap);
+        }
+        if !node.slot.rights.contains(CapRights::WRITE) {
+            return Err(ErrorCode::CapRightsViolation);
+        }
+        let destination = self.resolve(&tree, destination, true)?;
+        self.vacant(destination, &tree)?;
+        let object = object::allocate_irq(irq_num)?;
+        let node = Node {
+            slot: CapSlot {
+                cap_type: CapType::Irq {
+                    irq_num,
+                    id: object.0,
+                },
+                rights: CapRights::READ
+                    .union(CapRights::WRITE)
+                    .union(CapRights::GRANT),
+                badge: 0,
+            },
+            object: Some(object),
+            parent: Some(source),
+            owner: self.id,
+        };
+        match tree.install(node) {
+            Ok(id) => {
+                *self.slot_mut(&mut tree, destination) = Some(id);
+                Ok(())
+            }
+            Err(error) => {
+                object::deallocate(object);
+                Err(error)
+            }
+        }
+    }
+
     /// Install a capability issued by the kernel at boot.
     pub fn insert(&mut self, cptr: u64, slot: CapSlot) -> Result<(), ErrorCode> {
         let object = match slot.cap_type {
@@ -475,10 +519,11 @@ impl CSpace {
             CapType::Thread(id) => Some(KObjectId(id.0)),
             CapType::AddressSpace(id) => Some(KObjectId(id.0)),
             CapType::CNode { ptr, .. } => Some(KObjectId(ptr)),
-            CapType::Irq { .. } | CapType::IoPort { .. } | CapType::Framebuffer => None,
-            CapType::Null | CapType::Frame { .. } | CapType::Untyped { .. } => {
-                return Err(ErrorCode::InvalidCap)
-            }
+            CapType::IrqControl | CapType::IoPort { .. } | CapType::Framebuffer => None,
+            CapType::Null
+            | CapType::Irq { .. }
+            | CapType::Frame { .. }
+            | CapType::Untyped { .. } => return Err(ErrorCode::InvalidCap),
         };
         self.install(cptr, slot, object)
     }

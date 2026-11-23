@@ -14,6 +14,7 @@ extern crate alloc;
 extern crate std;
 
 mod boot_screen;
+mod irq;
 pub mod serial;
 pub mod vga;
 pub mod exceptions;

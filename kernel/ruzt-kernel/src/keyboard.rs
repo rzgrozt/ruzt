@@ -1,40 +1,13 @@
 //! PS/2 keyboard scancode handling.
 
-use crate::cap::cspace::CapabilityId;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use ruzt_abi::ErrorCode;
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use x86_64::instructions::port::PortReadOnly;
 
 static SCANCODE_READY: AtomicBool = AtomicBool::new(false);
 static SCANCODE: AtomicU8 = AtomicU8::new(0);
-static USER_DRIVER: AtomicUsize = AtomicUsize::new(0);
-static IRQ_PENDING: AtomicBool = AtomicBool::new(false);
 
 pub(crate) const IRQ: u32 = 1;
 pub(crate) const DATA_PORT: u16 = 0x60;
-
-/// Route the keyboard interrupt to the initial user process.
-pub(crate) fn enable_user_driver(thread: crate::sched::ThreadId) {
-    assert_ne!(thread, 0);
-    assert_eq!(USER_DRIVER.swap(thread, Ordering::Relaxed), 0);
-}
-
-pub(crate) fn detach_user_driver(thread: crate::sched::ThreadId) {
-    if USER_DRIVER
-        .compare_exchange(thread, 0, Ordering::Relaxed, Ordering::Relaxed)
-        .is_ok()
-    {
-        IRQ_PENDING.store(false, Ordering::Relaxed);
-    }
-}
-
-pub(crate) fn is_user_driver(thread: crate::sched::ThreadId) -> bool {
-    thread != 0 && USER_DRIVER.load(Ordering::Relaxed) == thread
-}
-
-pub(crate) fn take_irq() -> bool {
-    IRQ_PENDING.swap(false, Ordering::Relaxed)
-}
 
 pub(crate) fn trace_wait() {
     #[cfg(feature = "qemu-rootsrv-test")]
@@ -44,39 +17,9 @@ pub(crate) fn trace_wait() {
     }
 }
 
-/// Sleep until the driver has an interrupt to handle.
-/// Called from the syscall interrupt gate with interrupts disabled.
-pub(crate) fn wait_irq(authority: Option<CapabilityId>) -> Result<(), ErrorCode> {
-    if !is_user_driver(crate::sched::current_thread_id()) {
-        return Err(ErrorCode::InvalidCap);
-    }
-    while !take_irq() {
-        // This check and the scheduler's blocked transition are atomic
-        // with respect to this CPU's keyboard IRQ.
-        trace_wait();
-        crate::sched::block_with_authority(
-            crate::sched::ThreadState::BlockedIrq(IRQ),
-            authority,
-            Default::default(),
-        );
-        crate::sched::check_ipc_completion()?;
-    }
-    Ok(())
-}
-
-/// Called from the keyboard ISR (vector 33).
-/// For the boot-time user driver, only records the interrupt.
+/// Read one scancode for the kernel-only diagnostic.
 #[allow(unsafe_code)]
 pub fn on_interrupt() {
-    let thread = USER_DRIVER.load(Ordering::Relaxed);
-    if thread != 0 {
-        // The controller drops the IRQ line when the driver reads the byte.
-        // On the edge-triggered PIC, no other interrupt arrives for that byte.
-        IRQ_PENDING.store(true, Ordering::Relaxed);
-        crate::sched::wake_irq(thread, IRQ);
-        return;
-    }
-
     // SAFETY: The kernel echo task owns the PS/2 data port without a user driver.
     let scancode: u8 = unsafe { PortReadOnly::new(DATA_PORT).read() };
 
