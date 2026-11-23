@@ -305,6 +305,7 @@ pub(crate) fn apply_capability_removals() {
     for thread in &mut sched.threads {
         if let Some(user) = &mut thread.user {
             user.unmap_revoked_frames();
+            user.unmap_revoked_mmio();
         }
     }
     sched.finish_waiters(Some(ErrorCode::InvalidCap), |thread| {

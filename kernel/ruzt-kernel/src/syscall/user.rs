@@ -2,8 +2,8 @@
 
 use core::mem::{offset_of, size_of};
 use ruzt_abi::{
-    CapOp, CapRights, CapTransferSlot, ErrorCode, FramebufferInfo, IpcMessage, ProcessStatus,
-    RetypeKind, SyscallArgs, WaitEvent, IPC_CAP_SLOTS, MAX_WAIT_SOURCES,
+    CapOp, CapRights, CapTransferSlot, ErrorCode, FramebufferInfo, IpcMessage, PciAddress,
+    ProcessStatus, RetypeKind, SyscallArgs, WaitEvent, IPC_CAP_SLOTS, MAX_WAIT_SOURCES,
 };
 use ruzt_cap::CapType;
 use ruzt_hal::mem::PhysFrame;
@@ -26,6 +26,34 @@ const BADGE_OFFSET: usize = offset_of!(CapTransferSlot, badge);
 
 pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
     let operation = args.arg1;
+    if operation == CapOp::ClaimPciDevice as u64 {
+        let address = pci_address(args.arg3)?;
+        return sched::with_current_user(|user| {
+            user.cspace.claim_pci_device(args.arg0, args.arg2, address)
+        })
+        .ok_or(ErrorCode::InvalidCap)?;
+    }
+    if operation == CapOp::OpenPciBar as u64 {
+        let index = usize::try_from(args.arg3).map_err(|_| ErrorCode::BadMessage)?;
+        return sched::with_current_user(|user| {
+            user.cspace
+                .open_pci_bar(args.arg0, args.arg2, index, args.arg4, args.arg5)
+        })
+        .ok_or(ErrorCode::InvalidCap)?;
+    }
+    if operation == CapOp::MapMmio as u64 {
+        let writable = match args.arg3 {
+            0 => false,
+            1 => true,
+            _ => return Err(ErrorCode::BadMessage),
+        };
+        return sched::with_current_user(|user| user.map_mmio(args.arg0, args.arg2, writable))
+            .ok_or(ErrorCode::InvalidCap)?;
+    }
+    if operation == CapOp::UnmapMmio as u64 {
+        return sched::with_current_user(|user| user.unmap_mmio(args.arg0))
+            .ok_or(ErrorCode::InvalidCap)?;
+    }
     if operation == CapOp::ClaimIrq as u64 {
         let line = u32::try_from(args.arg3).map_err(|_| ErrorCode::BadMessage)?;
         return sched::with_current_user(|user| user.cspace.claim_irq(args.arg0, args.arg2, line))
@@ -169,6 +197,21 @@ pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
             ipc::wait_notification(id, authority)
         }
         CapType::Irq { irq_num, .. } => invoke_irq(args, irq_num, capability.rights),
+        CapType::PciControl if operation == CapOp::ReadPciConfig as u64 => {
+            require(capability.rights, CapRights::READ)?;
+            let address = pci_address(args.arg2)?;
+            let offset = u8::try_from(args.arg3).map_err(|_| ErrorCode::BadMessage)?;
+            let value = crate::pci::read_config(address, offset)?;
+            user_mem::write_user_buffer(root, args.arg4, &value.to_ne_bytes())
+        }
+        CapType::Mmio(_) if operation == CapOp::MmioSize as u64 => {
+            let bytes = sched::with_current_user(|user| {
+                let (_, pin) = user.cspace.device_mmio(args.arg0, CapRights::READ)?;
+                Ok::<_, ErrorCode>(pin.range.bytes)
+            })
+            .ok_or(ErrorCode::InvalidCap)??;
+            user_mem::write_user_buffer(root, args.arg2, &bytes.to_ne_bytes())
+        }
         CapType::IoPort { port } if args.arg1 == CapOp::ReadPort8 as u64 => {
             require(capability.rights, CapRights::READ)?;
             user_mem::write_user_buffer_with(root, args.arg2, 1, || {
@@ -200,6 +243,12 @@ pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
         }
         _ => Err(ErrorCode::InvalidCap),
     }
+}
+
+fn pci_address(bits: u64) -> Result<PciAddress, ErrorCode> {
+    u16::try_from(bits)
+        .map(PciAddress::from_bits)
+        .map_err(|_| ErrorCode::BadMessage)
 }
 
 fn invoke_irq(args: &SyscallArgs, line: u32, rights: CapRights) -> Result<(), ErrorCode> {

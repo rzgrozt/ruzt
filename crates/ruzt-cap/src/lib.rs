@@ -112,6 +112,12 @@ pub enum CapType {
     Program(u64),
     /// Authority to claim unassigned device interrupt lines.
     IrqControl,
+    /// Authority to read PCI configuration and claim device functions.
+    PciControl,
+    /// A claimed PCI function and its firmware-assigned resources.
+    PciDevice(u64),
+    /// A page-aligned device memory range.
+    Mmio(u64),
 }
 
 /// A capability as it lives in a CNode slot.

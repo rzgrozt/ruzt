@@ -18,6 +18,8 @@ User tasks can read the monotonic clock, supply an absolute deadline to a capabi
 
 The boot server can claim and delegate exclusive device IRQ capabilities for the legacy x86 PIC. A driver binds a claim, waits through the device SDK or IPC wait list, and acknowledges it after servicing the device. The line stays masked between delivery and acknowledgement. Revoking the binding capability or reaping its driver removes the binding. QEMU also exercises delegation, re-arming, and reclamation with a real COM1 interrupt in `consoled`.
 
+The boot server can enumerate conventional PCI configuration space and claim firmware-programmed memory BARs on endpoint functions with bus mastering disabled. It can delegate individual page-aligned BAR ranges with read or write rights. Device mappings are uncached and non-executable, and revocation removes their page-table entries. The QEMU EDU guest checks a real PCI register read and write, read-only delegation, rollback on an occupied page, and reclamation after revocation.
+
 The root server receives an 8 MiB Untyped RAM budget at boot. Each process's image, user stack, heap, and private page tables draw from its address-space budget. `rootsrv` reserves 2 MiB for the console address space and delegates a separate 8 KiB region to the service for its scratch buffer. Copies of an Untyped capability draw from the same budget. A reserved region returns to its parent after the region cap and its last live allocation are gone.
 
 Each process has a self address-space capability for mapping zeroed anonymous pages at a chosen virtual address. These pages draw from its address-space budget and may be read-only or writable. Unmapping returns the pages to the budget. A failed range operation preserves existing mappings.

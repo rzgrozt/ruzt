@@ -7,7 +7,7 @@ use ruzt_cap::AddressSpaceId;
 use ruzt_hal::mem::{MapError, PageFlags, PhysFrame, VirtAddr};
 use ruzt_hal_x86_64::mapper::{self, UserPageFrames, X86_64Mapper};
 
-use super::{map_owned_page, overlaps_heap, UserProcess, PAGE_SIZE};
+use super::{map_owned_page, overlaps_heap, page_range, UserProcess, PAGE_SIZE};
 use crate::cap::object::{self, KObjectId, KernelObject, UntypedBudget};
 
 pub(super) struct PrivatePage {
@@ -26,17 +26,6 @@ impl PrivatePage {
             budget.deallocate(frame);
         }
     }
-}
-
-fn page_range(address: u64, count: u64) -> Result<Range<u64>, ErrorCode> {
-    let end = count
-        .checked_mul(PAGE_SIZE)
-        .and_then(|length| address.checked_add(length))
-        .ok_or(ErrorCode::BadMessage)?;
-    if address == 0 || count == 0 || address % PAGE_SIZE != 0 || end > 1 << 47 {
-        return Err(ErrorCode::BadMessage);
-    }
-    Ok(address..end)
 }
 
 impl UserProcess {

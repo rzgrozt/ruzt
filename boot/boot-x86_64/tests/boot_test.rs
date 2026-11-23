@@ -41,7 +41,7 @@ fn test_rootsrv_updates_the_framebuffer_from_keyboard_input() {
     let temp = tempfile::tempdir().expect("Failed to create boot test directory");
     let disk_image = build_image(temp.path(), "qemu-rootsrv-test", Services::Console);
     let serial_path = temp.path().join("serial.log");
-    let mut vm = start_guest(&disk_image, &serial_path);
+    let mut vm = start_guest_with_devices(&disk_image, &serial_path, &["-device", "edu"]);
 
     wait_for_serial(
         &mut vm.child,
@@ -77,6 +77,7 @@ fn test_rootsrv_updates_the_framebuffer_from_keyboard_input() {
             "Breakpoint returned cleanly.",
             "rootsrv process created, entering user mode...",
             "rootsrv: delegated UART IRQ delivered, re-armed and reclaimed",
+            "rootsrv: PCI BAR mapped, delegated read-only, revoked and reclaimed",
             "rootsrv: moved capability revoked transitively",
             "Hello from ring 3, rootsrv alive.",
             "rootsrv: console write acknowledged over IPC",
@@ -301,6 +302,10 @@ struct Guest {
 }
 
 fn start_guest(disk_image: &Path, serial_path: &Path) -> Guest {
+    start_guest_with_devices(disk_image, serial_path, &[])
+}
+
+fn start_guest_with_devices(disk_image: &Path, serial_path: &Path, devices: &[&str]) -> Guest {
     let slot = qemu_slot();
     Guest {
         child: Command::new("timeout")
@@ -310,6 +315,7 @@ fn start_guest(disk_image: &Path, serial_path: &Path) -> Guest {
             .arg("-serial")
             .arg(format!("file:{}", serial_path.display()))
             .args(["-display", "none", "-monitor", "stdio", "-no-reboot"])
+            .args(devices)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .spawn()

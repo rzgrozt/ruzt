@@ -5,8 +5,8 @@
 extern crate alloc;
 
 use ruzt_abi::{
-    console, CapRights, ErrorCode, IpcMessage, RetypeKind, FRAME_BYTES, ROOTSRV_FRAMEBUFFER,
-    WAIT_ENDPOINT_CLOSED, WAIT_IRQ, WAIT_MESSAGE,
+    console, CapRights, ErrorCode, IpcMessage, RetypeKind, FRAME_BYTES, PROCESS_ADDRESS_SPACE,
+    ROOTSRV_FRAMEBUFFER, WAIT_ENDPOINT_CLOSED, WAIT_IRQ, WAIT_MESSAGE,
 };
 use ruzt_driver_sdk::{read_port_u8, write_port_u8};
 
@@ -15,6 +15,7 @@ const TRANSMITTER_READY: u8 = 1 << 5;
 const CONSOLE_BUFFER: u64 = 0x6000_0000;
 const SCRATCH_BUFFER: u64 = CONSOLE_BUFFER + FRAME_BYTES as u64;
 const SCRATCH_FRAME: u64 = 7;
+const DEVICE_WINDOW: u64 = 0x6200_0000;
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
@@ -51,6 +52,12 @@ fn main() -> ! {
             (console::WRITE_SHARED, 3) => write_shared(&request).map(|()| console::WRITTEN),
             (console::CHECK_REVOCATION, 1) => check_revocation().map(|()| console::REVOKED),
             (console::CHECK_IRQ, 3) => check_irq(&request).map(|()| console::IRQ_CHECKED),
+            (console::CHECK_MMIO, 1) => {
+                check_mmio(request.caps[0].cptr).map(|()| console::MMIO_CHECKED)
+            }
+            (console::CHECK_MMIO_REVOKED, 0) => {
+                check_mmio_revoked().map(|()| console::MMIO_CHECKED)
+            }
             _ => Err(ErrorCode::BadMessage),
         };
         if label.is_err() {
@@ -77,6 +84,31 @@ fn main() -> ! {
             }
         }
     }
+}
+
+fn check_mmio(cap: u64) -> Result<(), ErrorCode> {
+    use ruzt_driver_sdk::map_mmio;
+    assert_eq!(
+        map_mmio(cap, DEVICE_WINDOW, true),
+        Err(ErrorCode::CapRightsViolation)
+    );
+    let registers = map_mmio(cap, DEVICE_WINDOW, false)?;
+    // SAFETY: The supervisor grants the EDU register pages and waits for the
+    // reply before revoking the capability. The ID is a readable dword.
+    let identity = unsafe { registers.read_u32(0)? };
+    if identity & 0xffff != 0x00ed {
+        return Err(ErrorCode::BadMessage);
+    }
+    Ok(())
+}
+
+fn check_mmio_revoked() -> Result<(), ErrorCode> {
+    assert_eq!(
+        ruzt_driver_sdk::unmap_mmio(console::RECEIVED_NOTIFICATION),
+        Err(ErrorCode::InvalidCap)
+    );
+    ruzt_ipc::map_anonymous(PROCESS_ADDRESS_SPACE, DEVICE_WINDOW, 2, true)?;
+    ruzt_ipc::unmap_anonymous(PROCESS_ADDRESS_SPACE, DEVICE_WINDOW, 2)
 }
 
 fn check_irq(request: &IpcMessage) -> Result<(), ErrorCode> {

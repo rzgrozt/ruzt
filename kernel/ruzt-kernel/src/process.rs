@@ -4,6 +4,7 @@ mod anonymous;
 mod boot_caps;
 mod framebuffer;
 mod initrd;
+mod mmio;
 mod shared_frames;
 
 use crate::cap::{
@@ -12,6 +13,7 @@ use crate::cap::{
 };
 use crate::sched::{self, ThreadState};
 use alloc::vec::Vec;
+use core::ops::Range;
 use ruzt_abi::{
     CapRights, ErrorCode, FramebufferInfo, ProcessStatus, IPC_CAP_SLOTS, PROCESS_ADDRESS_SPACE,
     ROOTSRV_FRAMEBUFFER, ROOTSRV_UNTYPED, USER_HEAP_INITIAL_BYTES, USER_HEAP_LIMIT,
@@ -51,6 +53,17 @@ fn overlaps_heap(start: u64, end: u64) -> bool {
     start < USER_HEAP_LIMIT && USER_HEAP_START < end
 }
 
+fn page_range(address: u64, count: u64) -> Result<Range<u64>, ErrorCode> {
+    let end = count
+        .checked_mul(PAGE_SIZE)
+        .and_then(|length| address.checked_add(length))
+        .ok_or(ErrorCode::BadMessage)?;
+    if address == 0 || count == 0 || address % PAGE_SIZE != 0 || end > 1 << 47 {
+        return Err(ErrorCode::BadMessage);
+    }
+    Ok(address..end)
+}
+
 fn initial_stack_pointer() -> u64 {
     // System V function entry expects an 8-byte return-address bias.
     STACK_REGION.end().unwrap() - 8
@@ -79,6 +92,7 @@ struct UserAddressSpace {
     heap_extension: Vec<anonymous::PrivatePage>,
     // Dropped only after Drop destroys the private page tables.
     shared_frames: Vec<shared_frames::Mapping>,
+    device_mappings: Vec<mmio::Mapping>,
     budget: UntypedBudget,
 }
 
@@ -290,6 +304,7 @@ fn map_image(
         anonymous: Vec::new(),
         heap_extension: Vec::new(),
         shared_frames: Vec::new(),
+        device_mappings: Vec::new(),
         budget,
     };
     let framebuffer = mapper::with_mapper(|mapper| {

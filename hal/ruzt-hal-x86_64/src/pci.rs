@@ -1,0 +1,138 @@
+//! Legacy PCI configuration mechanism one.
+
+use x86_64::instructions::port::{Port, PortWriteOnly};
+
+const CONFIG_ADDRESS: u16 = 0xcf8;
+const CONFIG_DATA: u16 = 0xcfc;
+const COMMAND: u8 = 4;
+const MEMORY_DECODE: u16 = 1 << 1;
+const BUS_MASTER: u16 = 1 << 2;
+
+/// Number of BAR slots in an endpoint's PCI configuration header.
+pub const BAR_COUNT: usize = 6;
+
+/// A firmware-programmed PCI memory BAR.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MemoryBar {
+    /// First physical byte decoded by the PCI device.
+    pub base: u64,
+    /// Size in bytes, as obtained from the BAR mask.
+    pub bytes: u64,
+}
+
+fn select(function: u16, offset: u8) {
+    let address = 0x8000_0000 | (u32::from(function) << 8) | u32::from(offset & !3);
+    // SAFETY: This port selects a PCI configuration dword for CONFIG_DATA.
+    unsafe { PortWriteOnly::<u32>::new(CONFIG_ADDRESS).write(address) };
+}
+
+/// Read one PCI configuration dword from a packed bus/device/function address.
+///
+/// # Safety
+/// The platform must support mechanism one and the caller must serialize all
+/// accesses to the configuration address and data ports.
+pub unsafe fn read_config(function: u16, offset: u8) -> u32 {
+    select(function, offset);
+    // SAFETY: CONFIG_ADDRESS selected this configuration dword.
+    unsafe { Port::<u32>::new(CONFIG_DATA).read() }
+}
+
+fn write_config(function: u16, offset: u8, value: u32) {
+    select(function, offset);
+    // SAFETY: CONFIG_ADDRESS selected this configuration dword.
+    unsafe { PortWriteOnly::<u32>::new(CONFIG_DATA).write(value) };
+}
+
+fn write_command(function: u16, value: u16) {
+    select(function, COMMAND);
+    // SAFETY: A word write changes PCI_COMMAND without touching the
+    // write-one-to-clear PCI_STATUS register in the upper half.
+    unsafe { PortWriteOnly::<u16>::new(CONFIG_DATA).write(value) };
+}
+
+/// Size assigned memory BARs while the endpoint's memory decode is disabled.
+///
+/// Returns `None` for non-endpoint functions, functions with memory decode
+/// disabled, or functions that can currently bus-master. The function's BAR
+/// and command registers are restored before returning.
+///
+/// # Safety
+/// Mechanism one must be present, configuration operations must be
+/// serialized, and no driver may be using this PCI function.
+pub unsafe fn probe_bars(function: u16) -> Option<[Option<MemoryBar>; BAR_COUNT]> {
+    // SAFETY: The caller serializes the entire probe including these reads.
+    let read = |offset| unsafe { read_config(function, offset) };
+    if read(0) as u16 == u16::MAX || (read(0x0c) >> 16) as u8 & 0x7f != 0 {
+        return None;
+    }
+    let command = read(COMMAND) as u16;
+    if command & (MEMORY_DECODE | BUS_MASTER) != MEMORY_DECODE {
+        return None;
+    }
+    write_command(function, command & !MEMORY_DECODE);
+    let mut bars = [None; BAR_COUNT];
+    let mut index = 0;
+    while index < BAR_COUNT {
+        let offset = 0x10 + index as u8 * 4;
+        let low = read(offset);
+        let kind = low & 0x7;
+        if kind == 0 {
+            write_config(function, offset, u32::MAX);
+            let mask = read(offset);
+            write_config(function, offset, low);
+            bars[index] = decode_bar(u64::from(low), u64::from(mask) | 0xffff_ffff_0000_0000);
+        } else if kind == 4 && index + 1 < BAR_COUNT {
+            let upper_offset = offset + 4;
+            let high = read(upper_offset);
+            write_config(function, offset, u32::MAX);
+            write_config(function, upper_offset, u32::MAX);
+            let mask = (u64::from(read(upper_offset)) << 32) | u64::from(read(offset));
+            write_config(function, upper_offset, high);
+            write_config(function, offset, low);
+            bars[index] = decode_bar((u64::from(high) << 32) | u64::from(low), mask);
+            index += 1;
+        }
+        index += 1;
+    }
+    write_command(function, command);
+    Some(bars)
+}
+
+fn decode_bar(base: u64, mask: u64) -> Option<MemoryBar> {
+    let base = base & !0xf;
+    let bytes = (!(mask & !0xf)).checked_add(1)?;
+    if base == 0 || !bytes.is_power_of_two() || base % bytes != 0 {
+        return None;
+    }
+    // A conforming BAR returns the canonical contiguous address mask.
+    if (mask & !0xf) != !(bytes - 1) {
+        return None;
+    }
+    Some(MemoryBar { base, bytes })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_32_and_64_bit_bars_and_rejects_invalid_masks() {
+        assert_eq!(
+            decode_bar(0xfea0_0000, 0xffff_ffff_fff0_0000),
+            Some(MemoryBar {
+                base: 0xfea0_0000,
+                bytes: 0x10_0000
+            })
+        );
+        assert_eq!(
+            decode_bar(0x1_0000_000c, 0xffff_ffff_ffff_c00c),
+            Some(MemoryBar {
+                base: 0x1_0000_0000,
+                bytes: 0x4000
+            })
+        );
+        assert_eq!(decode_bar(0, u64::MAX), None);
+        assert_eq!(decode_bar(0xfea0_0010, 0xffff_ffff_fff0_0000), None);
+        assert_eq!(decode_bar(0xfea0_0000, 0xffff_ffef_fff0_0000), None);
+    }
+}

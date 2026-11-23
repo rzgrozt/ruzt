@@ -5,6 +5,9 @@
 use ruzt_abi::{CapOp, ErrorCode, FramebufferInfo, SyscallNumber};
 use ruzt_runtime::syscall::syscall;
 
+mod pci;
+pub use pci::{claim_pci_device, map_mmio, open_pci_bar, read_pci_config, unmap_mmio, MmioRegion};
+
 /// Claim a device interrupt line into an empty capability slot.
 pub fn claim_irq(control: u64, destination: u64, line: u32) -> Result<(), ErrorCode> {
     invoke_irq(control, CapOp::ClaimIrq, destination, u64::from(line))

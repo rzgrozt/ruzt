@@ -49,6 +49,8 @@ pub const ROOTSRV_IRQ_CONTROL: u64 = 28;
 pub const ROOTSRV_UART_IRQ_ENABLE: u64 = 29;
 /// Authority to read the console UART's interrupt identification register.
 pub const ROOTSRV_UART_IRQ_IDENTIFY: u64 = 30;
+/// Boot authority to enumerate PCI functions and claim their device resources.
+pub const ROOTSRV_PCI_CONTROL: u64 = 32;
 /// Self address-space capability installed at process startup.
 pub const PROCESS_ADDRESS_SPACE: u64 = 15;
 /// Base virtual address of the initial runtime heap.
@@ -60,6 +62,34 @@ pub const USER_HEAP_LIMIT: u64 = USER_HEAP_START + 16 * 1024 * 1024;
 
 /// Byte length of a frame supported by the user mapping ABI.
 pub const FRAME_BYTES: usize = 4096;
+
+/// PCI function address encoded as bus, device and function in a 16-bit word.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+pub struct PciAddress(u16);
+
+impl PciAddress {
+    /// Construct an address with a five-bit device and three-bit function.
+    pub const fn new(bus: u8, device: u8, function: u8) -> Option<Self> {
+        if device < 32 && function < 8 {
+            Some(Self(
+                ((bus as u16) << 8) | ((device as u16) << 3) | function as u16,
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Construct an address from its packed representation.
+    pub const fn from_bits(bits: u16) -> Self {
+        Self(bits)
+    }
+
+    /// Return the packed representation.
+    pub const fn bits(self) -> u16 {
+        self.0
+    }
+}
 
 /// Largest supported radix of a retyped capability table.
 pub const MAX_CNODE_RADIX: u8 = 8;
@@ -140,6 +170,12 @@ pub mod console {
     pub const CHECK_IRQ: u64 = 7;
     /// A UART interrupt was received and acknowledged.
     pub const IRQ_CHECKED: u64 = 8;
+    /// Map and inspect a read-only grant for a PCI device register page.
+    pub const CHECK_MMIO: u64 = 9;
+    /// The device register page was inspected.
+    pub const MMIO_CHECKED: u64 = 10;
+    /// Verify the previous device mapping has been revoked.
+    pub const CHECK_MMIO_REVOKED: u64 = 11;
 }
 
 /// System-call numbers.
@@ -261,6 +297,20 @@ pub enum CapOp {
     AckIrq = 21,
     /// Remove the caller's binding and mask the invoked IRQ.
     UnbindIrq = 22,
+    /// Read an aligned PCI configuration dword.
+    /// `arg2` is the packed function, `arg3` the byte offset, `arg4` the output pointer.
+    ReadPciConfig = 23,
+    /// Claim the PCI function in `arg3` into slot `arg2` using PCI control.
+    ClaimPciDevice = 24,
+    /// Create an MMIO capability at `arg2` from BAR `arg3` of the invoked
+    /// device. `arg4` and `arg5` give the first page and number of pages.
+    OpenPciBar = 25,
+    /// Map the invoked MMIO range at `arg2` with read-only (0) or read-write (1) access in `arg3`.
+    MapMmio = 26,
+    /// Remove the caller's mapping through the invoked MMIO capability.
+    UnmapMmio = 27,
+    /// Write the invoked MMIO range length in bytes as a `u64` to `arg2`.
+    MmioSize = 28,
 }
 
 /// The process invoked `Exit`.
@@ -639,6 +689,12 @@ mod tests {
         assert_eq!(CapOp::BindIrq as u64, 20);
         assert_eq!(CapOp::AckIrq as u64, 21);
         assert_eq!(CapOp::UnbindIrq as u64, 22);
+        assert_eq!(CapOp::ReadPciConfig as u64, 23);
+        assert_eq!(CapOp::ClaimPciDevice as u64, 24);
+        assert_eq!(CapOp::OpenPciBar as u64, 25);
+        assert_eq!(CapOp::MapMmio as u64, 26);
+        assert_eq!(CapOp::UnmapMmio as u64, 27);
+        assert_eq!(CapOp::MmioSize as u64, 28);
     }
 
     #[test]

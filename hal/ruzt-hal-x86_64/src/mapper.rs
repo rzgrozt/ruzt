@@ -140,6 +140,122 @@ pub struct X86_64Mapper {
 }
 
 impl X86_64Mapper {
+    /// Match the boot physmap's cache attributes to a device's user mappings.
+    ///
+    /// # Safety
+    /// The page-aligned range must contain only device memory. It must have no
+    /// existing access or mapping outside the boot physmap. The boot CPU must
+    /// serialize higher-half page-table edits with interrupts disabled.
+    pub unsafe fn make_device_physmap_uncached(
+        &mut self,
+        base: u64,
+        bytes: u64,
+    ) -> Result<(), MapError> {
+        const HUGE_BYTES: u64 = 2 * 1024 * 1024;
+        let end = base.checked_add(bytes).ok_or(MapError::InvalidAlignment)?;
+        if bytes == 0
+            || end > 1 << 52
+            || base % PhysFrame::SIZE as u64 != 0
+            || end % PhysFrame::SIZE as u64 != 0
+        {
+            return Err(MapError::InvalidAlignment);
+        }
+        let mut start = base;
+        let result = (|| {
+            while start < end {
+                let chunk_end = end.min((start | (HUGE_BYTES - 1)) + 1);
+                // SAFETY: This chunk is inside the caller's exclusive device
+                // range and is contained by a single 2 MiB physmap slot.
+                unsafe {
+                    self.uncache_physmap_chunk(start, chunk_end)?;
+                }
+                start = chunk_end;
+            }
+            Ok(())
+        })();
+        // All boot physmap changes are shared with user roots, non-global, and
+        // made on the only CPU. Flush even if a later chunk could not split.
+        x86_64::instructions::tlb::flush_all();
+        result
+    }
+
+    unsafe fn uncache_physmap_chunk(&mut self, start: u64, end: u64) -> Result<(), MapError> {
+        const HUGE_BYTES: u64 = 2 * 1024 * 1024;
+        const UC: PageTableFlags = PageTableFlags::NO_CACHE.union(PageTableFlags::WRITE_THROUGH);
+        let offset = physical_memory_offset();
+        let Some(address) = offset
+            .as_u64()
+            .checked_add(start)
+            .and_then(|raw| X64VirtAddr::try_new(raw).ok())
+        else {
+            return Ok(());
+        };
+        let root = self.inner.level_4_table();
+        let Ok(l3) = root[address.p4_index()].frame() else {
+            return Ok(());
+        };
+        // SAFETY: A present non-leaf in the boot physmap names a live page
+        // table mapped by the physmap itself.
+        let l3 = unsafe { &*(offset + l3.start_address().as_u64()).as_ptr::<PageTable>() };
+        let entry = &l3[address.p3_index()];
+        if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+            // This bootloader builds the physmap with at most 2 MiB pages.
+            return Err(MapError::InvalidAlignment);
+        }
+        let Ok(l2) = entry.frame() else { return Ok(()) };
+        // SAFETY: The same page-table ownership and boot physmap contract
+        // covers the L2 table. The caller serializes all higher-half edits.
+        let l2 = unsafe { &mut *(offset + l2.start_address().as_u64()).as_mut_ptr::<PageTable>() };
+        let entry = &mut l2[address.p2_index()];
+        if !entry.flags().contains(PageTableFlags::PRESENT) {
+            return Ok(());
+        }
+        let huge_base = start & !(HUGE_BYTES - 1);
+        if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+            if entry.addr().as_u64() != huge_base {
+                return Err(MapError::InvalidAlignment);
+            }
+            let flags = entry.flags();
+            if start == huge_base && end == huge_base + HUGE_BYTES {
+                entry.set_flags(flags | UC);
+                return Ok(());
+            }
+            let table = (self.alloc)().ok_or(MapError::FrameAllocationFailed)?;
+            // SAFETY: The allocator returned one exclusively owned table
+            // frame. Each leaf below replaces part of the same physmap span.
+            let l1 = unsafe { &mut *frame_pointer(table).cast::<PageTable>() };
+            for (index, page) in l1.iter_mut().enumerate() {
+                let physical = huge_base + index as u64 * PhysFrame::SIZE as u64;
+                let page_flags = flags & !PageTableFlags::HUGE_PAGE;
+                let page_flags = if (start..end).contains(&physical) {
+                    page_flags | UC
+                } else {
+                    page_flags
+                };
+                page.set_addr(X64PhysAddr::new(physical), page_flags);
+            }
+            entry.set_addr(
+                X64PhysAddr::new(table.base.as_u64()),
+                PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+            );
+            return Ok(());
+        }
+        let l1 = entry.frame().map_err(|_| MapError::InvalidAlignment)?;
+        // SAFETY: As above, the present L2 entry names a live, serialized table.
+        let l1 = unsafe { &mut *(offset + l1.start_address().as_u64()).as_mut_ptr::<PageTable>() };
+        for physical in (start..end).step_by(PhysFrame::SIZE) {
+            let entry = &mut l1[(offset + physical).p1_index()];
+            if !entry.flags().contains(PageTableFlags::PRESENT) {
+                continue;
+            }
+            if entry.addr().as_u64() != physical {
+                return Err(MapError::InvalidAlignment);
+            }
+            entry.set_flags(entry.flags() | UC);
+        }
+        Ok(())
+    }
+
     /// Free an inactive user root and the page tables owned by its lower half.
     ///
     /// Mapped leaf frames and the shared supervisor tables stay with their owners.
@@ -405,8 +521,8 @@ fn frame_pointer(frame: PhysFrame) -> *mut u8 {
 
 /// Check all pages in a nonempty user buffer in the expected active root.
 ///
-/// Only 4 KiB mappings are supported. Every level must permit user access
-/// and, for an output buffer, writes.
+/// Only cacheable 4 KiB mappings are supported. Every level must permit user
+/// access and, for an output buffer, writes.
 pub fn active_user_range_accessible(
     root: PhysFrame,
     address: u64,
@@ -449,6 +565,9 @@ fn user_page_accessible(
         let table = unsafe { &*virtual_addr.as_ptr::<PageTable>() };
         let entry = &table[index];
         if !entry.flags().contains(required) {
+            return false;
+        }
+        if level == 3 && entry.flags().contains(PageTableFlags::NO_CACHE) {
             return false;
         }
         if level != 3 {

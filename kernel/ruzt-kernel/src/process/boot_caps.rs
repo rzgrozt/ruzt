@@ -2,8 +2,8 @@
 
 use ruzt_abi::{
     CapRights, ROOTSRV_CONSOLE_PROGRAM, ROOTSRV_IRQ_CONTROL, ROOTSRV_KEYBOARD_DATA,
-    ROOTSRV_UART_DATA, ROOTSRV_UART_IRQ_ENABLE, ROOTSRV_UART_IRQ_IDENTIFY, ROOTSRV_UART_STATUS,
-    ROOTSRV_UNTYPED,
+    ROOTSRV_PCI_CONTROL, ROOTSRV_UART_DATA, ROOTSRV_UART_IRQ_ENABLE, ROOTSRV_UART_IRQ_IDENTIFY,
+    ROOTSRV_UART_STATUS, ROOTSRV_UNTYPED,
 };
 use ruzt_cap::{CapSlot, CapType};
 
@@ -13,7 +13,13 @@ use crate::{keyboard, serial};
 const ROOTSRV_UNTYPED_BITS: u8 = 23;
 
 pub(super) fn root_space(console_image: &'static [u8]) -> CSpace {
-    let mut rootsrv = CSpace::new(5);
+    let mut rootsrv = CSpace::new(6);
+    grant(
+        &mut rootsrv,
+        ROOTSRV_PCI_CONTROL,
+        CapType::PciControl,
+        CapRights::READ.union(CapRights::WRITE),
+    );
     grant(
         &mut rootsrv,
         ROOTSRV_IRQ_CONTROL,

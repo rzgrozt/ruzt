@@ -2,11 +2,13 @@
 
 use alloc::{collections::BTreeMap, vec::Vec};
 use core::ops::Bound::{Excluded, Unbounded};
-use ruzt_abi::{cptr_depth, ErrorCode, RetypeKind, IPC_CAP_SLOTS, MAX_CNODE_RADIX, MAX_CPTR_DEPTH};
+use ruzt_abi::{
+    cptr_depth, ErrorCode, PciAddress, RetypeKind, IPC_CAP_SLOTS, MAX_CNODE_RADIX, MAX_CPTR_DEPTH,
+};
 use ruzt_cap::{CapRights, CapSlot, CapType, NULL_SLOT};
 use spin::Mutex;
 
-use super::object::{self, FramePin, KObjectId, UntypedBudget, MAX_OBJECTS};
+use super::object::{self, FramePin, KObjectId, MmioPin, UntypedBudget, MAX_OBJECTS};
 
 /// A capability identity that survives moves between slots.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -17,6 +19,10 @@ pub(crate) struct CapabilityId(u64);
 pub(crate) struct CapabilityPath([u64; MAX_CPTR_DEPTH]);
 
 impl CapabilityPath {
+    pub(crate) fn leaf(&self) -> CapabilityId {
+        CapabilityId(self.0[0])
+    }
+
     pub(crate) fn is_live(&self) -> bool {
         let tree = DERIVATIONS.lock();
         self.0
@@ -312,11 +318,35 @@ impl CSpace {
 
     pub(crate) fn lookup_path(&self, cptr: u64) -> Result<(CapabilityPath, CapSlot), ErrorCode> {
         let tree = DERIVATIONS.lock();
+        self.lookup_path_locked(&tree, cptr)
+    }
+
+    fn lookup_path_locked(
+        &self,
+        tree: &DerivationTree,
+        cptr: u64,
+    ) -> Result<(CapabilityPath, CapSlot), ErrorCode> {
         let mut path = [0; MAX_CPTR_DEPTH];
-        let address = self.resolve_with(&tree, cptr, false, |level, id| path[level] = id.0)?;
-        let (id, node) = self.live_node(&tree, address)?;
+        let address = self.resolve_with(tree, cptr, false, |level, id| path[level] = id.0)?;
+        let (id, node) = self.live_node(tree, address)?;
         path[0] = id.0;
         Ok((CapabilityPath(path), node.slot))
+    }
+
+    pub(crate) fn device_mmio(
+        &self,
+        cptr: u64,
+        rights: CapRights,
+    ) -> Result<(CapabilityPath, MmioPin), ErrorCode> {
+        let tree = DERIVATIONS.lock();
+        let (path, cap) = self.lookup_path_locked(&tree, cptr)?;
+        let CapType::Mmio(id) = cap.cap_type else {
+            return Err(ErrorCode::InvalidCap);
+        };
+        if !cap.rights.contains(rights) {
+            return Err(ErrorCode::CapRightsViolation);
+        }
+        Ok((path, MmioPin::new(KObjectId(id))?))
     }
 
     fn live_node(
@@ -471,23 +501,70 @@ impl CSpace {
         destination: u64,
         irq_num: u32,
     ) -> Result<(), ErrorCode> {
+        self.allocate_device_object(control, destination, |cap| {
+            if cap != CapType::IrqControl {
+                return Err(ErrorCode::InvalidCap);
+            }
+            let object = object::allocate_irq(irq_num)?;
+            Ok((
+                object,
+                CapType::Irq {
+                    irq_num,
+                    id: object.0,
+                },
+            ))
+        })
+    }
+
+    pub(crate) fn claim_pci_device(
+        &mut self,
+        control: u64,
+        destination: u64,
+        address: PciAddress,
+    ) -> Result<(), ErrorCode> {
+        self.allocate_device_object(control, destination, |cap| {
+            if cap != CapType::PciControl {
+                return Err(ErrorCode::InvalidCap);
+            }
+            let object = object::allocate_pci_device(address)?;
+            Ok((object, CapType::PciDevice(object.0)))
+        })
+    }
+
+    pub(crate) fn open_pci_bar(
+        &mut self,
+        source: u64,
+        destination: u64,
+        bar: usize,
+        first: u64,
+        pages: u64,
+    ) -> Result<(), ErrorCode> {
+        self.allocate_device_object(source, destination, |cap| {
+            let CapType::PciDevice(device) = cap else {
+                return Err(ErrorCode::InvalidCap);
+            };
+            let object = object::allocate_mmio(KObjectId(device), bar, first, pages)?;
+            Ok((object, CapType::Mmio(object.0)))
+        })
+    }
+
+    fn allocate_device_object(
+        &mut self,
+        cptr: u64,
+        destination: u64,
+        allocate: impl FnOnce(CapType) -> Result<(KObjectId, CapType), ErrorCode>,
+    ) -> Result<(), ErrorCode> {
         let mut tree = DERIVATIONS.lock();
-        let (source, node) = self.lookup_node(&tree, control)?;
-        if node.slot.cap_type != CapType::IrqControl {
-            return Err(ErrorCode::InvalidCap);
-        }
+        let (source, node) = self.lookup_node(&tree, cptr)?;
         if !node.slot.rights.contains(CapRights::WRITE) {
             return Err(ErrorCode::CapRightsViolation);
         }
         let destination = self.resolve(&tree, destination, true)?;
         self.vacant(destination, &tree)?;
-        let object = object::allocate_irq(irq_num)?;
+        let (object, cap_type) = allocate(node.slot.cap_type)?;
         let node = Node {
             slot: CapSlot {
-                cap_type: CapType::Irq {
-                    irq_num,
-                    id: object.0,
-                },
+                cap_type,
                 rights: CapRights::READ
                     .union(CapRights::WRITE)
                     .union(CapRights::GRANT),
@@ -519,9 +596,14 @@ impl CSpace {
             CapType::Thread(id) => Some(KObjectId(id.0)),
             CapType::AddressSpace(id) => Some(KObjectId(id.0)),
             CapType::CNode { ptr, .. } => Some(KObjectId(ptr)),
-            CapType::IrqControl | CapType::IoPort { .. } | CapType::Framebuffer => None,
+            CapType::IrqControl
+            | CapType::PciControl
+            | CapType::IoPort { .. }
+            | CapType::Framebuffer => None,
             CapType::Null
             | CapType::Irq { .. }
+            | CapType::PciDevice(_)
+            | CapType::Mmio(_)
             | CapType::Frame { .. }
             | CapType::Untyped { .. } => return Err(ErrorCode::InvalidCap),
         };

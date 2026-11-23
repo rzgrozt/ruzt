@@ -6,13 +6,13 @@ extern crate alloc;
 mod tile;
 
 use ruzt_abi::{
-    console, CapRights, CapTransferSlot, ErrorCode, IpcMessage, RetypeKind, FRAME_BYTES,
-    PROCESS_ADDRESS_SPACE, PROCESS_EXITED, PROCESS_FAULTED, ROOTSRV_CONSOLE_FRAME,
+    console, CapRights, CapTransferSlot, ErrorCode, IpcMessage, PciAddress, RetypeKind,
+    FRAME_BYTES, PROCESS_ADDRESS_SPACE, PROCESS_EXITED, PROCESS_FAULTED, ROOTSRV_CONSOLE_FRAME,
     ROOTSRV_CONSOLE_NOTIFICATION, ROOTSRV_CONSOLE_PROCESS, ROOTSRV_CONSOLE_PROGRAM,
     ROOTSRV_CONSOLE_REPLY, ROOTSRV_CONSOLE_REQUEST, ROOTSRV_FRAMEBUFFER, ROOTSRV_IRQ_CONTROL,
-    ROOTSRV_KEYBOARD_DATA, ROOTSRV_KEYBOARD_IRQ, ROOTSRV_UART_DATA, ROOTSRV_UART_IRQ_ENABLE,
-    ROOTSRV_UART_IRQ_IDENTIFY, ROOTSRV_UART_STATUS, ROOTSRV_UNTYPED, WAIT_ENDPOINT_CLOSED,
-    WAIT_IRQ, WAIT_MESSAGE, WAIT_NOTIFICATION, WAIT_PROCESS_EXITED,
+    ROOTSRV_KEYBOARD_DATA, ROOTSRV_KEYBOARD_IRQ, ROOTSRV_PCI_CONTROL, ROOTSRV_UART_DATA,
+    ROOTSRV_UART_IRQ_ENABLE, ROOTSRV_UART_IRQ_IDENTIFY, ROOTSRV_UART_STATUS, ROOTSRV_UNTYPED,
+    WAIT_ENDPOINT_CLOSED, WAIT_IRQ, WAIT_MESSAGE, WAIT_NOTIFICATION, WAIT_PROCESS_EXITED,
 };
 use ruzt_runtime::{debug_print, runtime_init};
 
@@ -330,6 +330,7 @@ fn run_console() -> bool {
             if ruzt_driver_sdk::read_port_u8(ROOTSRV_UART_IRQ_ENABLE).is_ok() {
                 check_console_irq().expect("delegate and reclaim the console UART IRQ");
             }
+            check_pci_mmio().expect("verify firmware-assigned PCI memory");
             assert_eq!(
                 ruzt_ipc::split_untyped(
                     PROGRAM_BUDGET,
@@ -446,6 +447,96 @@ fn check_console_irq() -> Result<(), ErrorCode> {
     ruzt_driver_sdk::unbind_irq(VACANT)?;
     ruzt_ipc::delete(VACANT)?;
     write_line("rootsrv: delegated UART IRQ delivered, re-armed and reclaimed");
+    Ok(())
+}
+
+fn check_pci_mmio() -> Result<(), ErrorCode> {
+    use ruzt_driver_sdk::{claim_pci_device, map_mmio, open_pci_bar, read_pci_config, unmap_mmio};
+    const EDU_ID: u32 = 0x11e8_1234;
+    const DEVICE: u64 = 33;
+    const BAR: u64 = 34;
+    const SPARE: u64 = 35;
+    const WINDOW: u64 = 0x5200_0000;
+    let mut found = None;
+    for device in 0..32 {
+        let address = PciAddress::new(0, device, 0).unwrap();
+        if read_pci_config(ROOTSRV_PCI_CONTROL, address, 0)? == EDU_ID {
+            found = Some(address);
+            break;
+        }
+    }
+    let Some(address) = found else { return Ok(()) };
+    assert_eq!(
+        read_pci_config(ROOTSRV_UNTYPED, address, 0),
+        Err(ErrorCode::InvalidCap)
+    );
+    claim_pci_device(ROOTSRV_PCI_CONTROL, DEVICE, address)?;
+    assert_eq!(
+        claim_pci_device(ROOTSRV_PCI_CONTROL, SPARE, address),
+        Err(ErrorCode::SlotOccupied)
+    );
+    assert_eq!(
+        open_pci_bar(DEVICE, BAR, 0, 255, 2),
+        Err(ErrorCode::BadMessage)
+    );
+    open_pci_bar(DEVICE, BAR, 0, 0, 2)?;
+
+    let second_page = WINDOW + FRAME_BYTES as u64;
+    ruzt_ipc::map_anonymous(PROCESS_ADDRESS_SPACE, second_page, 1, true)?;
+    assert_eq!(map_mmio(BAR, WINDOW, true), Err(ErrorCode::MappingExists));
+    ruzt_ipc::map_anonymous(PROCESS_ADDRESS_SPACE, WINDOW, 1, true)?;
+    ruzt_ipc::unmap_anonymous(PROCESS_ADDRESS_SPACE, WINDOW, 2)?;
+    let registers = map_mmio(BAR, WINDOW, true)?;
+    // SAFETY: The EDU identity confirmed the device and BAR0 maps its registers.
+    // Register 4 accepts a dword and returns its bitwise inversion on read.
+    unsafe {
+        assert_eq!(registers.read_u32(0)? & 0xffff, 0x00ed);
+        registers.write_u32(4, 0x1234_5678)?;
+        assert_eq!(registers.read_u32(4)?, !0x1234_5678);
+    }
+    // SAFETY: Asking the kernel to validate this mapped range as an output
+    // buffer is intentional. MonotonicTime rejects device pages before writing.
+    let status = unsafe {
+        ruzt_runtime::syscall::syscall(
+            ruzt_abi::SyscallNumber::MonotonicTime,
+            WINDOW,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    };
+    assert_eq!(ErrorCode::from_u64(status), Err(ErrorCode::BadMessage));
+    unmap_mmio(BAR)?;
+    let mut request = IpcMessage {
+        label: console::CHECK_MMIO,
+        cap_count: 1,
+        ..IpcMessage::default()
+    };
+    request.caps[0] = CapTransferSlot {
+        cptr: BAR,
+        rights: CapRights::READ,
+        badge: 0,
+    };
+    ruzt_ipc::send(ROOTSRV_CONSOLE_REQUEST, &request)?;
+    let mut response = IpcMessage::default();
+    ruzt_ipc::recv(ROOTSRV_CONSOLE_REPLY, &mut response)?;
+    assert_eq!(response.label, console::MMIO_CHECKED);
+
+    ruzt_ipc::revoke(DEVICE)?;
+    assert_eq!(map_mmio(BAR, WINDOW, false), Err(ErrorCode::InvalidCap));
+    let request = IpcMessage {
+        label: console::CHECK_MMIO_REVOKED,
+        ..IpcMessage::default()
+    };
+    ruzt_ipc::send(ROOTSRV_CONSOLE_REQUEST, &request)?;
+    ruzt_ipc::recv(ROOTSRV_CONSOLE_REPLY, &mut response)?;
+    assert_eq!(response.label, console::MMIO_CHECKED);
+    ruzt_ipc::delete(DEVICE)?;
+    claim_pci_device(ROOTSRV_PCI_CONTROL, SPARE, address)?;
+    ruzt_ipc::delete(SPARE)?;
+    write_line("rootsrv: PCI BAR mapped, delegated read-only, revoked and reclaimed");
     Ok(())
 }
 

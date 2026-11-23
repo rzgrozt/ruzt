@@ -1,9 +1,10 @@
 //! Kernel object table — every capability references a stable entry here.
 
-use ruzt_abi::{ErrorCode, ProcessStatus, RetypeKind, MAX_CNODE_RADIX};
+use ruzt_abi::{ErrorCode, PciAddress, ProcessStatus, RetypeKind, MAX_CNODE_RADIX};
 use ruzt_cap::{AddressSpaceId, CapType, EndpointId, FrameSize, NotificationId, ProcessId};
 use ruzt_hal::mem::{PhysAddr, PhysFrame};
 use ruzt_hal_x86_64::mapper::{self, UserPageFrames};
+use ruzt_hal_x86_64::pci::MemoryBar;
 use spin::Mutex;
 
 use super::region::FreePages;
@@ -78,6 +79,20 @@ pub enum KernelObject {
     Irq {
         /// Hardware IRQ line number.
         irq_num: u32,
+    },
+    /// An exclusive lease on a firmware-configured PCI function.
+    PciDevice {
+        /// PCI bus, device and function.
+        address: PciAddress,
+        /// Assignments validated against boot and other device resources.
+        bars: crate::pci::Bars,
+    },
+    /// A page-aligned portion of a PCI memory BAR.
+    Mmio {
+        /// Holds the device lease even when the original device cap is deleted.
+        device: KObjectId,
+        /// Physical register range.
+        range: MemoryBar,
     },
 }
 
@@ -174,6 +189,79 @@ pub(super) fn allocate_irq(irq_num: u32) -> Result<KObjectId, ErrorCode> {
     entry.object = Some(object);
     entry.generation += 1;
     Ok(id)
+}
+
+pub(super) fn allocate_pci_device(address: PciAddress) -> Result<KObjectId, ErrorCode> {
+    let mut table = TABLE.lock();
+    if table.iter().any(|entry| {
+        matches!(entry.object, Some(KernelObject::PciDevice { address: live, .. }) if live == address)
+    }) {
+        return Err(ErrorCode::SlotOccupied);
+    }
+    let id = vacant_id(&table[..])?;
+    let bars = crate::pci::probe(address)?;
+    for entry in table.iter() {
+        if let Some(KernelObject::PciDevice { bars: claimed, .. }) = entry.object {
+            if bars.iter().flatten().any(|bar| {
+                claimed
+                    .iter()
+                    .flatten()
+                    .any(|other| crate::pci::overlaps(*bar, *other))
+            }) {
+                return Err(ErrorCode::MappingExists);
+            }
+        }
+    }
+    crate::pci::prepare_physmap(&bars)?;
+    let entry = &mut table[id.index()];
+    entry.object = Some(KernelObject::PciDevice { address, bars });
+    entry.generation += 1;
+    Ok(id)
+}
+
+pub(super) fn allocate_mmio(
+    device: KObjectId,
+    bar: usize,
+    first: u64,
+    pages: u64,
+) -> Result<KObjectId, ErrorCode> {
+    let mut table = TABLE.lock();
+    let id = vacant_id(&table[..])?;
+    let parent = &mut table[device.index()];
+    if !parent.matches(device) {
+        return Err(ErrorCode::InvalidCap);
+    }
+    let Some(KernelObject::PciDevice { bars, .. }) = parent.object else {
+        return Err(ErrorCode::InvalidCap);
+    };
+    let range = bar_subrange(
+        bars.get(bar)
+            .copied()
+            .flatten()
+            .ok_or(ErrorCode::NotFound)?,
+        first,
+        pages,
+    )?;
+    parent.references = parent
+        .references
+        .checked_add(1)
+        .ok_or(ErrorCode::NoMemory)?;
+    let entry = &mut table[id.index()];
+    entry.object = Some(KernelObject::Mmio { device, range });
+    entry.generation += 1;
+    Ok(id)
+}
+
+fn bar_subrange(bar: MemoryBar, first: u64, pages: u64) -> Result<MemoryBar, ErrorCode> {
+    let page = PhysFrame::SIZE as u64;
+    let bar_pages = bar.bytes / page;
+    if pages == 0 || first.checked_add(pages).is_none_or(|end| end > bar_pages) {
+        return Err(ErrorCode::BadMessage);
+    }
+    Ok(MemoryBar {
+        base: bar.base + first * page,
+        bytes: pages * page,
+    })
 }
 
 /// Register a descriptor for a user-owned page table root.
@@ -417,6 +505,28 @@ impl Drop for FramePin {
     }
 }
 
+/// Keeps a device lease alive until the last associated mapping is removed.
+pub(crate) struct MmioPin {
+    id: KObjectId,
+    pub(crate) range: MemoryBar,
+}
+
+impl MmioPin {
+    pub(super) fn new(id: KObjectId) -> Result<Self, ErrorCode> {
+        let Some(KernelObject::Mmio { range, .. }) = get(id) else {
+            return Err(ErrorCode::InvalidCap);
+        };
+        retain(id)?;
+        Ok(Self { id, range })
+    }
+}
+
+impl Drop for MmioPin {
+    fn drop(&mut self) {
+        release(self.id);
+    }
+}
+
 /// Keeps the Untyped allocator alive for every private page of an address space.
 pub(crate) struct UntypedBudget(KObjectId);
 
@@ -529,6 +639,9 @@ fn destroy(object: KernelObject, backing: Option<UntypedAllocation>) {
             }
         }
         KernelObject::Irq { irq_num } => crate::irq::release(irq_num),
+        KernelObject::Mmio { device, .. } => {
+            release(device);
+        }
         _ => {}
     }
     if let Some(allocation) = backing {
@@ -582,6 +695,9 @@ fn kernel_object_from_cap_type(cap_type: CapType) -> Result<KernelObject, ErrorC
         #[cfg(not(test))]
         CapType::CNode { .. } => Err(ErrorCode::InvalidCap),
         CapType::Irq { .. } | CapType::IrqControl => Err(ErrorCode::InvalidCap),
+        CapType::PciControl | CapType::PciDevice(_) | CapType::Mmio(_) => {
+            Err(ErrorCode::InvalidCap)
+        }
         // Boot device capabilities are only provisioned at process creation.
         CapType::IoPort { .. } | CapType::Framebuffer => Err(ErrorCode::NotImplemented),
     }
@@ -664,6 +780,44 @@ mod tests {
             }),
             Err(ErrorCode::InvalidCap)
         );
+    }
+
+    #[test]
+    fn live_mmio_pin_keeps_the_pci_device_lease() {
+        let _state = crate::isolated_kernel_state();
+        let device = allocate_with(|| {
+            let mut bars = [None; ruzt_hal_x86_64::pci::BAR_COUNT];
+            bars[0] = Some(MemoryBar {
+                base: 0xfea0_0000,
+                bytes: 8192,
+            });
+            Ok(KernelObject::PciDevice {
+                address: PciAddress::new(0, 4, 0).unwrap(),
+                bars,
+            })
+        })
+        .unwrap();
+        assert_eq!(allocate_mmio(device, 0, 0, 0), Err(ErrorCode::BadMessage));
+        assert_eq!(
+            allocate_mmio(device, 0, u64::MAX, 2),
+            Err(ErrorCode::BadMessage)
+        );
+        assert_eq!(allocate_mmio(device, 0, 1, 2), Err(ErrorCode::BadMessage));
+        let mmio = allocate_mmio(device, 0, 1, 1).unwrap();
+        let pin = MmioPin::new(mmio).unwrap();
+        assert_eq!(
+            pin.range,
+            MemoryBar {
+                base: 0xfea0_1000,
+                bytes: 4096
+            }
+        );
+        deallocate(device);
+        deallocate(mmio);
+        assert!(get(device).is_some());
+        drop(pin);
+        assert_eq!(get(mmio), None);
+        assert_eq!(get(device), None);
     }
 
     #[test]
