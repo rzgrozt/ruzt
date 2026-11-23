@@ -155,6 +155,11 @@ pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
             sched::with_current_user(|process| process.unmap_anonymous(id, args.arg2, args.arg3))
                 .ok_or(ErrorCode::InvalidCap)?
         }
+        CapType::AddressSpace(id) if operation == CapOp::GrowHeap as u64 => {
+            require(capability.rights, CapRights::WRITE)?;
+            sched::with_current_user(|process| process.grow_heap(id, args.arg2, args.arg3))
+                .ok_or(ErrorCode::InvalidCap)?
+        }
         CapType::Notification(id) if args.arg1 == CapOp::Signal as u64 => {
             require(capability.rights, CapRights::WRITE)?;
             ErrorCode::from_u64(ipc::notification_signal(id))

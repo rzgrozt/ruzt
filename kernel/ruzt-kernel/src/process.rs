@@ -14,7 +14,8 @@ use crate::sched::{self, ThreadState};
 use alloc::vec::Vec;
 use ruzt_abi::{
     CapRights, ErrorCode, FramebufferInfo, ProcessStatus, IPC_CAP_SLOTS, PROCESS_ADDRESS_SPACE,
-    ROOTSRV_FRAMEBUFFER, ROOTSRV_UNTYPED,
+    ROOTSRV_FRAMEBUFFER, ROOTSRV_UNTYPED, USER_HEAP_INITIAL_BYTES, USER_HEAP_LIMIT,
+    USER_HEAP_START,
 };
 use ruzt_cap::{CapType, EndpointId, ProcessId};
 use ruzt_hal::boot::Framebuffer;
@@ -42,9 +43,13 @@ const STACK_REGION: Region = Region {
     page_count: 32,
 };
 const HEAP_REGION: Region = Region {
-    start: 0x4000_0000,
-    page_count: 256,
+    start: USER_HEAP_START,
+    page_count: USER_HEAP_INITIAL_BYTES as u64 / PAGE_SIZE,
 };
+
+fn overlaps_heap(start: u64, end: u64) -> bool {
+    start < USER_HEAP_LIMIT && USER_HEAP_START < end
+}
 
 fn initial_stack_pointer() -> u64 {
     // System V function entry expects an 8-byte return-address bias.
@@ -70,7 +75,8 @@ impl UserProcess {
 struct UserAddressSpace {
     root: PhysFrame,
     ram: Vec<PhysFrame>,
-    anonymous: Vec<anonymous::AnonymousPage>,
+    anonymous: Vec<anonymous::PrivatePage>,
+    heap_extension: Vec<anonymous::PrivatePage>,
     // Dropped only after Drop destroys the private page tables.
     shared_frames: Vec<shared_frames::Mapping>,
     budget: UntypedBudget,
@@ -84,8 +90,12 @@ impl Drop for UserAddressSpace {
             // construction or after the scheduler permanently switches away.
             unsafe { mapper.destroy_user_address_space(self.root, &self.budget) };
         });
-        let anonymous = self.anonymous.drain(..).map(|page| page.frame);
-        for frame in self.ram.drain(..).chain(anonymous) {
+        let dynamic = self
+            .anonymous
+            .drain(..)
+            .chain(self.heap_extension.drain(..))
+            .map(|page| page.frame);
+        for frame in self.ram.drain(..).chain(dynamic) {
             // SAFETY: These are owned allocator frames. No user table maps
             // them after destroying the root. Device pages are never tracked.
             unsafe { self.budget.deallocate(frame) };
@@ -279,6 +289,7 @@ fn map_image(
         root,
         ram: Vec::new(),
         anonymous: Vec::new(),
+        heap_extension: Vec::new(),
         shared_frames: Vec::new(),
         budget,
     };
@@ -289,6 +300,9 @@ fn map_image(
             }
             let start = segment.vaddr & !(PAGE_SIZE - 1);
             let end = (segment.vaddr + segment.mem_size).next_multiple_of(PAGE_SIZE);
+            if overlaps_heap(start, end) {
+                return Err(MapError::AlreadyMapped);
+            }
             let data_end = segment.vaddr + segment.data.len() as u64;
             for page in (start..end).step_by(PhysFrame::SIZE) {
                 let copy_start = page.max(segment.vaddr);

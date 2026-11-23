@@ -1,6 +1,9 @@
 #![no_std]
 #![no_main]
 
+#[cfg(any(feature = "qemu-fault-test", feature = "qemu-exit-test"))]
+extern crate alloc;
+
 use ruzt_abi::{
     console, CapRights, ErrorCode, IpcMessage, RetypeKind, FRAME_BYTES, ROOTSRV_FRAMEBUFFER,
 };
@@ -117,6 +120,7 @@ fn run_shutdown_test() {
         ruzt_ipc::map_anonymous(ruzt_abi::PROCESS_ADDRESS_SPACE, private_page, 1, true)
             .expect("map private memory to be reclaimed on exit");
         uart_write(b"consoled: delegated scratch and anonymous page mapped\n");
+        check_heap_budget();
     }
     #[cfg(feature = "qemu-fault-test")]
     // SAFETY: This test deliberately raises a user instruction exception.
@@ -125,6 +129,34 @@ fn run_shutdown_test() {
     };
     #[cfg(all(feature = "qemu-exit-test", not(feature = "qemu-fault-test")))]
     ruzt_runtime::syscall::exit(23);
+}
+
+#[cfg(any(feature = "qemu-fault-test", feature = "qemu-exit-test"))]
+fn check_heap_budget() {
+    use core::hint::black_box;
+
+    let mut initial = alloc::vec::Vec::new();
+    black_box(&mut initial)
+        .try_reserve_exact(ruzt_abi::USER_HEAP_INITIAL_BYTES - 64 * 1024)
+        .expect("allocate most of the initial console heap");
+    initial.push(0x69u8);
+
+    let mut extra = alloc::vec::Vec::new();
+    black_box(&mut extra)
+        .try_reserve_exact(128 * 1024)
+        .expect("grow the console heap");
+    extra.push(0x96u8);
+    let mut oversized = alloc::vec::Vec::<u8>::new();
+    // An optimized build can elide a known, unused allocation.
+    assert!(black_box(&mut oversized)
+        .try_reserve_exact(2 * 1024 * 1024)
+        .is_err());
+    black_box(&mut extra)
+        .try_reserve_exact(256 * 1024)
+        .expect("grow after a rejected allocation");
+    assert_eq!(black_box(initial.as_slice()), [0x69]);
+    assert_eq!(black_box(extra.as_slice()), [0x96]);
+    uart_write(b"consoled: runtime heap recovered after budget exhaustion\n");
 }
 
 fn check_revocation() -> Result<(), ErrorCode> {

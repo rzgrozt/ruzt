@@ -45,6 +45,12 @@ pub const ROOTSRV_UART_DATA: u64 = 18;
 pub const ROOTSRV_UART_STATUS: u64 = 19;
 /// Self address-space capability installed at process startup.
 pub const PROCESS_ADDRESS_SPACE: u64 = 15;
+/// Base virtual address of the initial runtime heap.
+pub const USER_HEAP_START: u64 = 0x4000_0000;
+/// Bytes mapped at the heap base before entering user mode.
+pub const USER_HEAP_INITIAL_BYTES: usize = 1024 * 1024;
+/// Exclusive end of the virtual range reserved for the runtime heap.
+pub const USER_HEAP_LIMIT: u64 = USER_HEAP_START + 16 * 1024 * 1024;
 
 /// Byte length of a frame supported by the user mapping ABI.
 pub const FRAME_BYTES: usize = 4096;
@@ -170,6 +176,9 @@ pub enum CapOp {
     /// Unmap a range of private pages created by `MapAnonymous`.
     /// `arg2` is the start address and `arg3` is the page count.
     UnmapAnonymous = 17,
+    /// Extend the runtime heap with zeroed writable pages.
+    /// `arg2` is the current heap end and `arg3` is the number of pages to add.
+    GrowHeap = 18,
 }
 
 /// The process invoked `Exit`.
@@ -511,6 +520,7 @@ mod tests {
         assert_eq!(CapOp::SpawnProgram as u64, 15);
         assert_eq!(CapOp::MapAnonymous as u64, 16);
         assert_eq!(CapOp::UnmapAnonymous as u64, 17);
+        assert_eq!(CapOp::GrowHeap as u64, 18);
     }
 
     #[test]

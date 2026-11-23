@@ -14,6 +14,8 @@ The root server receives an 8 MiB Untyped RAM budget at boot. Each process's ima
 
 Each process has a self address-space capability for mapping zeroed anonymous pages at a chosen virtual address. These pages draw from its address-space budget and may be read-only or writable. Unmapping returns the pages to the budget. A failed range operation preserves existing mappings.
 
+The runtime starts with a 1 MiB heap. On allocation pressure it can extend the heap inside a reserved 16 MiB virtual range using pages from the same budget. A failed extension leaves the heap intact. The kernel returns the grown heap to its budget when it reaps the process.
+
 When a service exits or takes a user-mode fault, the kernel closes endpoints designated at launch, wakes blocked peers, and reclaims its stack and private address-space memory after switching away. `rootsrv` uses the process status capability to distinguish exit from fault and retries a failed console instance once with fresh endpoints.
 
 ## Repository layout

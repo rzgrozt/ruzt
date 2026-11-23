@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 mod tile;
 
 use ruzt_abi::{
@@ -387,6 +389,7 @@ fn verify_program_budget_reclaimed() {
 fn main() -> ! {
     run_console();
     check_anonymous_memory();
+    check_heap_growth();
 
     assert_eq!(
         ruzt_driver_sdk::wait_irq(u64::MAX),
@@ -425,6 +428,40 @@ fn main() -> ! {
             write_line("rootsrv: Space key received");
         }
     }
+}
+
+fn check_heap_growth() {
+    use alloc::alloc::{alloc, dealloc, Layout};
+    use ruzt_abi::{USER_HEAP_INITIAL_BYTES, USER_HEAP_START};
+
+    let first_extension = USER_HEAP_START + USER_HEAP_INITIAL_BYTES as u64;
+    assert_eq!(
+        ruzt_ipc::map_anonymous(PROCESS_ADDRESS_SPACE, first_extension, 1, true),
+        Err(ErrorCode::MappingExists),
+    );
+    // A page-aligned allocation larger than the entire bootstrap heap.
+    let layout = Layout::from_size_align(
+        USER_HEAP_INITIAL_BYTES + FRAME_BYTES - size_of::<usize>(),
+        FRAME_BYTES * 2,
+    )
+    .unwrap();
+    // SAFETY: The layout is valid and nonempty. The allocation is checked
+    // before any access and released below with the same layout.
+    let pointer = unsafe { alloc(layout) };
+    assert!(!pointer.is_null());
+    assert_eq!(pointer.addr() % layout.align(), 0);
+    assert_eq!(
+        ruzt_ipc::unmap_anonymous(PROCESS_ADDRESS_SPACE, first_extension, 1),
+        Err(ErrorCode::NotFound),
+    );
+    // SAFETY: The successful allocation covers all of these bytes.
+    unsafe {
+        let last = pointer.add(layout.size() - 1);
+        last.write_volatile(0xa5);
+        assert_eq!(last.read_volatile(), 0xa5);
+        dealloc(pointer, layout);
+    }
+    write_line("rootsrv: aligned allocation grew the runtime heap");
 }
 
 fn check_anonymous_memory() {
