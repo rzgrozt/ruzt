@@ -8,7 +8,9 @@ use ruzt_abi::{
 use ruzt_cap::{CapRights, CapSlot, CapType, NULL_SLOT};
 use spin::Mutex;
 
-use super::object::{self, FramePin, KObjectId, MmioPin, UntypedBudget, MAX_OBJECTS};
+use super::object::{
+    self, DmaPin, FramePin, KObjectId, MmioPin, PciPin, UntypedBudget, MAX_OBJECTS,
+};
 
 /// A capability identity that survives moves between slots.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -349,6 +351,34 @@ impl CSpace {
         Ok((path, MmioPin::new(KObjectId(id))?))
     }
 
+    pub(crate) fn dma_buffer(
+        &self,
+        cptr: u64,
+        rights: CapRights,
+    ) -> Result<(CapabilityPath, DmaPin), ErrorCode> {
+        let tree = DERIVATIONS.lock();
+        let (path, cap) = self.lookup_path_locked(&tree, cptr)?;
+        let CapType::DmaBuffer(id) = cap.cap_type else {
+            return Err(ErrorCode::InvalidCap);
+        };
+        if !cap.rights.contains(rights) {
+            return Err(ErrorCode::CapRightsViolation);
+        }
+        Ok((path, DmaPin::new(KObjectId(id))?))
+    }
+
+    pub(crate) fn pci_device(&self, cptr: u64) -> Result<(CapabilityPath, PciPin), ErrorCode> {
+        let tree = DERIVATIONS.lock();
+        let (path, cap) = self.lookup_path_locked(&tree, cptr)?;
+        let CapType::PciDevice(id) = cap.cap_type else {
+            return Err(ErrorCode::InvalidCap);
+        };
+        if !cap.rights.contains(CapRights::WRITE) {
+            return Err(ErrorCode::CapRightsViolation);
+        }
+        Ok((path, PciPin::new(KObjectId(id))?))
+    }
+
     fn live_node(
         &self,
         tree: &DerivationTree,
@@ -604,6 +634,7 @@ impl CSpace {
             | CapType::Irq { .. }
             | CapType::PciDevice(_)
             | CapType::Mmio(_)
+            | CapType::DmaBuffer(_)
             | CapType::Frame { .. }
             | CapType::Untyped { .. } => return Err(ErrorCode::InvalidCap),
         };

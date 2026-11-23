@@ -166,7 +166,8 @@ pub fn revoke(cptr: u64) -> Result<(), ErrorCode> {
 }
 
 /// Create a child object in an empty slot, charging the invoked Untyped budget.
-/// Use [`split_untyped`] or [`create_cnode`] for objects with an explicit size.
+/// Use [`split_untyped`], [`create_cnode`] or the driver SDK's DMA allocation
+/// operation for objects with an explicit size.
 pub fn retype(untyped: u64, destination: u64, kind: RetypeKind) -> Result<(), ErrorCode> {
     control(untyped, CapOp::Retype, destination, kind as u64, 0)
 }

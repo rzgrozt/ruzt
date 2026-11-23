@@ -1,13 +1,16 @@
-//! Boot-time default-deny PCI DMA translation.
+//! Default-deny PCI DMA translation.
 
 use alloc::vec::Vec;
 use ruzt_abi::PciAddress;
 use ruzt_hal::boot::{BootInfo, FirmwareTables, MemoryRegionKind};
 use ruzt_hal::mem::{PhysFrame, VirtAddr};
 use ruzt_hal_x86_64::{mapper, vtd};
-use spin::Once;
+use spin::{Mutex, Once};
 
 use crate::{acpi, mm::frame};
+
+mod domain;
+pub(crate) use domain::{bind, detach_revoked, detach_thread, unbind};
 
 #[cfg(feature = "qemu-vtd-test")]
 mod probe;
@@ -33,7 +36,6 @@ enum Scope {
 }
 
 impl Scope {
-    #[cfg(feature = "qemu-vtd-test")]
     fn covers(&self, address: PciAddress) -> bool {
         match self {
             Self::All => true,
@@ -54,9 +56,11 @@ enum Error {
 }
 
 struct Controller {
-    _unit: vtd::Unit,
-    _root: PhysFrame,
-    _scope: Scope,
+    unit: vtd::Unit,
+    root: PhysFrame,
+    scope: Scope,
+    host_bits: u8,
+    domains: Mutex<domain::Domains>,
 }
 
 static CONTROLLER: Once<Controller> = Once::new();
@@ -77,7 +81,7 @@ pub(crate) fn verify_unassigned_device() {
     let controller = CONTROLLER
         .get()
         .expect("VT-d is required by the QEMU fixture");
-    probe::verify(&controller._unit, &controller._scope)
+    probe::verify(&controller.unit, &controller.scope)
         .expect("verify VT-d blocks an unassigned requester");
 }
 
@@ -121,7 +125,12 @@ fn start(boot: &BootInfo) -> Result<Option<Controller>, Error> {
         frame::deallocate(root);
         return Err(Error::BadRegisters);
     }
-    if let Err(error) = initialize_root(root, unit.coherent()) {
+    #[allow(unsafe_code)]
+    // SAFETY: The allocator returned fresh direct-mapped RAM.
+    unsafe {
+        mapper::zero_frame(root)
+    };
+    if let Err(error) = frame_alias(root).and_then(|alias| publish(alias, unit.coherent())) {
         frame::deallocate(root);
         return Err(error);
     }
@@ -130,26 +139,23 @@ fn start(boot: &BootInfo) -> Result<Option<Controller>, Error> {
     // denies DMA. The allocator keeps the table even on a hardware timeout.
     unsafe { unit.enable(root) }.map_err(Error::Hardware)?;
     Ok(Some(Controller {
-        _unit: unit,
-        _root: root,
-        _scope: remapper.scope,
+        unit,
+        root,
+        scope: remapper.scope,
+        host_bits: remapper.host_bits,
+        domains: Mutex::new(domain::Domains::new()),
     }))
 }
 
-fn initialize_root(root: PhysFrame, coherent: bool) -> Result<(), Error> {
-    #[allow(unsafe_code)]
-    // SAFETY: The allocator returned one fresh direct-mapped RAM frame.
-    unsafe {
-        mapper::zero_frame(root)
-    };
+fn frame_alias(frame: PhysFrame) -> Result<VirtAddr, Error> {
+    mapper::with_mapper(|mapper| mapper.physmap_alias(frame.base.as_u64(), PhysFrame::SIZE as u64))
+        .ok_or(Error::BadRegisters)
+}
+
+fn publish(alias: VirtAddr, coherent: bool) -> Result<(), Error> {
     if !coherent {
-        let alias = mapper::with_mapper(|mapper| {
-            mapper.physmap_alias(root.base.as_u64(), PhysFrame::SIZE as u64)
-        })
-        .ok_or(Error::BadRegisters)?;
         flush_frame(alias)?;
     }
-    // Publish the whole empty table before programming the remapping unit.
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
     Ok(())
 }

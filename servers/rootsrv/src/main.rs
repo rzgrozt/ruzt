@@ -533,10 +533,100 @@ fn check_pci_mmio() -> Result<(), ErrorCode> {
     ruzt_ipc::send(ROOTSRV_CONSOLE_REQUEST, &request)?;
     ruzt_ipc::recv(ROOTSRV_CONSOLE_REPLY, &mut response)?;
     assert_eq!(response.label, console::MMIO_CHECKED);
+    open_pci_bar(DEVICE, BAR, 0, 0, 1)?;
+    check_pci_dma(DEVICE, BAR, address)?;
+    ruzt_ipc::delete(BAR)?;
     ruzt_ipc::delete(DEVICE)?;
     claim_pci_device(ROOTSRV_PCI_CONTROL, SPARE, address)?;
     ruzt_ipc::delete(SPARE)?;
     write_line("rootsrv: PCI BAR mapped, delegated read-only, revoked and reclaimed");
+    Ok(())
+}
+
+fn check_pci_dma(device: u64, bar: u64, address: PciAddress) -> Result<(), ErrorCode> {
+    use ruzt_driver_sdk::{
+        allocate_dma_buffer, bind_dma, map_dma_buffer, read_pci_config, unmap_dma_buffer, DMA_WRITE,
+    };
+    const BUDGET: u64 = 36;
+    const BUFFER: u64 = 37;
+    const SPARE: u64 = 38;
+    const BUFFER_BITS: u8 = 13;
+    const WINDOW: u64 = 0x5400_0000;
+    const BUS_MASTER: u32 = 1 << 2;
+    let shared = CapRights::READ.union(CapRights::WRITE);
+
+    ruzt_ipc::split_untyped(ROOTSRV_UNTYPED, BUDGET, BUFFER_BITS)?;
+    assert_eq!(
+        allocate_dma_buffer(BUDGET, BUFFER, 11),
+        Err(ErrorCode::BadMessage)
+    );
+    allocate_dma_buffer(BUDGET, BUFFER, BUFFER_BITS)?;
+    assert_eq!(
+        ruzt_ipc::retype(BUDGET, SPARE, RetypeKind::Frame),
+        Err(ErrorCode::NoMemory)
+    );
+    ruzt_ipc::mint(BUFFER, SPARE, CapRights::READ, 0)?;
+    assert_eq!(
+        bind_dma(device, SPARE, DMA_WRITE),
+        Err(ErrorCode::CapRightsViolation)
+    );
+    ruzt_ipc::delete(SPARE)?;
+
+    let mut request = IpcMessage {
+        label: console::CHECK_DMA,
+        cap_count: 3,
+        ..IpcMessage::default()
+    };
+    for (slot, cptr) in request.caps.iter_mut().zip([device, BUFFER, bar]) {
+        *slot = CapTransferSlot {
+            cptr,
+            rights: shared,
+            badge: 0,
+        };
+    }
+    ruzt_ipc::send(ROOTSRV_CONSOLE_REQUEST, &request)?;
+    let mut response = IpcMessage::default();
+    ruzt_ipc::recv(ROOTSRV_CONSOLE_REPLY, &mut response)?;
+    let transferred = match response.label {
+        console::DMA_CHECKED => {
+            assert_eq!(
+                read_pci_config(ROOTSRV_PCI_CONTROL, address, 4)? & BUS_MASTER,
+                BUS_MASTER
+            );
+            ruzt_ipc::revoke(BUFFER)?;
+            let request = IpcMessage {
+                label: console::CHECK_DMA_REVOKED,
+                ..IpcMessage::default()
+            };
+            ruzt_ipc::send(ROOTSRV_CONSOLE_REQUEST, &request)?;
+            ruzt_ipc::recv(ROOTSRV_CONSOLE_REPLY, &mut response)?;
+            assert_eq!(response.label, console::DMA_CHECKED);
+            true
+        }
+        console::DMA_UNAVAILABLE => false,
+        _ => return Err(ErrorCode::BadMessage),
+    };
+    assert_eq!(
+        read_pci_config(ROOTSRV_PCI_CONTROL, address, 4)? & BUS_MASTER,
+        0
+    );
+    ruzt_ipc::delete(BUFFER)?;
+    allocate_dma_buffer(BUDGET, SPARE, BUFFER_BITS)?;
+    map_dma_buffer(SPARE, WINDOW, false)?;
+    // SAFETY: The reallocated buffer is mapped read-only and unbound.
+    unsafe {
+        assert_eq!((WINDOW as *const u64).read_volatile(), 0);
+        assert_eq!(
+            ((WINDOW + FRAME_BYTES as u64) as *const u64).read_volatile(),
+            0
+        );
+    }
+    unmap_dma_buffer(SPARE)?;
+    ruzt_ipc::delete(SPARE)?;
+    ruzt_ipc::delete(BUDGET)?;
+    if transferred {
+        write_line("rootsrv: delegated DMA round trip, revocation and reclamation verified");
+    }
     Ok(())
 }
 

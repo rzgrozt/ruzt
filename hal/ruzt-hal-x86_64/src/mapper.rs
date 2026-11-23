@@ -85,6 +85,9 @@ fn convert_flags(flags: PageFlags) -> PageTableFlags {
     if flags.contains(PageFlags::WRITETHROUGH) {
         f |= PageTableFlags::WRITE_THROUGH;
     }
+    if flags.contains(PageFlags::DMA) {
+        f |= DMA_PAGE;
+    }
     // SENSITIVE has no x86_64 page-table equivalent — the allocator zeroes
     // the frame on deallocation.
 
@@ -524,6 +527,7 @@ impl Mapper for X86_64Mapper {
 static MAPPER: Mutex<MaybeUninit<X86_64Mapper>> = Mutex::new(MaybeUninit::uninit());
 static INIT: Once = Once::new();
 static PHYSICAL_MEMORY_OFFSET: Once<X64VirtAddr> = Once::new();
+const DMA_PAGE: PageTableFlags = PageTableFlags::BIT_9;
 
 fn physical_memory_offset() -> X64VirtAddr {
     match PHYSICAL_MEMORY_OFFSET.get() {
@@ -538,8 +542,8 @@ fn frame_pointer(frame: PhysFrame) -> *mut u8 {
 
 /// Check all pages in a nonempty user buffer in the expected active root.
 ///
-/// Only cacheable 4 KiB mappings are supported. Every level must permit user
-/// access and, for an output buffer, writes.
+/// Every level must permit user access and, for an output buffer, writes.
+/// MMIO and DMA mappings cannot serve as syscall buffers.
 pub fn active_user_range_accessible(
     root: PhysFrame,
     address: u64,
@@ -584,7 +588,11 @@ fn user_page_accessible(
         if !entry.flags().contains(required) {
             return false;
         }
-        if level == 3 && entry.flags().contains(PageTableFlags::NO_CACHE) {
+        if level == 3
+            && entry
+                .flags()
+                .intersects(PageTableFlags::NO_CACHE | DMA_PAGE)
+        {
             return false;
         }
         if level != 3 {

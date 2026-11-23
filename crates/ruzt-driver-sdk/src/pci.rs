@@ -131,7 +131,7 @@ impl MmioRegion {
     /// # Safety
     /// The mapping must remain live and the device must support this read.
     pub unsafe fn read_u32(&self, offset: u64) -> Result<u32, ErrorCode> {
-        let address = self.register(offset)?;
+        let address = self.register(offset, 4)?;
         // SAFETY: Bounds and alignment were checked, with device and mapping
         // validity guaranteed by the caller.
         Ok(unsafe { core::ptr::read_volatile(core::ptr::without_provenance(address)) })
@@ -146,14 +146,40 @@ impl MmioRegion {
         if !self.writable {
             return Err(ErrorCode::CapRightsViolation);
         }
-        let address = self.register(offset)?;
+        let address = self.register(offset, 4)?;
         // SAFETY: Bounds, alignment and write access were checked.
         unsafe { core::ptr::write_volatile(core::ptr::without_provenance_mut(address), value) };
         Ok(())
     }
 
-    fn register(&self, offset: u64) -> Result<usize, ErrorCode> {
-        if offset % 4 != 0 || offset.checked_add(4).is_none_or(|end| end > self.bytes) {
+    /// Read one naturally aligned 64-bit device register.
+    ///
+    /// # Safety
+    /// The mapping must remain live and the device must support this read.
+    pub unsafe fn read_u64(&self, offset: u64) -> Result<u64, ErrorCode> {
+        let address = self.register(offset, 8)?;
+        // SAFETY: Bounds and alignment were checked, and the caller guarantees
+        // the mapping and operation are valid.
+        Ok(unsafe { core::ptr::read_volatile(core::ptr::without_provenance(address)) })
+    }
+
+    /// Write one naturally aligned 64-bit device register.
+    ///
+    /// # Safety
+    /// The mapping must remain live and the device must support this write
+    /// and all of its side effects.
+    pub unsafe fn write_u64(&self, offset: u64, value: u64) -> Result<(), ErrorCode> {
+        if !self.writable {
+            return Err(ErrorCode::CapRightsViolation);
+        }
+        let address = self.register(offset, 8)?;
+        // SAFETY: Bounds, alignment and write access were checked.
+        unsafe { core::ptr::write_volatile(core::ptr::without_provenance_mut(address), value) };
+        Ok(())
+    }
+
+    fn register(&self, offset: u64, width: u64) -> Result<usize, ErrorCode> {
+        if offset % width != 0 || offset.checked_add(width).is_none_or(|end| end > self.bytes) {
             return Err(ErrorCode::BadMessage);
         }
         Ok((self.address + offset) as usize)

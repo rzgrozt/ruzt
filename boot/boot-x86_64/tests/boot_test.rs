@@ -144,7 +144,7 @@ enum Services {
 }
 
 #[test]
-fn test_vtd_rejects_dma_from_an_unassigned_device() {
+fn test_vtd_isolates_and_reclaims_delegated_dma() {
     let temp = tempfile::tempdir().expect("create VT-d test directory");
     let disk_image = build_image(temp.path(), "qemu-vtd-test", Services::Console);
     let serial_path = temp.path().join("serial.log");
@@ -171,6 +171,7 @@ fn test_vtd_rejects_dma_from_an_unassigned_device() {
         &[
             "VT-d DMA translation enabled with an empty root table",
             "VT-d rejected an unassigned EDU DMA request",
+            "rootsrv: delegated DMA round trip, revocation and reclamation verified",
             "rootsrv: PCI BAR mapped, delegated read-only, revoked and reclaimed",
         ],
     );

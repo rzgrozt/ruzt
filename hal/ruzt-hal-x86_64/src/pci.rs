@@ -55,7 +55,7 @@ fn write_command(function: u16, value: u16) {
 /// # Safety
 /// The caller holds the function exclusively, serializes configuration
 /// access, and has active DMA isolation for the requester before enabling it.
-pub unsafe fn set_bus_master(function: u16, enabled: bool) {
+pub unsafe fn set_bus_master(function: u16, enabled: bool) -> bool {
     // SAFETY: The caller serializes PCI configuration accesses.
     let command = unsafe { read_config(function, COMMAND) } as u16;
     let command = if enabled {
@@ -64,6 +64,9 @@ pub unsafe fn set_bus_master(function: u16, enabled: bool) {
         command & !BUS_MASTER
     };
     write_command(function, command);
+    // SAFETY: The caller still owns this serialized transaction.
+    let actual = unsafe { read_config(function, COMMAND) };
+    actual != u32::MAX && (actual as u16 & BUS_MASTER != 0) == enabled
 }
 
 /// Size assigned memory BARs while the endpoint's memory decode is disabled.

@@ -1,4 +1,4 @@
-//! User mappings backed by device register apertures.
+//! User mappings backed by device registers or DMA buffers.
 
 use core::ops::Range;
 use ruzt_abi::{CapRights, ErrorCode};
@@ -6,18 +6,42 @@ use ruzt_hal::mem::{MapError, PageFlags, PhysAddr, PhysFrame, VirtAddr};
 use ruzt_hal_x86_64::mapper::{self, UserPageFrames, X86_64Mapper};
 
 use super::{overlaps_heap, page_range, UserProcess, PAGE_SIZE};
-use crate::cap::{cspace::CapabilityPath, object::MmioPin};
+use crate::cap::{
+    cspace::CapabilityPath,
+    object::{DmaPin, MmioPin},
+};
+
+enum Backing {
+    Mmio(MmioPin),
+    Dma(DmaPin),
+}
+
+impl Backing {
+    fn base(&self) -> u64 {
+        match self {
+            Self::Mmio(lease) => lease.range.base,
+            Self::Dma(buffer) => buffer.base.base.as_u64(),
+        }
+    }
+
+    fn pages(&self) -> u64 {
+        match self {
+            Self::Mmio(lease) => lease.range.bytes / PAGE_SIZE,
+            Self::Dma(buffer) => buffer.pages as u64,
+        }
+    }
+}
 
 pub(super) struct Mapping {
     authority: CapabilityPath,
     addresses: Range<u64>,
-    lease: MmioPin,
+    backing: Backing,
 }
 
 impl Mapping {
     fn frame(&self, address: u64) -> PhysFrame {
-        let physical = self.lease.range.base + (address - self.addresses.start);
-        PhysFrame::from_base(PhysAddr::new(physical)).expect("page-aligned MMIO mapping")
+        let physical = self.backing.base() + (address - self.addresses.start);
+        PhysFrame::from_base(PhysAddr::new(physical)).expect("page-aligned device mapping")
     }
 
     #[allow(unsafe_code)]
@@ -42,21 +66,40 @@ impl Mapping {
 }
 
 impl UserProcess {
-    #[allow(unsafe_code)]
-    pub(crate) fn map_mmio(
+    pub(crate) fn map_device_memory(
         &mut self,
         cptr: u64,
         address: u64,
         writable: bool,
+        dma: bool,
     ) -> Result<(), ErrorCode> {
         let mut rights = CapRights::READ;
-        let mut flags = PageFlags::USER | PageFlags::NOCACHE | PageFlags::WRITETHROUGH;
+        let mut flags = PageFlags::USER;
         if writable {
             rights = rights.union(CapRights::WRITE);
             flags |= PageFlags::WRITABLE;
         }
-        let (authority, lease) = self.cspace.device_mmio(cptr, rights)?;
-        let addresses = page_range(address, lease.range.bytes / PAGE_SIZE)?;
+        let (authority, backing) = if dma {
+            flags |= PageFlags::DMA;
+            let (authority, buffer) = self.cspace.dma_buffer(cptr, rights)?;
+            (authority, Backing::Dma(buffer))
+        } else {
+            flags |= PageFlags::NOCACHE | PageFlags::WRITETHROUGH;
+            let (authority, lease) = self.cspace.device_mmio(cptr, rights)?;
+            (authority, Backing::Mmio(lease))
+        };
+        self.map_device_backing(address, flags, authority, backing)
+    }
+
+    #[allow(unsafe_code)]
+    fn map_device_backing(
+        &mut self,
+        address: u64,
+        flags: PageFlags,
+        authority: CapabilityPath,
+        backing: Backing,
+    ) -> Result<(), ErrorCode> {
+        let addresses = page_range(address, backing.pages())?;
         if overlaps_heap(addresses.start, addresses.end) {
             return Err(ErrorCode::MappingExists);
         }
@@ -73,7 +116,7 @@ impl UserProcess {
         let mapping = Mapping {
             authority,
             addresses,
-            lease,
+            backing,
         };
         mapper::with_mapper(|mapper| {
             for address in mapping.addresses.clone().step_by(PhysFrame::SIZE) {
@@ -103,21 +146,27 @@ impl UserProcess {
         Ok(())
     }
 
-    pub(crate) fn unmap_mmio(&mut self, cptr: u64) -> Result<(), ErrorCode> {
-        let authority = self.cspace.capability_id(cptr)?;
+    pub(crate) fn unmap_device_memory(&mut self, cptr: u64, dma: bool) -> Result<(), ErrorCode> {
+        let (path, slot) = self.cspace.lookup_path(cptr)?;
+        if !matches!(
+            (dma, slot.cap_type),
+            (true, ruzt_cap::CapType::DmaBuffer(_)) | (false, ruzt_cap::CapType::Mmio(_))
+        ) {
+            return Err(ErrorCode::InvalidCap);
+        }
         let root = self.root();
         let budget = &self.space.budget;
         let mappings = &mut self.space.device_mappings;
         let index = mappings
             .iter()
-            .position(|mapping| mapping.authority.leaf() == authority)
+            .position(|mapping| mapping.authority.leaf() == path.leaf())
             .ok_or(ErrorCode::NotFound)?;
         mappings[index].unmap(root, budget);
         mappings.swap_remove(index);
         Ok(())
     }
 
-    pub(crate) fn unmap_revoked_mmio(&mut self) {
+    pub(crate) fn unmap_revoked_device_memory(&mut self) {
         let root = self.root();
         let budget = &self.space.budget;
         self.space.device_mappings.retain(|mapping| {

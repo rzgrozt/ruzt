@@ -63,6 +63,13 @@ pub const USER_HEAP_LIMIT: u64 = USER_HEAP_START + 16 * 1024 * 1024;
 /// Byte length of a frame supported by the user mapping ABI.
 pub const FRAME_BYTES: usize = 4096;
 
+/// Device-visible base of the contiguous buffer bound to a PCI requester.
+pub const DMA_IOVA_BASE: u64 = 0x0200_0000;
+/// Permit DMA reads from the bound buffer.
+pub const DMA_READ: u64 = 1;
+/// Permit DMA writes to the bound buffer.
+pub const DMA_WRITE: u64 = 2;
+
 /// PCI function address encoded as bus, device and function in a 16-bit word.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(transparent)]
@@ -176,6 +183,14 @@ pub mod console {
     pub const MMIO_CHECKED: u64 = 10;
     /// Verify the previous device mapping has been revoked.
     pub const CHECK_MMIO_REVOKED: u64 = 11;
+    /// Exercise a delegated DMA buffer and leave it bound for revocation.
+    pub const CHECK_DMA: u64 = 12;
+    /// The delegated DMA round trip succeeded.
+    pub const DMA_CHECKED: u64 = 13;
+    /// This PCI requester has no supported DMA remapping backend.
+    pub const DMA_UNAVAILABLE: u64 = 14;
+    /// Verify the previous DMA buffer mapping was removed.
+    pub const CHECK_DMA_REVOKED: u64 = 15;
 }
 
 /// System-call numbers.
@@ -250,7 +265,8 @@ pub enum CapOp {
     /// Create a child object from an Untyped capability. `arg2` is the
     /// empty destination slot and `arg3` is a [`RetypeKind`]. For an Untyped
     /// child, `arg4` is the base-two exponent of its size in bytes. For a
-    /// CNode, `arg4` is the base-two exponent of the number of slots.
+    /// CNode, `arg4` is the base-two exponent of the number of slots. For a
+    /// DMA buffer, `arg4` is the base-two exponent of its size in bytes.
     Retype = 5,
     /// Mint a derived capability.
     Mint = 6,
@@ -311,6 +327,14 @@ pub enum CapOp {
     UnmapMmio = 27,
     /// Write the invoked MMIO range length in bytes as a `u64` to `arg2`.
     MmioSize = 28,
+    /// Map the DMA buffer at `arg2` with read-only (0) or read-write (1) access in `arg3`.
+    MapDmaBuffer = 29,
+    /// Remove the caller's CPU mapping through the invoked DMA buffer.
+    UnmapDmaBuffer = 30,
+    /// Bind buffer slot `arg2` to the invoked PCI device with `DMA_*` rights in `arg3`.
+    BindDma = 31,
+    /// Disable bus mastering and retire the caller's DMA binding on this device.
+    UnbindDma = 32,
 }
 
 /// The process invoked `Exit`.
@@ -370,6 +394,8 @@ pub enum RetypeKind {
     Untyped = 3,
     /// A capability table with up to 256 slots.
     CNode = 4,
+    /// A zeroed, physically contiguous DMA buffer backed by Untyped RAM.
+    DmaBuffer = 5,
 }
 
 impl TryFrom<u64> for RetypeKind {
@@ -382,6 +408,7 @@ impl TryFrom<u64> for RetypeKind {
             2 => Ok(Self::Notification),
             3 => Ok(Self::Untyped),
             4 => Ok(Self::CNode),
+            5 => Ok(Self::DmaBuffer),
             _ => Err(ErrorCode::BadMessage),
         }
     }
@@ -704,7 +731,8 @@ mod tests {
         assert_eq!(RetypeKind::try_from(2), Ok(RetypeKind::Notification));
         assert_eq!(RetypeKind::try_from(3), Ok(RetypeKind::Untyped));
         assert_eq!(RetypeKind::try_from(4), Ok(RetypeKind::CNode));
-        assert_eq!(RetypeKind::try_from(5), Err(ErrorCode::BadMessage));
+        assert_eq!(RetypeKind::try_from(5), Ok(RetypeKind::DmaBuffer));
+        assert_eq!(RetypeKind::try_from(6), Err(ErrorCode::BadMessage));
     }
 
     #[test]

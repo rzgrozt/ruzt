@@ -118,6 +118,8 @@ pub enum CapType {
     PciDevice(u64),
     /// A page-aligned device memory range.
     Mmio(u64),
+    /// A contiguous RAM allocation eligible for CPU and isolated DMA mappings.
+    DmaBuffer(u64),
 }
 
 /// A capability as it lives in a CNode slot.

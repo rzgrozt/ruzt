@@ -4,6 +4,8 @@
 #[cfg(any(feature = "qemu-fault-test", feature = "qemu-exit-test"))]
 extern crate alloc;
 
+mod dma;
+
 use ruzt_abi::{
     console, CapRights, ErrorCode, IpcMessage, RetypeKind, FRAME_BYTES, PROCESS_ADDRESS_SPACE,
     ROOTSRV_FRAMEBUFFER, WAIT_ENDPOINT_CLOSED, WAIT_IRQ, WAIT_MESSAGE,
@@ -58,6 +60,8 @@ fn main() -> ! {
             (console::CHECK_MMIO_REVOKED, 0) => {
                 check_mmio_revoked().map(|()| console::MMIO_CHECKED)
             }
+            (console::CHECK_DMA, 3) => dma::check(&request),
+            (console::CHECK_DMA_REVOKED, 0) => dma::check_revoked().map(|()| console::DMA_CHECKED),
             _ => Err(ErrorCode::BadMessage),
         };
         if label.is_err() {

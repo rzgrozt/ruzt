@@ -300,12 +300,13 @@ pub(crate) fn wake_wait_any(target: Target) {
 
 pub(crate) fn apply_capability_removals() {
     crate::irq::detach_revoked();
+    crate::iommu::detach_revoked();
     let mut guard = SCHEDULER.lock();
     let Some(sched) = guard.as_mut() else { return };
     for thread in &mut sched.threads {
         if let Some(user) = &mut thread.user {
             user.unmap_revoked_frames();
-            user.unmap_revoked_mmio();
+            user.unmap_revoked_device_memory();
         }
     }
     sched.finish_waiters(Some(ErrorCode::InvalidCap), |thread| {

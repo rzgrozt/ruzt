@@ -13,6 +13,7 @@ const FAULT_EVENT_CONTROL: usize = 0x38;
 const TRANSLATION_ENABLE: u32 = 1 << 31;
 const SET_ROOT_POINTER: u32 = 1 << 30;
 const WRITE_BUFFER_FLUSH: u32 = 1 << 27;
+const GLOBAL_PERSISTENT_STATE: u32 = 0x96ff_ffff;
 const INVALIDATE: u64 = 1 << 63;
 const CONTEXT_GLOBAL: u64 = 1 << 61;
 const IOTLB_GLOBAL: u64 = 1 << 60;
@@ -66,6 +67,7 @@ impl Unit {
         let major = version >> 4 & 0xf;
         if !(1..6).contains(&major)
             || unit.capability >> 8 & 0b11111 == 0
+            || unit.capability & 7 == 7
             || unit.iotlb < 0x48
             || unit.iotlb > PhysFrame::SIZE - 8
             || status & COMMAND_STATE != 0
@@ -80,6 +82,32 @@ impl Unit {
         self.extended & 1 != 0
     }
 
+    /// Whether second-stage leaves can force DMA to snoop processor caches.
+    pub fn snoop_control(&self) -> bool {
+        self.extended & (1 << 7) != 0
+    }
+
+    /// Supported depth for a legacy second-stage page table.
+    pub fn page_table_levels(&self) -> Option<u8> {
+        if self.capability & (1 << 9) != 0 {
+            Some(3)
+        } else if self.capability & (1 << 10) != 0 {
+            Some(4)
+        } else {
+            None
+        }
+    }
+
+    /// Whether IOTLB invalidation can drain both reads and posted writes.
+    pub fn can_drain(&self) -> bool {
+        self.capability >> 54 & 3 == 3
+    }
+
+    /// Maximum count of distinct domain IDs, including reserved ID zero.
+    pub fn domain_count(&self) -> usize {
+        1 << (4 + 2 * (self.capability & 7))
+    }
+
     /// Activate legacy translation using a fully initialized root table.
     ///
     /// # Safety
@@ -90,13 +118,26 @@ impl Unit {
         // Kernel polling is used for primary faults until interrupt
         // remapping and fault interrupt routing are installed.
         self.write32(FAULT_EVENT_CONTROL, 1 << 31);
-        if self.capability & (1 << 4) != 0 {
-            self.write32(GLOBAL_COMMAND, WRITE_BUFFER_FLUSH);
-            wait(|| self.read32(GLOBAL_STATUS) & WRITE_BUFFER_FLUSH == 0)?;
-        }
         self.write64(ROOT_ADDRESS, root.base.as_u64());
         self.write32(GLOBAL_COMMAND, SET_ROOT_POINTER);
         wait(|| self.read32(GLOBAL_STATUS) & SET_ROOT_POINTER != 0)?;
+        self.invalidate_all()?;
+        self.write32(GLOBAL_COMMAND, TRANSLATION_ENABLE);
+        wait(|| self.read32(GLOBAL_STATUS) & TRANSLATION_ENABLE != 0)
+    }
+
+    /// Invalidate legacy context and IOTLB caches, draining pending DMA when supported.
+    ///
+    /// The caller must serialize register commands and keep affected pages
+    /// pinned until this operation completes successfully.
+    pub fn invalidate_all(&self) -> Result<(), Error> {
+        wait(|| self.read64(CONTEXT_COMMAND) & INVALIDATE == 0)?;
+        wait(|| self.read64(self.iotlb) & INVALIDATE == 0)?;
+        if self.capability & (1 << 4) != 0 {
+            let state = self.read32(GLOBAL_STATUS) & GLOBAL_PERSISTENT_STATE;
+            self.write32(GLOBAL_COMMAND, state | WRITE_BUFFER_FLUSH);
+            wait(|| self.read32(GLOBAL_STATUS) & WRITE_BUFFER_FLUSH == 0)?;
+        }
         self.write64(CONTEXT_COMMAND, INVALIDATE | CONTEXT_GLOBAL);
         wait(|| self.read64(CONTEXT_COMMAND) & INVALIDATE == 0)?;
         if self.read64(CONTEXT_COMMAND) >> 59 & 3 != 1 {
@@ -108,8 +149,7 @@ impl Unit {
         if self.read64(self.iotlb) >> 57 & 3 != 1 {
             return Err(Error::InvalidationFailed);
         }
-        self.write32(GLOBAL_COMMAND, TRANSLATION_ENABLE);
-        wait(|| self.read32(GLOBAL_STATUS) & TRANSLATION_ENABLE != 0)
+        Ok(())
     }
 
     /// Whether the unit has logged a fault for this source and DMA page.

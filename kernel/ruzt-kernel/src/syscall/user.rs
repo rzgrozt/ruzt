@@ -3,7 +3,8 @@
 use core::mem::{offset_of, size_of};
 use ruzt_abi::{
     CapOp, CapRights, CapTransferSlot, ErrorCode, FramebufferInfo, IpcMessage, PciAddress,
-    ProcessStatus, RetypeKind, SyscallArgs, WaitEvent, IPC_CAP_SLOTS, MAX_WAIT_SOURCES,
+    ProcessStatus, RetypeKind, SyscallArgs, WaitEvent, DMA_READ, DMA_WRITE, IPC_CAP_SLOTS,
+    MAX_WAIT_SOURCES,
 };
 use ruzt_cap::CapType;
 use ruzt_hal::mem::PhysFrame;
@@ -13,7 +14,7 @@ use x86_64::instructions::port::{PortReadOnly, PortWriteOnly};
 
 use super::user_mem;
 use crate::cap::ops::{cap_delete, cap_mint, cap_move};
-use crate::{ipc, irq, process, sched};
+use crate::{iommu, ipc, irq, process, sched};
 
 const DATA_OFFSET: usize = offset_of!(IpcMessage, data);
 const LABEL_OFFSET: usize = offset_of!(IpcMessage, label);
@@ -41,18 +42,49 @@ pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
         })
         .ok_or(ErrorCode::InvalidCap)?;
     }
-    if operation == CapOp::MapMmio as u64 {
+    if operation == CapOp::MapMmio as u64 || operation == CapOp::MapDmaBuffer as u64 {
         let writable = match args.arg3 {
             0 => false,
             1 => true,
             _ => return Err(ErrorCode::BadMessage),
         };
-        return sched::with_current_user(|user| user.map_mmio(args.arg0, args.arg2, writable))
-            .ok_or(ErrorCode::InvalidCap)?;
+        return sched::with_current_user(|user| {
+            user.map_device_memory(
+                args.arg0,
+                args.arg2,
+                writable,
+                operation == CapOp::MapDmaBuffer as u64,
+            )
+        })
+        .ok_or(ErrorCode::InvalidCap)?;
     }
-    if operation == CapOp::UnmapMmio as u64 {
-        return sched::with_current_user(|user| user.unmap_mmio(args.arg0))
-            .ok_or(ErrorCode::InvalidCap)?;
+    if operation == CapOp::UnmapMmio as u64 || operation == CapOp::UnmapDmaBuffer as u64 {
+        return sched::with_current_user(|user| {
+            user.unmap_device_memory(args.arg0, operation == CapOp::UnmapDmaBuffer as u64)
+        })
+        .ok_or(ErrorCode::InvalidCap)?;
+    }
+    if operation == CapOp::BindDma as u64 {
+        let permissions = args.arg3;
+        let rights = match permissions {
+            DMA_READ => CapRights::READ,
+            DMA_WRITE => CapRights::WRITE,
+            both if both == DMA_READ | DMA_WRITE => CapRights::READ.union(CapRights::WRITE),
+            _ => return Err(ErrorCode::BadMessage),
+        };
+        let (device, buffer) = sched::with_current_user(|user| {
+            Ok::<_, ErrorCode>((
+                user.cspace.pci_device(args.arg0)?,
+                user.cspace.dma_buffer(args.arg2, rights)?,
+            ))
+        })
+        .ok_or(ErrorCode::InvalidCap)??;
+        return iommu::bind(sched::current_thread_id(), device, buffer, permissions);
+    }
+    if operation == CapOp::UnbindDma as u64 {
+        let (_, device) = sched::with_current_user(|user| user.cspace.pci_device(args.arg0))
+            .ok_or(ErrorCode::InvalidCap)??;
+        return iommu::unbind(sched::current_thread_id(), device.address);
     }
     if operation == CapOp::ClaimIrq as u64 {
         let line = u32::try_from(args.arg3).map_err(|_| ErrorCode::BadMessage)?;

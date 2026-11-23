@@ -94,6 +94,13 @@ pub enum KernelObject {
         /// Physical register range.
         range: MemoryBar,
     },
+    /// Contiguous, page-aligned memory reserved from a user Untyped region.
+    DmaBuffer {
+        /// First frame of the allocation.
+        base: PhysFrame,
+        /// Number of consecutive frames.
+        pages: usize,
+    },
 }
 
 const INDEX_BITS: u32 = MAX_OBJECTS.trailing_zeros();
@@ -344,6 +351,13 @@ pub(super) fn retype(
             }
             bits
         }
+        RetypeKind::DmaBuffer => {
+            let bits = u8::try_from(requested_size_bits).map_err(|_| ErrorCode::BadMessage)?;
+            if !(PAGE_BITS..=parent_bits).contains(&bits) {
+                return Err(ErrorCode::BadMessage);
+            }
+            bits
+        }
         RetypeKind::CNode if requested_size_bits <= u64::from(MAX_CNODE_RADIX) => PAGE_BITS,
         _ if requested_size_bits == 0 => PAGE_BITS,
         _ => return Err(ErrorCode::BadMessage),
@@ -375,6 +389,16 @@ pub(super) fn retype(
                     phys,
                     size: FrameSize::Size4K,
                 },
+            )
+        }
+        RetypeKind::DmaBuffer => {
+            scrub_dma_buffer(phys, count);
+            (
+                KernelObject::DmaBuffer {
+                    base: phys,
+                    pages: count,
+                },
+                CapType::DmaBuffer(id.0),
             )
         }
         RetypeKind::Endpoint => (
@@ -527,6 +551,49 @@ impl Drop for MmioPin {
     }
 }
 
+pub(crate) struct DmaPin {
+    pub(crate) id: KObjectId,
+    pub(crate) base: PhysFrame,
+    pub(crate) pages: usize,
+}
+
+impl DmaPin {
+    pub(super) fn new(id: KObjectId) -> Result<Self, ErrorCode> {
+        let Some(KernelObject::DmaBuffer { base, pages }) = get(id) else {
+            return Err(ErrorCode::InvalidCap);
+        };
+        retain(id)?;
+        Ok(Self { id, base, pages })
+    }
+}
+
+impl Drop for DmaPin {
+    fn drop(&mut self) {
+        release(self.id);
+    }
+}
+
+pub(crate) struct PciPin {
+    id: KObjectId,
+    pub(crate) address: PciAddress,
+}
+
+impl PciPin {
+    pub(super) fn new(id: KObjectId) -> Result<Self, ErrorCode> {
+        let Some(KernelObject::PciDevice { address, .. }) = get(id) else {
+            return Err(ErrorCode::InvalidCap);
+        };
+        retain(id)?;
+        Ok(Self { id, address })
+    }
+}
+
+impl Drop for PciPin {
+    fn drop(&mut self) {
+        release(self.id);
+    }
+}
+
 /// Keeps the Untyped allocator alive for every private page of an address space.
 pub(crate) struct UntypedBudget(KObjectId);
 
@@ -633,6 +700,7 @@ fn destroy(object: KernelObject, backing: Option<UntypedAllocation>) {
             // and the page is still reserved in the parent region.
             unsafe { ruzt_hal_x86_64::mapper::zero_frame(phys) };
         }
+        KernelObject::DmaBuffer { base, pages } => scrub_dma_buffer(base, pages),
         KernelObject::Untyped { phys, size_bits } => {
             if backing.is_none() {
                 frame::deallocate_contiguous(phys, 1 << (size_bits - PAGE_BITS));
@@ -656,6 +724,15 @@ fn destroy(object: KernelObject, backing: Option<UntypedAllocation>) {
                 .put(allocation.first, allocation.count);
         }
         release(allocation.region);
+    }
+}
+
+#[allow(unsafe_code)]
+fn scrub_dma_buffer(base: PhysFrame, pages: usize) {
+    for page in 0..pages {
+        // SAFETY: These pages are reserved in their Untyped region and no
+        // CPU mapping or active DMA binding can reference them at this point.
+        unsafe { mapper::zero_frame(frame_at(base, page)) };
     }
 }
 
@@ -695,7 +772,7 @@ fn kernel_object_from_cap_type(cap_type: CapType) -> Result<KernelObject, ErrorC
         #[cfg(not(test))]
         CapType::CNode { .. } => Err(ErrorCode::InvalidCap),
         CapType::Irq { .. } | CapType::IrqControl => Err(ErrorCode::InvalidCap),
-        CapType::PciControl | CapType::PciDevice(_) | CapType::Mmio(_) => {
+        CapType::PciControl | CapType::PciDevice(_) | CapType::Mmio(_) | CapType::DmaBuffer(_) => {
             Err(ErrorCode::InvalidCap)
         }
         // Boot device capabilities are only provisioned at process creation.

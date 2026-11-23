@@ -89,6 +89,8 @@ bitflags! {
         /// Mark page as "sensitive" — kernel zeroes on free (key material, passwords).
         // SOURCE: Design Report §10.3 — "Sensitive flag — kernel zeros on free"
         const SENSITIVE     = 1 << 6;
+        /// This mapping can be accessed asynchronously by a DMA device.
+        const DMA           = 1 << 7;
     }
 }
 

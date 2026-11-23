@@ -210,6 +210,7 @@ pub(crate) fn terminate_current(status: ProcessStatus, reason: core::fmt::Argume
         crate::ipc::close_endpoint(channel);
     }
     crate::irq::detach_thread(crate::sched::current_thread_id());
+    crate::iommu::detach_thread(crate::sched::current_thread_id());
     crate::sched::retire_current_user(status)
 }
 
