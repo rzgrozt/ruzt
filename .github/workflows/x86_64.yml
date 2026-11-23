@@ -19,7 +19,7 @@ jobs:
       - name: Install QEMU
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-system-x86 seabios
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 seabios ovmf
       - name: Run host tests
         run: cargo test --locked -p ruzt-abi -p ruzt-cap -p ruzt-hal -p ruzt-hal-x86_64 -p ruzt-kernel --lib
       - name: Run QEMU integration tests

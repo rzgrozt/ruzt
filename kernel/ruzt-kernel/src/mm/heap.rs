@@ -9,9 +9,10 @@ use linked_list_allocator::LockedHeap;
 use ruzt_hal::cpu::CpuOps;
 use ruzt_hal::mem::{Mapper, PageFlags, VirtAddr};
 
-/// Virtual start address of the kernel heap.
-/// Chosen well above the kernel image in canonical higher-half space.
-const HEAP_START: u64 = 0xFFFF_C000_0000_0000;
+/// Start of the kernel heap, at the last PML4 slot in the supervisor half.
+///
+/// The bootloader's dynamic mapping range ends below this slot.
+pub const HEAP_START: u64 = 0xFFFF_FF80_0000_0000;
 
 /// Size of the heap in bytes (4 MiB).
 const HEAP_SIZE: usize = 4 * 1024 * 1024;

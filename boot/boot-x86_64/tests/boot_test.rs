@@ -37,6 +37,92 @@ fn test_kernel_boots_and_schedules_blocking_ipc() {
 }
 
 #[test]
+fn test_uefi_boots_user_services_with_a_randomized_kernel() {
+    let temp = tempfile::tempdir().expect("create UEFI test directory");
+    let disk = build_firmware_image(
+        temp.path(),
+        "qemu-rootsrv-test,qemu-kaslr-test",
+        Services::Console,
+        true,
+    );
+    let (code, vars) = [
+        (
+            "/usr/share/OVMF/OVMF_CODE_4M.fd",
+            "/usr/share/OVMF/OVMF_VARS_4M.fd",
+        ),
+        (
+            "/usr/share/edk2/x64/OVMF_CODE.4m.fd",
+            "/usr/share/edk2/x64/OVMF_VARS.4m.fd",
+        ),
+    ]
+    .into_iter()
+    .map(|(code, vars)| (Path::new(code), Path::new(vars)))
+    .find(|(code, vars)| code.is_file() && vars.is_file())
+    .expect("install the OVMF code and variables template");
+    let mut addresses = [0; 2];
+    for (index, address) in addresses.iter_mut().enumerate() {
+        let serial_path = temp.path().join(format!("serial-{index}.log"));
+        let [first, code_arg, second, vars_arg] =
+            boot_x86_64::ovmf_drives(code, vars, &temp.path().join(format!("vars-{index}.fd")))
+                .expect("copy OVMF variables");
+        let mut guest = start_guest_with_devices(
+            &disk,
+            &serial_path,
+            &[
+                "-machine", "q35", "-cpu", "max", &first, &code_arg, &second, &vars_arg,
+            ],
+        );
+        let serial = wait_for_serial(
+            &mut guest.child,
+            &serial_path,
+            "rootsrv thread waiting for keyboard IRQ",
+            Instant::now() + BOOT_TIMEOUT,
+        );
+        assert_markers(
+            &serial,
+            &[
+                "x86 supervisor protection (SMEP=true, SMAP=true)",
+                "Breakpoint returned cleanly.",
+                "rootsrv: console write acknowledged over IPC",
+                "rootsrv: framebuffer tile drawn",
+            ],
+        );
+        assert!(!serial.contains("virtual_address_offset"), "{serial}");
+        assert!(
+            !serial.contains("VT-d DMA translation unavailable"),
+            "{serial}"
+        );
+        *address = breakpoint_address(&serial);
+        monitor(&mut guest.child, "sendkey spc");
+        wait_for_serial(
+            &mut guest.child,
+            &serial_path,
+            "rootsrv: Space key received",
+            Instant::now() + ACTION_TIMEOUT,
+        );
+        monitor(&mut guest.child, "quit");
+        assert!(guest.child.wait().expect("wait for UEFI guest").success());
+    }
+    assert_ne!(
+        addresses[0], addresses[1],
+        "a second boot reused the kernel load address"
+    );
+}
+
+fn breakpoint_address(serial: &str) -> u64 {
+    let address = serial
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("EXCEPTION: BREAKPOINT @ VirtAddr(0x")
+                .and_then(|suffix| suffix.strip_suffix(')'))
+        })
+        .expect("the UEFI fixture reports its relocated breakpoint");
+    let address = u64::from_str_radix(address, 16).expect("read the relocated breakpoint address");
+    assert!((0xffff_8000_0000_0000..0xffff_ff80_0000_0000).contains(&address));
+    address
+}
+
+#[test]
 fn test_rootsrv_updates_the_framebuffer_from_keyboard_input() {
     let temp = tempfile::tempdir().expect("Failed to create boot test directory");
     let disk_image = build_image(temp.path(), "qemu-rootsrv-test", Services::Console);
@@ -255,6 +341,15 @@ fn assert_console_shutdown_isolated(services: Services, reason: &str, observed_s
 }
 
 fn build_image(temp: &Path, kernel_feature: &str, services: Services) -> PathBuf {
+    build_firmware_image(temp, kernel_feature, services, false)
+}
+
+fn build_firmware_image(
+    temp: &Path,
+    kernel_feature: &str,
+    services: Services,
+    uefi: bool,
+) -> PathBuf {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let kernel_dir = workspace.join("kernel/ruzt-kernel");
     let build_dir = temp.join("target");
@@ -309,8 +404,13 @@ fn build_image(temp: &Path, kernel_feature: &str, services: Services) -> PathBuf
     assert!(status.success(), "Kernel build failed: {status}");
 
     let disk_image = temp.join("ruzt-test.img");
-    boot_x86_64::create_image(&disk_image, &debug_dir.join("ruzt-kernel"), programs)
-        .expect("Failed to create disk image");
+    let kernel = debug_dir.join("ruzt-kernel");
+    if uefi {
+        boot_x86_64::create_uefi_image(&disk_image, &kernel, programs)
+    } else {
+        boot_x86_64::create_image(&disk_image, &kernel, programs)
+    }
+    .expect("Failed to create disk image");
     disk_image
 }
 

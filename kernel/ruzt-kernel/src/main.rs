@@ -6,10 +6,21 @@ use bootloader_api::{config::Mapping, entry_point, BootInfo as RawBootInfo, Boot
 use ruzt_hal::cpu::CpuOps;
 
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
+    const SUPERVISOR_START: u64 = 0xffff_8000_0000_0000;
     let mut c = BootloaderConfig::new_default();
-    c.mappings.physical_memory = Some(Mapping::Dynamic);
-    // User address spaces inherit only the supervisor half.
-    c.mappings.dynamic_range_start = Some(0xffff_8000_0000_0000);
+    // The pinned BIOS loader's early stack cannot hold the ASLR RNG state.
+    c.mappings.aslr = cfg!(feature = "uefi-kaslr");
+    // The pinned loader can shift a randomized physmap past its reservation
+    // when the physical span is an exact multiple of a PML4 slot.
+    c.mappings.physical_memory = Some(if c.mappings.aslr {
+        Mapping::FixedAddress(SUPERVISOR_START)
+    } else {
+        Mapping::Dynamic
+    });
+    // Reserve the last supervisor PML4 slot for the kernel heap.
+    c.mappings.dynamic_range_start = Some(SUPERVISOR_START);
+    c.mappings.dynamic_range_end =
+        Some(ruzt_kernel::mm::heap::HEAP_START - ruzt_hal::mem::PhysFrame::SIZE as u64);
     c.kernel_stack_size = 256 * 1024;
     c
 };

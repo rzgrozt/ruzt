@@ -18,6 +18,8 @@ User tasks can read the monotonic clock, supply an absolute deadline to a capabi
 
 The x86-64 kernel enables SMEP and SMAP when the CPU advertises them. Syscalls copy through supervisor-only aliases after checking access on every user page. Interrupt and syscall entry clear the live AC and DF flags and preserve the interrupted task's flags for return. The QEMU preemption test exercises this path with both protections enabled.
 
+UEFI images built with `uefi-kaslr` randomize the kernel image and stack within the supervisor half. The physical-memory map and kernel heap occupy fixed, disjoint ranges. The UEFI test boots the same image twice and verifies different kernel addresses while exercising console IPC, the framebuffer, and keyboard input. BIOS images use the default kernel build because the pinned BIOS loader exhausts its early stack while initializing ASLR.
+
 The boot server can claim and delegate exclusive device IRQ capabilities for the legacy x86 PIC. A driver binds a claim, waits through the device SDK or IPC wait list, and acknowledges it after servicing the device. The line stays masked between delivery and acknowledgement. Revoking the binding capability or reaping its driver removes the binding. QEMU also exercises delegation, re-arming, and reclamation with a real COM1 interrupt in `consoled`.
 
 The boot server can enumerate conventional PCI configuration space and claim firmware-programmed memory BARs on endpoint functions with bus mastering disabled. It can delegate individual page-aligned BAR ranges with read or write rights. Device mappings are uncached and non-executable, and revocation removes their page-table entries. The QEMU EDU guest checks a real PCI register read and write, read-only delegation, rollback on an occupied page, and reclamation after revocation.
@@ -54,7 +56,7 @@ From the repository root, run the host tests for the ABI, capability types, x86_
 cargo test --locked -p ruzt-abi -p ruzt-cap -p ruzt-hal -p ruzt-hal-x86_64 -p ruzt-kernel --lib
 ```
 
-Run the kernel-only and ring-3 QEMU tests with the pinned Rust nightly and components in [`rust-toolchain.toml`](rust-toolchain.toml). It requires `qemu-system-x86_64`, GNU `tar`, and `timeout` on your path.
+Run the kernel-only and ring-3 QEMU tests with the pinned Rust nightly and components in [`rust-toolchain.toml`](rust-toolchain.toml). Install `qemu-system-x86_64`, SeaBIOS, the 4 MiB OVMF firmware, GNU `tar`, and `timeout`.
 
 ```sh
 cargo test --locked -p boot-x86_64 --test boot_test -- --nocapture
@@ -79,6 +81,13 @@ cargo run --locked -p boot-x86_64
 ```
 
 QEMU opens a window for the boot screen and streams serial diagnostics to the terminal. With that window focused, press Space to toggle the top-right tile between blue and mint.
+
+For UEFI with address randomization, build the UEFI kernel and pass the OVMF code and variables template. Set the paths for your distribution.
+
+```sh
+(cd kernel/ruzt-kernel && cargo build --locked --features uefi-kaslr)
+cargo run --locked -p boot-x86_64 -- --uefi /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_VARS_4M.fd
+```
 
 ## Design
 

@@ -145,10 +145,16 @@ pub(crate) fn assert_entry_flags() {
 }
 
 extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
+    #[cfg(feature = "qemu-kaslr-test")]
     serial_println!(
         "EXCEPTION: BREAKPOINT @ {:?}",
         stack_frame.instruction_pointer
     );
+    #[cfg(not(feature = "qemu-kaslr-test"))]
+    {
+        let _ = stack_frame;
+        serial_println!("EXCEPTION: BREAKPOINT");
+    }
 }
 
 extern "x86-interrupt" fn double_fault_handler(
