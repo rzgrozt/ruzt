@@ -88,19 +88,51 @@ pub fn wait_any_with_caps(
     first: u64,
     capacity: u8,
 ) -> Result<WaitEvent, ErrorCode> {
+    wait_for_event(sources, first, capacity, None)
+}
+
+/// Wait for an event until an absolute monotonic deadline in nanoseconds.
+///
+/// A ready source wins even if the deadline has already passed at entry, so
+/// a deadline of zero polls. If no source is ready, the call returns
+/// [`ErrorCode::TimedOut`] when the deadline expires.
+pub fn wait_any_until(sources: &[u64], deadline_ns: u64) -> Result<WaitEvent, ErrorCode> {
+    wait_any_with_caps_until(sources, 0, 0, deadline_ns)
+}
+
+/// Wait with a deadline and receive any grants into one contiguous window.
+pub fn wait_any_with_caps_until(
+    sources: &[u64],
+    first: u64,
+    capacity: u8,
+    deadline_ns: u64,
+) -> Result<WaitEvent, ErrorCode> {
+    wait_for_event(sources, first, capacity, Some(deadline_ns))
+}
+
+fn wait_for_event(
+    sources: &[u64],
+    first: u64,
+    capacity: u8,
+    deadline: Option<u64>,
+) -> Result<WaitEvent, ErrorCode> {
+    let (number, deadline_ns) = match deadline {
+        Some(deadline) => (SyscallNumber::WaitAnyUntil, deadline),
+        None => (SyscallNumber::WaitAny, 0),
+    };
     let mut event = WaitEvent::default();
     #[allow(unsafe_code)]
     // SAFETY: The slice is readable and the local event is exclusively
     // writable for the duration of the call.
     let status = unsafe {
         ruzt_runtime::syscall::syscall(
-            SyscallNumber::WaitAny,
+            number,
             sources.as_ptr() as u64,
             sources.len() as u64,
             (&raw mut event) as u64,
             first,
             u64::from(capacity),
-            0,
+            deadline_ns,
         )
     };
     ErrorCode::from_u64(status)?;

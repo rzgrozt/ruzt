@@ -31,8 +31,12 @@ pub(crate) extern "C" fn syscall_dispatch(args: &SyscallArgs, caller_cs: u64) ->
         }
         SyscallNumber::Invoke => invoke::invoke(args),
         SyscallNumber::WaitAny if from_user => {
-            user::wait_any(args).map_or_else(ErrorCode::as_u64, |()| ErrorCode::Ok.as_u64())
+            user::wait_any(args, None).map_or_else(ErrorCode::as_u64, |()| ErrorCode::Ok.as_u64())
         }
+        SyscallNumber::WaitAnyUntil if from_user => user::wait_any(args, Some(args.arg5))
+            .map_or_else(ErrorCode::as_u64, |()| ErrorCode::Ok.as_u64()),
+        SyscallNumber::MonotonicTime if from_user => user::monotonic_time(args.arg0)
+            .map_or_else(ErrorCode::as_u64, |()| ErrorCode::Ok.as_u64()),
         SyscallNumber::DebugPutChar => {
             crate::serial::SERIAL1.lock().send(args.arg0 as u8);
             ErrorCode::Ok.as_u64()
@@ -49,6 +53,8 @@ pub(crate) extern "C" fn syscall_dispatch(args: &SyscallArgs, caller_cs: u64) ->
         }
         SyscallNumber::Exit
         | SyscallNumber::WaitAny
+        | SyscallNumber::WaitAnyUntil
+        | SyscallNumber::MonotonicTime
         | SyscallNumber::NotImplemented
         | SyscallNumber::_Reply
         | SyscallNumber::_Yield => ErrorCode::NotImplemented.as_u64(),

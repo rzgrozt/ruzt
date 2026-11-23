@@ -158,6 +158,14 @@ pub enum SyscallNumber {
     /// a non-revocable mapping. `arg3` and `arg4` describe a contiguous
     /// capability receive window, as for [`CapOp::Recv`].
     WaitAny = 6,
+    /// Wait like [`Self::WaitAny`], or return [`ErrorCode::TimedOut`].
+    ///
+    /// `arg5` is the absolute monotonic deadline in nanoseconds. A ready
+    /// source can be polled with a deadline of zero. With an empty source
+    /// list the call sleeps until the deadline and ignores buffer arguments.
+    WaitAnyUntil = 7,
+    /// Write the monotonic timestamp in nanoseconds to the `u64` at `arg0`.
+    MonotonicTime = 8,
 }
 
 impl From<u64> for SyscallNumber {
@@ -169,6 +177,8 @@ impl From<u64> for SyscallNumber {
             3 => Self::DebugPutChar,
             5 => Self::Exit,
             6 => Self::WaitAny,
+            7 => Self::WaitAnyUntil,
+            8 => Self::MonotonicTime,
             _ => Self::NotImplemented,
         }
     }
@@ -498,6 +508,8 @@ pub enum ErrorCode {
     SlotOccupied = 8,
     /// The requested virtual address or frame capability already has a mapping.
     MappingExists = 9,
+    /// The operation's monotonic deadline expired.
+    TimedOut = 10,
 }
 
 impl ErrorCode {
@@ -510,7 +522,7 @@ impl ErrorCode {
     ///
     /// # Errors
     ///
-    /// Returns the corresponding error for codes 1 through 9. Unknown values
+    /// Returns the corresponding error for codes 1 through 10. Unknown values
     /// are reported as [`ErrorCode::NotImplemented`].
     pub const fn from_u64(value: u64) -> Result<(), ErrorCode> {
         match value {
@@ -524,6 +536,7 @@ impl ErrorCode {
             7 => Err(Self::NotImplemented),
             8 => Err(Self::SlotOccupied),
             9 => Err(Self::MappingExists),
+            10 => Err(Self::TimedOut),
             _ => Err(Self::NotImplemented),
         }
     }
@@ -644,6 +657,7 @@ mod tests {
         assert_eq!(ErrorCode::NotImplemented.as_u64(), 7);
         assert_eq!(ErrorCode::SlotOccupied.as_u64(), 8);
         assert_eq!(ErrorCode::MappingExists.as_u64(), 9);
+        assert_eq!(ErrorCode::TimedOut.as_u64(), 10);
     }
 
     #[test]
@@ -661,6 +675,7 @@ mod tests {
         assert_eq!(ErrorCode::from_u64(7), Err(ErrorCode::NotImplemented));
         assert_eq!(ErrorCode::from_u64(8), Err(ErrorCode::SlotOccupied));
         assert_eq!(ErrorCode::from_u64(9), Err(ErrorCode::MappingExists));
+        assert_eq!(ErrorCode::from_u64(10), Err(ErrorCode::TimedOut));
     }
 
     #[test]

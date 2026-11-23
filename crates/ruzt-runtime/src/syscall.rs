@@ -2,7 +2,7 @@
 
 use core::arch::asm;
 
-use ruzt_abi::SyscallNumber;
+use ruzt_abi::{ErrorCode, SyscallNumber};
 
 /// Enter the kernel with one register-encoded system call.
 ///
@@ -59,6 +59,35 @@ pub fn debug_putchar(byte: u8) {
             0,
         )
     };
+}
+
+/// Read the current monotonic time in nanoseconds since boot.
+pub fn monotonic_ns() -> Result<u64, ErrorCode> {
+    let mut timestamp = 0u64;
+    // SAFETY: The timestamp is exclusively writable for the entire call.
+    let status = unsafe {
+        syscall(
+            SyscallNumber::MonotonicTime,
+            (&raw mut timestamp) as u64,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    };
+    ErrorCode::from_u64(status)?;
+    Ok(timestamp)
+}
+
+/// Sleep until an absolute deadline on the monotonic clock.
+pub fn sleep_until(deadline_ns: u64) -> Result<(), ErrorCode> {
+    // SAFETY: An empty wait list requires no input or output buffers.
+    let status = unsafe { syscall(SyscallNumber::WaitAnyUntil, 0, 0, 0, 0, 0, deadline_ns) };
+    match ErrorCode::from_u64(status) {
+        Err(ErrorCode::TimedOut) => Ok(()),
+        other => other,
+    }
 }
 
 /// Terminate the calling user task.

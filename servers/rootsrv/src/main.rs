@@ -491,8 +491,9 @@ fn check_cspace() {
         ruzt_ipc::wait_any(&[read_path, u64::MAX]),
         Err(ErrorCode::InvalidCap)
     );
-    let event = ruzt_ipc::wait_any(&[read_path]).expect("wait through the read-only path");
+    let event = ruzt_ipc::wait_any_until(&[read_path], 0).expect("poll the ready notification");
     assert_eq!((event.index, event.kind), (0, WAIT_NOTIFICATION));
+    check_deadlines(read_path);
     assert_eq!(
         ruzt_ipc::move_cap(table, cptr_path(&[TABLE, 1]).unwrap()),
         Err(ErrorCode::BadMessage)
@@ -511,6 +512,27 @@ fn check_cspace() {
     ruzt_ipc::revoke(BUDGET).expect("release test endpoints");
     ruzt_ipc::delete(BUDGET).expect("release the CNode budget");
     write_line("rootsrv: nested capability lookup, revocation and budgets verified");
+}
+
+fn check_deadlines(notification: u64) {
+    use ruzt_runtime::syscall::{monotonic_ns, sleep_until};
+
+    assert_eq!(
+        ruzt_ipc::wait_any_until(&[notification], 0),
+        Err(ErrorCode::TimedOut)
+    );
+    let deadline = monotonic_ns().expect("read the monotonic clock") + 30_000_000;
+    assert_eq!(
+        ruzt_ipc::wait_any_until(&[notification], deadline),
+        Err(ErrorCode::TimedOut)
+    );
+    let after_wait = monotonic_ns().expect("read clock after the timed wait");
+    assert!(after_wait >= deadline);
+
+    let wake_at = after_wait + 30_000_000;
+    sleep_until(wake_at).expect("sleep without any wait sources");
+    assert!(monotonic_ns().expect("read clock after sleep") >= wake_at);
+    write_line("rootsrv: timed wait and sleep woke at monotonic deadlines");
 }
 
 fn check_heap_growth() {

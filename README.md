@@ -14,6 +14,8 @@ Processes can retype Untyped memory into capability tables, or CNodes, with up t
 
 The IPC library can block on up to eight endpoints, notifications, driver IRQs, and process status capabilities in one call. The kernel selects the first ready source in list order and consumes its message or signal as part of the wait. Endpoint messages can include capability grants, and a closed endpoint or reaped process wakes the waiter. Revoking a wait source or a CNode capability on its path cancels the wait.
 
+User tasks can read the monotonic clock, supply an absolute deadline to a capability wait, or sleep until a deadline without waiting on any capability. x86-64 wakes these tasks at scheduler safe points using the PIT's roughly 10 ms tick.
+
 The root server receives an 8 MiB Untyped RAM budget at boot. Each process's image, user stack, heap, and private page tables draw from its address-space budget. `rootsrv` reserves 2 MiB for the console address space and delegates a separate 8 KiB region to the service for its scratch buffer. Copies of an Untyped capability draw from the same budget. A reserved region returns to its parent after the region cap and its last live allocation are gone.
 
 Each process has a self address-space capability for mapping zeroed anonymous pages at a chosen virtual address. These pages draw from its address-space budget and may be read-only or writable. Unmapping returns the pages to the budget. A failed range operation preserves existing mappings.

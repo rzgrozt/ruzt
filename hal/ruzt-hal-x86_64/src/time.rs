@@ -6,8 +6,8 @@ use ruzt_hal::time::Timer;
 /// Each PIT tick ≈ 10 ms = 10_000_000 ns.
 const NS_PER_TICK: u64 = 10_000_000;
 
-/// Global tick counter incremented by the timer ISR.
-static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Nanoseconds since boot, advanced by the timer ISR.
+static MONOTONIC_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Stored deadline for one-shot timer emulation.
 static DEADLINE: AtomicU64 = AtomicU64::new(0);
@@ -17,7 +17,7 @@ pub struct X86_64Timer;
 
 impl Timer for X86_64Timer {
     fn now_monotonic_ns() -> u64 {
-        TICK_COUNT.load(Ordering::Relaxed) * NS_PER_TICK
+        MONOTONIC_NS.load(Ordering::Relaxed)
     }
 
     fn set_oneshot_ns(deadline_ns: u64) {
@@ -27,7 +27,9 @@ impl Timer for X86_64Timer {
 
 /// Called by the timer ISR on each PIT tick (~10 ms).
 pub fn increment_tick() {
-    TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+    let _ = MONOTONIC_NS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |time| {
+        Some(time.saturating_add(NS_PER_TICK))
+    });
 }
 
 /// Returns `true` if the deadline set by [`Timer::set_oneshot_ns`] has passed.

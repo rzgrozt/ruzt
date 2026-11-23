@@ -150,13 +150,15 @@ pub fn main(boot_info: &'static mut BootInfo) -> ! {
 
 fn idle_loop() -> ! {
     loop {
+        let mut guard = ruzt_hal_x86_64::cpu::X86_64Cpu::disable_interrupts();
         if crate::sched::should_switch() {
-            let _guard = ruzt_hal_x86_64::cpu::X86_64Cpu::disable_interrupts();
             crate::sched::reap_retired_user();
             crate::sched::yield_thread();
-            continue;
+        } else {
+            // Pair the work check with STI/HLT so an interrupt between them
+            // wakes the idle CPU instead of being handled before it halts.
+            guard.halt_until_interrupt();
         }
-        ruzt_hal_x86_64::cpu::X86_64Cpu::cpu_idle();
     }
 }
 

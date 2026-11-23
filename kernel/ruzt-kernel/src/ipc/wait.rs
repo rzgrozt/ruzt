@@ -5,6 +5,8 @@ use ruzt_abi::{
     WAIT_NOTIFICATION, WAIT_PROCESS_EXITED,
 };
 use ruzt_cap::{CapRights, CapSlot, CapType};
+use ruzt_hal::time::Timer;
+use ruzt_hal_x86_64::time::X86_64Timer;
 
 use super::{poll_packet, take_notification, ReceiveSlots};
 use crate::cap::cspace::CapabilityPath;
@@ -51,7 +53,11 @@ impl Source {
 
 /// Called with interrupts disabled. Readiness, consumption, and wait
 /// registration are atomic with respect to event producers on this CPU.
-pub(crate) fn wait_any(sources: &Sources, slots: ReceiveSlots) -> Result<WaitEvent, ErrorCode> {
+pub(crate) fn wait_any(
+    sources: &Sources,
+    slots: ReceiveSlots,
+    deadline: Option<u64>,
+) -> Result<WaitEvent, ErrorCode> {
     loop {
         if sources
             .iter()
@@ -67,6 +73,9 @@ pub(crate) fn wait_any(sources: &Sources, slots: ReceiveSlots) -> Result<WaitEve
                 return Ok(event);
             }
         }
+        if deadline.is_some_and(|deadline| deadline <= X86_64Timer::now_monotonic_ns()) {
+            return Err(ErrorCode::TimedOut);
+        }
         if sources
             .iter()
             .flatten()
@@ -74,7 +83,7 @@ pub(crate) fn wait_any(sources: &Sources, slots: ReceiveSlots) -> Result<WaitEve
         {
             keyboard::trace_wait();
         }
-        sched::block_wait_any(sources);
+        sched::block_wait_any(sources, deadline);
         sched::check_ipc_completion()?;
     }
 }
@@ -134,11 +143,15 @@ mod tests {
             object::set_notification_state(id, true);
         }
         for expected in 0..2 {
-            let event = wait_any(&sources, ReceiveSlots::default()).unwrap();
+            let event = wait_any(&sources, ReceiveSlots::default(), Some(0)).unwrap();
             assert_eq!((event.index, event.kind), (expected, WAIT_NOTIFICATION));
         }
         for id in ids {
             assert!(!take_notification(id).unwrap());
         }
+        assert_eq!(
+            wait_any(&sources, ReceiveSlots::default(), Some(0)),
+            Err(ErrorCode::TimedOut)
+        );
     }
 }

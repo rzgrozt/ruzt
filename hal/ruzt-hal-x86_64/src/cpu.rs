@@ -8,6 +8,14 @@ pub struct X86_64InterruptGuard {
     if_enabled: bool,
 }
 
+impl X86_64InterruptGuard {
+    /// Enable interrupts and halt atomically, then return with interrupts disabled.
+    pub fn halt_until_interrupt(&mut self) {
+        interrupts::enable_and_hlt();
+        interrupts::disable();
+    }
+}
+
 impl Drop for X86_64InterruptGuard {
     fn drop(&mut self) {
         if self.if_enabled {

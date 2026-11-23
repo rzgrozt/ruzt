@@ -7,6 +7,8 @@ use ruzt_abi::{
 };
 use ruzt_cap::CapType;
 use ruzt_hal::mem::PhysFrame;
+use ruzt_hal::time::Timer;
+use ruzt_hal_x86_64::time::X86_64Timer;
 use x86_64::instructions::port::{PortReadOnly, PortWriteOnly};
 
 use super::user_mem;
@@ -200,12 +202,23 @@ pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
     }
 }
 
-pub(crate) fn wait_any(args: &SyscallArgs) -> Result<(), ErrorCode> {
+pub(crate) fn monotonic_time(destination: u64) -> Result<(), ErrorCode> {
+    let root = sched::with_current_user(|process| process.root()).ok_or(ErrorCode::InvalidCap)?;
+    user_mem::write_user_buffer_with(root, destination, size_of::<u64>(), || {
+        X86_64Timer::now_monotonic_ns().to_ne_bytes()
+    })
+}
+
+pub(crate) fn wait_any(args: &SyscallArgs, deadline: Option<u64>) -> Result<(), ErrorCode> {
     let count = usize::try_from(args.arg1).map_err(|_| ErrorCode::BadMessage)?;
-    if !(1..=MAX_WAIT_SOURCES).contains(&count) {
+    if count > MAX_WAIT_SOURCES || (count == 0 && deadline.is_none()) {
         return Err(ErrorCode::BadMessage);
     }
     let root = sched::with_current_user(|process| process.root()).ok_or(ErrorCode::InvalidCap)?;
+    if count == 0 {
+        // A pure sleep never produces an event or uses a receive window.
+        return ipc::wait::wait_any(&Default::default(), Default::default(), deadline).map(|_| ());
+    }
     let mut cptrs = [0u8; size_of::<u64>() * MAX_WAIT_SOURCES];
     let cptrs = &mut cptrs[..count * size_of::<u64>()];
     user_mem::read_user_buffer(root, args.arg0, cptrs)?;
@@ -222,7 +235,7 @@ pub(crate) fn wait_any(args: &SyscallArgs) -> Result<(), ErrorCode> {
         Ok(sources)
     })
     .ok_or(ErrorCode::InvalidCap)??;
-    let event = ipc::wait::wait_any(&sources, slots)?;
+    let event = ipc::wait::wait_any(&sources, slots, deadline)?;
     let mut bytes = [0; size_of::<WaitEvent>()];
     bytes[offset_of!(WaitEvent, index)..][..8].copy_from_slice(&event.index.to_ne_bytes());
     bytes[offset_of!(WaitEvent, kind)..][..8].copy_from_slice(&event.kind.to_ne_bytes());

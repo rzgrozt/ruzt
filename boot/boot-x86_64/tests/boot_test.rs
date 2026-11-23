@@ -86,6 +86,7 @@ fn test_rootsrv_updates_the_framebuffer_from_keyboard_input() {
             "rootsrv: console allocation and mapping revoked through its Untyped budget",
             "rootsrv: Untyped budget enforced and reclaimed after revocation",
             "rootsrv: both delegated budgets reclaimed",
+            "rootsrv: timed wait and sleep woke at monotonic deadlines",
             "rootsrv: nested capability lookup, revocation and budgets verified",
             "rootsrv: anonymous memory rolled back and reused zeroed",
             "rootsrv: aligned allocation grew the runtime heap",
@@ -110,11 +111,15 @@ fn test_timer_preempts_cpu_bound_user_code() {
         "consoled: reply followed by CPU-bound loop",
         boot_deadline,
     );
-    wait_for_serial(
+    let serial = wait_for_serial(
         &mut vm.child,
         &serial_path,
         "rootsrv thread waiting for keyboard IRQ",
         boot_deadline,
+    );
+    assert_markers(
+        &serial,
+        &["rootsrv: timed wait and sleep woke at monotonic deadlines"],
     );
     monitor(&mut vm.child, "sendkey spc");
     wait_for_serial(

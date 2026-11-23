@@ -9,7 +9,9 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 use ruzt_abi::{ErrorCode, ProcessStatus};
+use ruzt_hal::time::Timer;
 use ruzt_hal_x86_64::context::FpState;
+use ruzt_hal_x86_64::time::X86_64Timer;
 use spin::Mutex;
 
 /// Opaque handle for a scheduler thread.
@@ -51,7 +53,8 @@ struct Thread {
     receive_slots: ReceiveSlots,
     wait_capability: Option<CapabilityId>,
     wait_sources: Option<Sources>,
-    /// A failure delivered instead of a message when an endpoint closes.
+    wait_deadline: Option<u64>,
+    /// An error that ended a blocking operation.
     ipc_error: Option<ErrorCode>,
     /// Address space and capabilities of a user-mode thread.
     user: Option<UserProcess>,
@@ -74,6 +77,7 @@ struct Scheduler {
     threads: Vec<alloc::boxed::Box<Thread>>,
     run_queue: VecDeque<ThreadId>,
     wait_queue: VecDeque<ThreadId>,
+    next_deadline: Option<u64>,
     current: ThreadId,
     kernel_cr3: u64,
     retired: Option<(ThreadId, ProcessStatus)>,
@@ -95,14 +99,47 @@ impl Scheduler {
             self.threads[id].state = ThreadState::Runnable;
             self.threads[id].wait_capability = None;
             self.threads[id].wait_sources = None;
+            self.threads[id].wait_deadline = None;
             self.threads[id].receive_slots = ReceiveSlots::default();
             self.run_queue.push_back(id);
         }
     }
 
     fn wake_wait_any(&mut self, target: Target) {
+        self.expire_waits();
         self.finish_waiters(None, |thread| thread.waits_for(target));
     }
+
+    fn set_wait_deadline(&mut self, id: ThreadId, deadline: u64) {
+        self.threads[id].wait_deadline = Some(deadline);
+        self.next_deadline = Some(
+            self.next_deadline
+                .map_or(deadline, |next| next.min(deadline)),
+        );
+    }
+
+    fn expire_waits(&mut self) {
+        if self.next_deadline.is_some() {
+            self.expire_waits_at(X86_64Timer::now_monotonic_ns());
+        }
+    }
+
+    fn expire_waits_at(&mut self, now: u64) {
+        if self.next_deadline.is_none_or(|deadline| deadline > now) {
+            return;
+        }
+        self.finish_waiters(Some(ErrorCode::TimedOut), |thread| {
+            thread.wait_deadline.is_some_and(|deadline| deadline <= now)
+        });
+        // Waking a task for another reason may leave an earlier cached
+        // deadline. Refresh it once that deadline is reached.
+        self.next_deadline = self
+            .wait_queue
+            .iter()
+            .filter_map(|&thread| self.threads[thread].wait_deadline)
+            .min();
+    }
+
     fn finish_waiters(&mut self, error: Option<ErrorCode>, matches: impl Fn(&Thread) -> bool) {
         loop {
             let waiter = self
@@ -145,6 +182,7 @@ pub fn init() {
         threads: Vec::with_capacity(16),
         run_queue: VecDeque::new(),
         wait_queue: VecDeque::new(),
+        next_deadline: None,
         current: 0,
         kernel_cr3,
         retired: None,
@@ -158,6 +196,7 @@ pub fn init() {
         receive_slots: ReceiveSlots::default(),
         wait_capability: None,
         wait_sources: None,
+        wait_deadline: None,
         ipc_error: None,
         user: None,
     }));
@@ -176,15 +215,16 @@ pub(crate) fn block_with_authority(
     capability: Option<CapabilityId>,
     slots: ReceiveSlots,
 ) {
-    block(reason, capability, slots, None);
+    block(reason, capability, slots, None, None);
 }
 
-pub(crate) fn block_wait_any(sources: &Sources) {
+pub(crate) fn block_wait_any(sources: &Sources, deadline: Option<u64>) {
     block(
         ThreadState::BlockedAny,
         None,
         ReceiveSlots::default(),
         Some(sources),
+        deadline,
     );
 }
 
@@ -193,6 +233,7 @@ fn block(
     capability: Option<CapabilityId>,
     slots: ReceiveSlots,
     sources: Option<&Sources>,
+    deadline: Option<u64>,
 ) {
     #[cfg(feature = "qemu-smoke-test")]
     crate::serial_println!(
@@ -209,6 +250,9 @@ fn block(
     sched.threads[current_id].wait_capability = capability;
     sched.threads[current_id].receive_slots = slots;
     sched.threads[current_id].wait_sources = sources.copied();
+    if let Some(deadline) = deadline {
+        sched.set_wait_deadline(current_id, deadline);
+    }
     sched.mark_blocked(current_id, reason);
     if let ThreadState::BlockedSend(endpoint) = reason {
         // A selector can consume the sender only after it joins the queue.
@@ -327,6 +371,7 @@ pub(crate) fn check_ipc_completion() -> Result<(), ErrorCode> {
 pub(crate) fn wake_irq(thread_id: ThreadId, irq: u32) {
     let mut guard = SCHEDULER.lock();
     let sched = guard.as_mut().expect("scheduler not initialised");
+    sched.expire_waits();
     let thread = &sched.threads[thread_id];
     if thread.state == ThreadState::BlockedIrq(irq) || thread.waits_for(Target::Irq(irq)) {
         sched.mark_runnable(thread_id);
@@ -459,6 +504,7 @@ fn spawn_thread(f: fn() -> !, user: Option<UserProcess>) -> Result<ThreadId, Err
         receive_slots: ReceiveSlots::default(),
         wait_capability: None,
         wait_sources: None,
+        wait_deadline: None,
         ipc_error: None,
         user,
     };
@@ -491,6 +537,7 @@ fn spawn_thread(f: fn() -> !, user: Option<UserProcess>) -> Result<ThreadId, Err
 pub fn yield_thread() {
     let mut guard = SCHEDULER.lock();
     let sched = guard.as_mut().expect("scheduler not initialised");
+    sched.expire_waits();
 
     let current_id = sched.current;
 
@@ -775,6 +822,48 @@ mod tests {
             scheduler.threads[notification_waiter].ipc_error,
             Some(ErrorCode::InvalidCap)
         );
+    }
+
+    #[test]
+    fn wait_deadlines_expire_once_and_leave_other_waiters_queued() {
+        let _state = crate::isolated_kernel_state();
+        fn entry() -> ! {
+            panic!("host tests do not switch stacks")
+        }
+        let early_event = spawn(entry);
+        let short = spawn(entry);
+        let tied = spawn(entry);
+        let long = spawn(entry);
+        let indefinite = spawn(entry);
+        let mut guard = SCHEDULER.lock();
+        let scheduler = guard.as_mut().unwrap();
+        for id in [early_event, short, tied, long, indefinite] {
+            scheduler.mark_blocked(id, ThreadState::BlockedAny);
+        }
+        for (id, deadline) in [(early_event, 10), (short, 20), (tied, 20), (long, 30)] {
+            scheduler.set_wait_deadline(id, deadline);
+        }
+        scheduler.mark_runnable(early_event);
+        scheduler.expire_waits_at(10);
+        assert_eq!(scheduler.next_deadline, Some(20));
+        assert_eq!(scheduler.run_queue, [early_event]);
+        assert_eq!(scheduler.threads[early_event].ipc_error, None);
+
+        scheduler.expire_waits_at(20);
+        assert_eq!(scheduler.next_deadline, Some(30));
+        assert_eq!(scheduler.wait_queue, [long, indefinite]);
+        assert_eq!(scheduler.run_queue, [early_event, short, tied]);
+        for id in [short, tied] {
+            assert_eq!(scheduler.threads[id].ipc_error, Some(ErrorCode::TimedOut));
+            assert_eq!(scheduler.threads[id].wait_deadline, None);
+        }
+
+        scheduler.expire_waits_at(u64::MAX);
+        assert_eq!(scheduler.next_deadline, None);
+        assert_eq!(scheduler.wait_queue, [indefinite]);
+        assert_eq!(scheduler.run_queue, [early_event, short, tied, long]);
+        assert_eq!(scheduler.threads[long].ipc_error, Some(ErrorCode::TimedOut));
+        assert_eq!(scheduler.threads[indefinite].ipc_error, None);
     }
 
     #[test]
