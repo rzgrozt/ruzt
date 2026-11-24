@@ -632,6 +632,7 @@ impl UserRange {
 /// Read a checked user buffer through supervisor-only aliases.
 ///
 /// Return false without copying if any page is outside the accessible range.
+/// Shared user bytes can change during the copy.
 ///
 /// # Safety
 /// The caller must keep the root, mappings, and backing frames stable for the
@@ -643,7 +644,7 @@ pub unsafe fn copy_from_active_user(root: PhysFrame, address: u64, buf: &mut [u8
     range.visit_pieces(|source, offset, length| {
         // SAFETY: The checked source piece is in a live RAM frame, and the
         // caller provides a disjoint destination with room for every piece.
-        unsafe { ptr::copy_nonoverlapping(source, buf.as_mut_ptr().add(offset), length) };
+        unsafe { copy_user_bytes(source, buf.as_mut_ptr().add(offset), length) };
     });
     true
 }
@@ -652,11 +653,12 @@ pub unsafe fn copy_from_active_user(root: PhysFrame, address: u64, buf: &mut [u8
 ///
 /// Return false without calling `produce` or writing if any page is outside
 /// the accessible range. The produced buffer must contain exactly `len` bytes.
+/// Another user task may access a shared destination during the copy.
 ///
 /// # Safety
 /// The caller must keep the root, mappings, and backing frames stable for the
 /// call, including during `produce`. The destination must be ordinary RAM
-/// exclusively writable during the copy and disjoint from the source.
+/// disjoint from the source.
 pub unsafe fn copy_to_active_user_with<T: AsRef<[u8]>>(
     root: PhysFrame,
     address: u64,
@@ -670,11 +672,26 @@ pub unsafe fn copy_to_active_user_with<T: AsRef<[u8]>>(
     let buf = output.as_ref();
     assert_eq!(buf.len(), len);
     range.visit_pieces(|destination, offset, length| {
-        // SAFETY: The checked destination piece is in a live, exclusively
-        // writable RAM frame, and the caller provides a disjoint source.
-        unsafe { ptr::copy_nonoverlapping(buf.as_ptr().add(offset), destination, length) };
+        // SAFETY: The checked destination piece is in a live, writable RAM
+        // frame, and the caller provides a disjoint source.
+        unsafe { copy_user_bytes(buf.as_ptr().add(offset), destination, length) };
     });
     true
+}
+
+unsafe fn copy_user_bytes(source: *const u8, destination: *mut u8, length: usize) {
+    // SAFETY: The caller supplies live, disjoint ranges. The x86 ABI clears
+    // DF. Issue the accesses directly so the compiler never assumes that
+    // the user mapping is free of concurrent accesses on another CPU.
+    unsafe {
+        core::arch::asm!(
+            "rep movsb",
+            inout("rsi") source => _,
+            inout("rdi") destination => _,
+            inout("rcx") length => _,
+            options(nostack, preserves_flags),
+        );
+    }
 }
 
 fn user_page_frame(

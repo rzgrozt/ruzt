@@ -87,8 +87,8 @@ pub fn copy_to_user(kernel_buf: &[u8], user_ptr: u64) -> Result<(), ErrorCode> {
     Ok(())
 }
 
-// User processes run on one CPU. The scheduler restores the calling root
-// before a blocked syscall resumes, and buffer copies do not reschedule.
+// The scheduler restores the calling root before a blocked syscall resumes.
+// The kernel transaction keeps mappings and backing frames live during a copy.
 pub(crate) fn validate_user_buffer(
     root: ruzt_hal::mem::PhysFrame,
     address: u64,
@@ -108,8 +108,8 @@ pub(crate) fn read_user_buffer(
     address: u64,
     buf: &mut [u8],
 ) -> Result<(), ErrorCode> {
-    // SAFETY: The syscall executes on the only CPU with interrupts disabled.
-    // User RAM frames are separate from the kernel's scratch buffers.
+    // SAFETY: The transaction holds this root's mappings stable, and the
+    // user RAM frames are separate from the kernel's scratch buffers.
     if unsafe { mapper::copy_from_active_user(root, address, buf) } {
         Ok(())
     } else {
@@ -132,9 +132,9 @@ pub(crate) fn write_user_buffer_with<T: AsRef<[u8]>>(
     len: usize,
     produce: impl FnOnce() -> T,
 ) -> Result<(), ErrorCode> {
-    // SAFETY: The only CPU is in the syscall gate with interrupts disabled.
-    // The producer runs synchronously without changing mappings or scheduling,
-    // and its output lives in kernel RAM separate from the user frames.
+    // SAFETY: The transaction keeps the user frames mapped. The producer runs
+    // synchronously without changing mappings or scheduling, and its output
+    // lives in kernel RAM separate from the user frames.
     if unsafe { mapper::copy_to_active_user_with(root, address, len, produce) } {
         Ok(())
     } else {
