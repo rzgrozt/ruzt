@@ -57,7 +57,6 @@ enum Error {
 
 struct Controller {
     unit: vtd::Unit,
-    mmio: u64,
     root: PhysFrame,
     scope: Scope,
     host_bits: u8,
@@ -71,11 +70,12 @@ impl Controller {
 }
 
 static CONTROLLER: Once<Controller> = Once::new();
+static MMIO_PAGE: Once<u64> = Once::new();
 
 pub(crate) fn overlaps_mmio(start: u64, end: u64) -> bool {
-    CONTROLLER.get().is_some_and(|controller| {
-        start < controller.mmio + PhysFrame::SIZE as u64 && controller.mmio < end
-    })
+    MMIO_PAGE
+        .get()
+        .is_some_and(|&base| start < base + PhysFrame::SIZE as u64 && base < end)
 }
 
 /// Whether an unassigned requester is covered by active default-deny DMA.
@@ -90,7 +90,11 @@ pub(crate) fn permits_pci_handoff(address: PciAddress) -> bool {
 pub(crate) fn init(boot: &BootInfo) {
     match start(boot) {
         Ok(Some(controller)) => {
+            let queued = controller.unit.uses_queued_invalidation();
             CONTROLLER.call_once(|| controller);
+            if queued {
+                crate::serial_println!("VT-d queued invalidation enabled");
+            }
             crate::serial_println!("VT-d DMA translation enabled with an empty root table");
         }
         Ok(None) => {}
@@ -103,6 +107,16 @@ pub(crate) fn verify_unassigned_device() {
     let controller = CONTROLLER
         .get()
         .expect("VT-d is required by the QEMU fixture");
+    // Global DMA invalidation submits three descriptors. Exercise wraparound
+    // of the 256-entry ring before the guest starts binding DMA buffers.
+    if controller.unit.uses_queued_invalidation() {
+        for _ in 0..86 {
+            controller
+                .unit
+                .invalidate_all()
+                .expect("wrap the VT-d queue");
+        }
+    }
     probe::verify(&controller.unit, &controller.scope)
         .expect("verify VT-d blocks an unassigned requester");
 }
@@ -128,6 +142,8 @@ fn start(boot: &BootInfo) -> Result<Option<Controller>, Error> {
     }) {
         return Err(Error::BadRegisters);
     }
+    // Keep the remapping aperture private even if initialization fails later.
+    MMIO_PAGE.call_once(|| remapper.base);
     let regs = mapper::with_mapper(|mapper| {
         let alias = mapper
             .physmap_alias(remapper.base, page)
@@ -141,7 +157,7 @@ fn start(boot: &BootInfo) -> Result<Option<Controller>, Error> {
     })?;
     #[allow(unsafe_code)]
     // SAFETY: This boot-owned VT-d register page is mapped uncached.
-    let unit = unsafe { vtd::Unit::inspect(regs) }.map_err(Error::Hardware)?;
+    let mut unit = unsafe { vtd::Unit::inspect(regs) }.map_err(Error::Hardware)?;
     let root = frame::allocate().ok_or(Error::NoMemory)?;
     if root.base.as_u64() >= 1 << remapper.host_bits {
         frame::deallocate(root);
@@ -156,18 +172,47 @@ fn start(boot: &BootInfo) -> Result<Option<Controller>, Error> {
         frame::deallocate(root);
         return Err(error);
     }
+    let queue = if unit.supports_queued_invalidation() {
+        match allocate_queue(remapper.host_bits) {
+            Ok(memory) => Some(memory),
+            Err(error) => {
+                frame::deallocate(root);
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
     #[allow(unsafe_code)]
-    // SAFETY: Every root entry is empty, visible to hardware, and therefore
-    // denies DMA. The allocator keeps the table even on a hardware timeout.
-    unsafe { unit.enable(root) }.map_err(Error::Hardware)?;
+    // SAFETY: The visible root table is empty. The queue pages, if required,
+    // are private and contiguous. All frames stay pinned on hardware failure.
+    unsafe { unit.enable(root, queue) }.map_err(Error::Hardware)?;
     Ok(Some(Controller {
         unit,
-        mmio: remapper.base,
         root,
         scope: remapper.scope,
         host_bits: remapper.host_bits,
         domains: Mutex::new(domain::Domains::new()),
     }))
+}
+
+fn allocate_queue(host_bits: u8) -> Result<(PhysFrame, VirtAddr), Error> {
+    let pages = vtd::INVALIDATION_PAGES;
+    let bytes = (pages * PhysFrame::SIZE) as u64;
+    let base = frame::allocate_contiguous(pages).ok_or(Error::NoMemory)?;
+    let start = base.base.as_u64();
+    let alias = mapper::with_mapper(|mapper| mapper.physmap_alias(start, bytes))
+        .filter(|_| start + bytes <= 1 << host_bits);
+    let Some(alias) = alias else {
+        frame::deallocate_contiguous(base, pages);
+        return Err(Error::BadRegisters);
+    };
+    #[allow(unsafe_code)]
+    // SAFETY: The allocator owns this contiguous range and the physmap covers it.
+    unsafe {
+        (alias.as_u64() as *mut u8).write_bytes(0, bytes as usize)
+    };
+    Ok((base, alias))
 }
 
 fn frame_alias(frame: PhysFrame) -> Result<VirtAddr, Error> {

@@ -1,6 +1,10 @@
 //! Register interface for legacy Intel VT-d DMA translation.
 
 use ruzt_hal::mem::{PhysFrame, VirtAddr};
+use spin::Mutex;
+
+mod queue;
+use queue::Queue;
 
 const VERSION: usize = 0;
 const CAPABILITY: usize = 8;
@@ -13,11 +17,14 @@ const FAULT_EVENT_CONTROL: usize = 0x38;
 const TRANSLATION_ENABLE: u32 = 1 << 31;
 const SET_ROOT_POINTER: u32 = 1 << 30;
 const WRITE_BUFFER_FLUSH: u32 = 1 << 27;
-const GLOBAL_PERSISTENT_STATE: u32 = 0x96ff_ffff;
+const GLOBAL_PERSISTENT_STATE: u32 = TRANSLATION_ENABLE | queue::ENABLE;
 const INVALIDATE: u64 = 1 << 63;
 const CONTEXT_GLOBAL: u64 = 1 << 61;
 const IOTLB_GLOBAL: u64 = 1 << 60;
 const WAIT_LIMIT: usize = 1_000_000;
+
+/// Frames for the invalidation ring and its hardware completion word.
+pub const INVALIDATION_PAGES: usize = 2;
 
 /// Error activating DMA translation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -26,7 +33,7 @@ pub enum Error {
     Unsupported,
     /// A remapping register operation did not complete.
     TimedOut,
-    /// Hardware rejected a requested global invalidation.
+    /// An invalidation failed or the queue lost synchronization.
     InvalidationFailed,
 }
 
@@ -36,6 +43,7 @@ pub struct Unit {
     iotlb: usize,
     capability: u64,
     extended: u64,
+    queue: Option<Mutex<Queue>>,
 }
 
 impl Unit {
@@ -50,6 +58,7 @@ impl Unit {
             iotlb: 0,
             capability: 0,
             extended: 0,
+            queue: None,
         };
         let version = unit.read32(VERSION);
         unit.capability = unit.read64(CAPABILITY);
@@ -103,6 +112,16 @@ impl Unit {
         self.capability >> 54 & 3 == 3
     }
 
+    /// Whether hardware accepts queued invalidation descriptors.
+    pub fn supports_queued_invalidation(&self) -> bool {
+        self.extended & (1 << 1) != 0
+    }
+
+    /// Whether translation is using the invalidation queue.
+    pub fn uses_queued_invalidation(&self) -> bool {
+        self.queue.is_some()
+    }
+
     /// Maximum count of distinct domain IDs, including reserved ID zero.
     pub fn domain_count(&self) -> usize {
         1 << (4 + 2 * (self.capability & 7))
@@ -113,16 +132,29 @@ impl Unit {
     /// # Safety
     /// The root table and all referenced tables must be visible to this unit
     /// and remain allocated for as long as it could access them, including
-    /// after an error. The caller must control the covered devices.
-    pub unsafe fn enable(&self, root: PhysFrame) -> Result<(), Error> {
+    /// after an error. On units with queued invalidation, `queue` must name
+    /// `INVALIDATION_PAGES` contiguous pinned RAM frames and their writable
+    /// contiguous alias. Reserve both frames exclusively for VT-d. The
+    /// caller must control the covered devices.
+    pub unsafe fn enable(
+        &mut self,
+        root: PhysFrame,
+        queue: Option<(PhysFrame, VirtAddr)>,
+    ) -> Result<(), Error> {
+        if queue.is_some() != self.supports_queued_invalidation() {
+            return Err(Error::Unsupported);
+        }
         // Kernel polling is used for primary faults until interrupt
         // remapping and fault interrupt routing are installed.
         self.write32(FAULT_EVENT_CONTROL, 1 << 31);
         self.write64(ROOT_ADDRESS, root.base.as_u64());
-        self.write32(GLOBAL_COMMAND, SET_ROOT_POINTER);
+        self.command(SET_ROOT_POINTER);
         wait(|| self.read32(GLOBAL_STATUS) & SET_ROOT_POINTER != 0)?;
+        if let Some((base, alias)) = queue {
+            self.queue = Some(Mutex::new(Queue::start(self, base, alias)?));
+        }
         self.invalidate_all()?;
-        self.write32(GLOBAL_COMMAND, TRANSLATION_ENABLE);
+        self.command(TRANSLATION_ENABLE);
         wait(|| self.read32(GLOBAL_STATUS) & TRANSLATION_ENABLE != 0)
     }
 
@@ -131,13 +163,19 @@ impl Unit {
     /// The caller must serialize register commands and keep affected pages
     /// pinned until this operation completes successfully.
     pub fn invalidate_all(&self) -> Result<(), Error> {
-        wait(|| self.read64(CONTEXT_COMMAND) & INVALIDATE == 0)?;
-        wait(|| self.read64(self.iotlb) & INVALIDATE == 0)?;
         if self.capability & (1 << 4) != 0 {
-            let state = self.read32(GLOBAL_STATUS) & GLOBAL_PERSISTENT_STATE;
-            self.write32(GLOBAL_COMMAND, state | WRITE_BUFFER_FLUSH);
+            self.command(WRITE_BUFFER_FLUSH);
             wait(|| self.read32(GLOBAL_STATUS) & WRITE_BUFFER_FLUSH == 0)?;
         }
+        if let Some(queue) = &self.queue {
+            return queue.lock().invalidate_dma(self);
+        }
+        self.invalidate_registers()
+    }
+
+    fn invalidate_registers(&self) -> Result<(), Error> {
+        wait(|| self.read64(CONTEXT_COMMAND) & INVALIDATE == 0)?;
+        wait(|| self.read64(self.iotlb) & INVALIDATE == 0)?;
         self.write64(CONTEXT_COMMAND, INVALIDATE | CONTEXT_GLOBAL);
         wait(|| self.read64(CONTEXT_COMMAND) & INVALIDATE == 0)?;
         if self.read64(CONTEXT_COMMAND) >> 59 & 3 != 1 {
@@ -150,6 +188,11 @@ impl Unit {
             return Err(Error::InvalidationFailed);
         }
         Ok(())
+    }
+
+    fn command(&self, bits: u32) {
+        let state = self.read32(GLOBAL_STATUS) & GLOBAL_PERSISTENT_STATE;
+        self.write32(GLOBAL_COMMAND, state | bits);
     }
 
     /// Whether the unit has logged a fault for this source and DMA page.

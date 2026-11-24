@@ -115,6 +115,7 @@ fn test_uefi_boots_user_services_with_a_randomized_kernel() {
             assert_markers(
                 &serial,
                 &[
+                    "VT-d queued invalidation enabled",
                     "VT-d DMA translation enabled with an empty root table",
                     "rootsrv: cleared firmware-enabled PCI bus mastering before delegation",
                     "rootsrv: PCI INTx delivered, re-armed, revoked and reclaimed",
@@ -315,6 +316,7 @@ fn test_vtd_isolates_and_reclaims_delegated_dma() {
     assert_markers(
         &serial,
         &[
+            "VT-d queued invalidation enabled",
             "VT-d DMA translation enabled with an empty root table",
             "VT-d rejected an unassigned EDU DMA request",
             "rootsrv: PCI INTx delivered, re-armed, revoked and reclaimed",
