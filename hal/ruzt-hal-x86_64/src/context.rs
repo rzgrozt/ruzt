@@ -21,7 +21,7 @@ impl Default for FpState {
 /// Enable the register state supported by the context switch.
 ///
 /// # Safety
-/// Call once on the boot CPU before running user code or switching threads.
+/// Call once on every CPU before running user code or switching threads.
 /// Kernel code must use the soft-float target, including interrupt handlers.
 pub unsafe fn init_fp() {
     // SAFETY: At boot no thread owns the CPU's floating-point state. FXSAVE
@@ -78,16 +78,21 @@ pub unsafe fn init_stack(stack: &mut [u8], entry: fn() -> !) -> u64 {
 /// Perform a context switch.
 ///
 /// Saves the current stack and floating-point state and restores the next
-/// thread's address space, stack, and registers.
+/// thread's address space, stack, and registers. Calls `finish` on the new
+/// stack after the outgoing context and address space are no longer active.
 ///
 /// # Safety
 /// - `old_rsp` must point to a valid, writable `u64`.
-/// - `new_rsp` must be a valid stack pointer initialised by [`init_stack`].
+/// - `new_rsp` must point to a frame from [`init_stack`] or a previous switch,
+///   with sufficient writable stack below it to call `finish`.
 /// - `new_cr3` must be valid and map the kernel and both kernel stacks.
 /// - `old_fp` and `new_fp` must point to distinct, aligned kernel-owned
 ///   states mapped in both address spaces. Call [`init_fp`] before switching.
 /// - Interrupts must be disabled by the caller.
-/// - The current thread's stack must remain live until the thread is resumed.
+/// - The current thread's stack must remain live until `finish` is entered.
+/// - `finish` must return with interrupts still disabled. It may publish the
+///   saved context or release its scheduler lock, so `switch` does not access
+///   the outgoing context after the call.
 #[unsafe(naked)]
 pub unsafe extern "C" fn switch(
     _old_rsp: *mut u64,
@@ -95,6 +100,7 @@ pub unsafe extern "C" fn switch(
     _new_cr3: u64,
     _old_fp: *mut FpState,
     _new_fp: *const FpState,
+    _finish: extern "C" fn(),
 ) {
     // SAFETY: [Categories 3/6/10/13 - Dangling, alignment, bounds, library
     // contract] The caller provides writable `rdi`, a frame-aligned `rsi`
@@ -116,6 +122,13 @@ pub unsafe extern "C" fn switch(
         "2:",
         "fxrstor64 [r8]",
         "mov rsp, rsi",
+        // The saved and initial frames have different stack alignment.
+        // Keep the exact frame pointer in a callee-saved register until the
+        // callback returns, then restore the incoming thread's registers.
+        "mov r12, rsp",
+        "and rsp, -16",
+        "call r9",
+        "mov rsp, r12",
         "pop r15",
         "pop r14",
         "pop r13",

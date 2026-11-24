@@ -155,6 +155,13 @@ impl Scheduler {
 
 static SCHEDULER: Mutex<Option<Scheduler>> = Mutex::new(None);
 
+#[allow(unsafe_code)]
+extern "C" fn finish_switch() {
+    // SAFETY: switch_to transferred the single lock acquisition to this
+    // callback, which runs after the previous stack and CR3 were replaced.
+    unsafe { SCHEDULER.force_unlock() };
+}
+
 /// Set by the timer ISR when a tick has occurred.
 static NEED_SWITCH: AtomicBool = AtomicBool::new(false);
 
@@ -421,12 +428,6 @@ pub(crate) fn reap_retired_user() {
             status,
         )
     };
-    #[allow(unsafe_code)]
-    // SAFETY: Idle is running on its boot stack with interrupts disabled.
-    // Restore RSP0 before releasing the task's former privilege stack.
-    unsafe {
-        ruzt_hal_x86_64::gdt::use_boot_trap_stack()
-    };
     let name = user.name;
     let publisher = user.exit_publisher.take();
     drop(user);
@@ -576,13 +577,20 @@ fn switch_to(mut guard: spin::MutexGuard<'_, Option<Scheduler>>, next_id: Thread
         unsafe { ruzt_hal_x86_64::gdt::set_trap_stack(stack_top) };
         user.root().base.as_u64()
     } else {
+        // SAFETY: Bookkeeping runs with interrupts disabled. A kernel thread
+        // must stop using the outgoing user thread's privilege stack.
+        unsafe { ruzt_hal_x86_64::gdt::use_boot_trap_stack() };
         sched.kernel_cr3
     };
     sched.current = next_id;
-    drop(guard);
+    // Transfer unlock to the incoming stack. Other CPUs must not reuse this
+    // context while the outgoing thread is still saving registers or CR3.
+    core::mem::forget(guard);
     // SAFETY: Both thread records are pinned in separate boxes, and the boot
     // kernel heap, the switch code, and both stacks are mapped in both roots.
-    unsafe { ruzt_hal_x86_64::context::switch(old_rsp, new_rsp, new_cr3, old_fp, new_fp) };
+    unsafe {
+        ruzt_hal_x86_64::context::switch(old_rsp, new_rsp, new_cr3, old_fp, new_fp, finish_switch)
+    };
 }
 
 #[cfg(test)]
