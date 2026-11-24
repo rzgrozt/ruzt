@@ -34,12 +34,22 @@ static STATE: [AtomicU8; 255] = [const { AtomicU8::new(OFFLINE) }; 255];
 static PERMANENT_ROOT: Once<u64> = Once::new();
 pub(crate) const SCHEDULER_SLOTS: usize = STATE.len() + 1;
 
+mod irq_probe;
 mod shootdown;
-pub(crate) use shootdown::{handle_tlb_ipi, install_shootdown};
+pub(crate) use irq_probe::handle as handle_lapic_probe;
+pub(crate) use shootdown::handle_tlb_ipi;
 #[cfg(feature = "qemu-smp-test")]
 pub(crate) use shootdown::verify_shootdown;
-#[cfg(not(test))]
-pub(crate) use shootdown::poll_local as poll_local_shootdown;
+
+pub(crate) fn install_remote_operations() {
+    shootdown::install_shootdown();
+    irq_probe::install();
+}
+
+pub(crate) fn poll_synchronous_ipis() {
+    shootdown::poll_local();
+    irq_probe::poll_boot();
+}
 
 pub(crate) fn secondary_scheduler_slot(id: u8) -> usize {
     usize::from(id) + 1

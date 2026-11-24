@@ -235,7 +235,7 @@ pub(crate) fn reserve_gsi(gsi: u32, flags: u64) -> Result<u32, ErrorCode> {
     };
     let input = find_input(&topology.controllers, route).ok_or(ErrorCode::NotFound)?;
     #[allow(unsafe_code)]
-    // SAFETY: The syscall runs on the boot CPU with interrupts disabled.
+    // SAFETY: The syscall transaction serializes route changes with IF clear.
     // The validated topology identifies a unique non-ISA, non-NMI pin.
     let line = unsafe { irq::reserve_gsi(gsi, input) };
     line.map_err(crate::irq::hardware_error)

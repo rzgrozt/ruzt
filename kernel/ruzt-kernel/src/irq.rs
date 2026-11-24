@@ -56,8 +56,8 @@ pub(crate) fn reserve_msi(address: PciAddress) -> Result<u32, ErrorCode> {
         return Err(ErrorCode::NotFound);
     }
     #[allow(unsafe_code)]
-    // SAFETY: The object table owns an exclusive function lease, and the
-    // boot CPU serializes its configuration cycles with interrupts disabled.
+    // SAFETY: The object table owns an exclusive function lease. The kernel
+    // transaction serializes configuration cycles with IF clear.
     let msi = unsafe { Msi::inspect(address.bits()) }.ok_or(ErrorCode::NotFound)?;
     #[allow(unsafe_code)]
     // SAFETY: VT-d covers this exact direct requester and the IRQ object
@@ -76,6 +76,7 @@ pub(crate) fn reserve_msix(
     let msix = resources.vector(vector)?;
     #[allow(unsafe_code)]
     // SAFETY: VT-d covers the leased function and its table is kernel-owned.
+    // The kernel transaction serializes route changes with IF clear.
     unsafe { hardware::reserve_msix(msix) }.map_err(hardware_error)
 }
 

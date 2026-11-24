@@ -5,7 +5,7 @@ use ruzt_abi::{ProcessStatus, PROCESS_FAULTED};
 use ruzt_hal::cpu::CpuOps;
 use ruzt_hal::time::Timer;
 use ruzt_hal_x86_64::{
-    apic::{SPURIOUS_VECTOR, TLB_VECTOR, WAKE_VECTOR},
+    apic::{LAPIC_PROBE_VECTOR, SPURIOUS_VECTOR, TLB_VECTOR, WAKE_VECTOR},
     irq::{IRQ_COUNT, VECTOR_BASE},
 };
 use spin::Once;
@@ -57,6 +57,7 @@ interrupt_entry!(timer_entry => timer_handler);
 interrupt_entry!(spurious_entry => spurious_handler);
 interrupt_entry!(wake_entry => wake_handler);
 interrupt_entry!(tlb_entry => tlb_handler);
+interrupt_entry!(lapic_probe_entry => lapic_probe_handler);
 interrupt_entry!(device_entry<LINE: u8> => device_irq);
 
 /// Initialises the global IDT with breakpoint, double-fault, page-fault, timer,
@@ -110,6 +111,7 @@ pub fn init_idt() {
             gate!(idt[SPURIOUS_VECTOR], spurious_entry);
             gate!(idt[WAKE_VECTOR], wake_entry);
             gate!(idt[TLB_VECTOR], tlb_entry);
+            gate!(idt[LAPIC_PROBE_VECTOR], lapic_probe_entry);
             gate!(idt[0x80], syscall_handler).set_privilege_level(x86_64::PrivilegeLevel::Ring3);
         }
         idt
@@ -123,6 +125,10 @@ extern "x86-interrupt" fn wake_handler(_frame: InterruptStackFrame) {
 
 extern "x86-interrupt" fn tlb_handler(_frame: InterruptStackFrame) {
     crate::smp::handle_tlb_ipi();
+}
+
+extern "x86-interrupt" fn lapic_probe_handler(_frame: InterruptStackFrame) {
+    crate::smp::handle_lapic_probe();
 }
 
 #[unsafe(naked)]

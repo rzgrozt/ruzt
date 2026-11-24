@@ -107,8 +107,8 @@ impl Mailbox {
 
 static MAILBOXES: [Mailbox; STATE.len()] = [const { Mailbox::new() }; STATE.len()];
 
-pub(crate) fn install_shootdown() {
-    tlb::install(invalidate_remote, poll_local);
+pub(super) fn install_shootdown() {
+    tlb::install(invalidate_remote, super::poll_synchronous_ipis);
 }
 
 fn invalidate_remote(request: Invalidation) {
@@ -161,6 +161,9 @@ fn broadcast(command: u8, argument: u64) {
         while mailbox.command.load(Ordering::Acquire) != IDLE {
             assert!(budget != 0, "TLB acknowledgement timed out on APIC {id}");
             budget -= 1;
+            // A remote CPU waiting on a route check can answer the shootdown
+            // while this CPU services the pending LAPIC query.
+            super::irq_probe::poll_boot();
             core::hint::spin_loop();
         }
     }

@@ -24,6 +24,7 @@ static ENDPOINT: AtomicU64 = AtomicU64::new(0);
 static RECEIVER_CPU: AtomicUsize = AtomicUsize::new(0);
 static SENDER_CPU: AtomicUsize = AtomicUsize::new(0);
 static IPC_COMPLETE: AtomicBool = AtomicBool::new(false);
+static VECTOR_PROBE_STARTED: AtomicBool = AtomicBool::new(false);
 const IPC_LABEL: u64 = 0x736d_702d_6970_6321;
 
 pub(crate) fn enqueue() {
@@ -64,6 +65,58 @@ pub(crate) fn verify_ipc() {
         core::hint::spin_loop();
     }
     panic!("cross-CPU IPC did not unblock its receiver");
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn verify_irq_probe() {
+    use ruzt_hal_x86_64::{
+        apic::{Ipi, TLB_VECTOR},
+        irq,
+    };
+
+    let bsp = crate::apic::cpu_topology().expect("QEMU APIC topology").bsp;
+    // SAFETY: The BSP has IF clear, owns its ICR, and has no TLB mailbox request.
+    // This makes a vector pending only on the receiving CPU.
+    assert!(unsafe { irq::send_ipi(bsp, Ipi::Tlb) });
+    // SAFETY: Same CPU and interrupt state. Pass only after IRR observes it.
+    assert!(
+        (0..1_000_000).any(|_| unsafe { irq::local_boot_vector_idle(TLB_VECTOR) } == Some(false))
+    );
+    spawn_worker(probe_irq);
+    crate::smp::tick_schedulers();
+    for _ in 0..50_000_000 {
+        if VECTOR_PROBE_STARTED.load(Ordering::Acquire) {
+            // The AP holds this transaction. While waiting, the BSP must
+            // service both probes with its interrupt gate still masked.
+            drop(transaction::enter());
+            crate::serial_println!(
+                "SMP LAPIC probe distinguished pending and idle boot CPU vectors"
+            );
+            return;
+        }
+        core::hint::spin_loop();
+    }
+    panic!("secondary CPU did not start its LAPIC probe");
+}
+
+#[allow(unsafe_code)]
+fn probe_irq() -> ! {
+    use ruzt_hal_x86_64::{apic::TLB_VECTOR, irq};
+
+    assert_ne!(current_cpu(), 0);
+    let _interrupts = X86_64Cpu::disable_interrupts();
+    let transaction = transaction::enter();
+    VECTOR_PROBE_STARTED.store(true, Ordering::Release);
+    // SAFETY: This test owns the vectors with IF clear under the transaction.
+    // Only the BSP's TLB vector was raised. No device routes are installed.
+    unsafe {
+        assert!(!irq::boot_vector_idle(TLB_VECTOR));
+        assert!(irq::boot_vector_idle(
+            irq::VECTOR_BASE + irq::IRQ_COUNT as u8 - 1
+        ));
+    }
+    drop(transaction);
+    retire_current_worker();
 }
 
 fn workers_reaped() -> bool {

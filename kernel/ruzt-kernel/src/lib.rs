@@ -128,7 +128,7 @@ pub fn main(boot_info: &'static mut BootInfo) -> ! {
 
     apic::init(boot_info);
     smp::start(startup);
-    smp::install_shootdown();
+    smp::install_remote_operations();
     #[cfg(feature = "qemu-smp-test")]
     smp::verify_shootdown();
 
@@ -147,6 +147,7 @@ pub fn main(boot_info: &'static mut BootInfo) -> ! {
     {
         sched::qemu::verify();
         sched::qemu::verify_ipc();
+        sched::qemu::verify_irq_probe();
     }
     serial_println!("Scheduler initialised.");
     advance_screen();

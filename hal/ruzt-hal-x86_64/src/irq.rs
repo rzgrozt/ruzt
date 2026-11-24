@@ -155,6 +155,37 @@ pub enum ReserveError {
 }
 
 static APIC: Once<ApicRoutes> = Once::new();
+static REMOTE_VECTOR_PROBE: Once<fn(u8) -> bool> = Once::new();
+
+/// Install the transport for a synchronous boot-CPU LAPIC query.
+///
+/// The callback runs with interrupts disabled and must sample the vector
+/// on the CPU that receives device interrupts. It must not take route locks.
+pub fn install_vector_probe(remote: fn(u8) -> bool) {
+    REMOTE_VECTOR_PROBE.call_once(|| remote);
+}
+
+/// Read the device-target LAPIC only if this is the boot CPU.
+///
+/// # Safety
+/// Interrupts must be disabled in the negotiated APIC mode.
+pub unsafe fn local_boot_vector_idle(vector: u8) -> Option<bool> {
+    let local = &APIC.get()?.local;
+    (local.current_id() == local.id()).then(|| local.vector_idle(vector))
+}
+
+/// Report whether a vector in the boot CPU's LAPIC is neither pending nor active.
+///
+/// # Safety
+/// Call in the negotiated APIC mode with interrupts disabled and serialized
+/// against other remote vector queries. The route and source must stay masked
+/// and drained for the duration of a reclamation check.
+pub unsafe fn boot_vector_idle(vector: u8) -> bool {
+    // SAFETY: The caller disabled interrupts and uses the configured LAPIC.
+    unsafe { local_boot_vector_idle(vector) }
+        .or_else(|| REMOTE_VECTOR_PROBE.get().map(|probe| probe(vector)))
+        .unwrap_or(false)
+}
 
 /// Send a physical unicast interrupt from the current CPU.
 ///
@@ -253,7 +284,7 @@ pub fn is_device_irq(line: u32) -> bool {
 /// Reserve an extended GSI and assign it a masked interrupt vector.
 ///
 /// # Safety
-/// Call on the boot CPU with local interrupts disabled. The input must
+/// Serialize route transactions and disable local interrupts. The input must
 /// designate this GSI's unique controller pin, outside the ISA and NMI routes.
 pub unsafe fn reserve_gsi(gsi: u32, input: Input) -> Result<u32, ReserveError> {
     reserve_extended(ExtendedInput::Gsi { gsi, input })
@@ -262,7 +293,7 @@ pub unsafe fn reserve_gsi(gsi: u32, input: Input) -> Result<u32, ReserveError> {
 /// Reserve one source-validated message interrupt for an exclusive endpoint.
 ///
 /// # Safety
-/// Call on the boot CPU with interrupts disabled. The device lease must
+/// Serialize route transactions and disable local interrupts. The device lease must
 /// remain exclusive until the IRQ is retired, and the active remapper must
 /// cover the endpoint's exact requester ID.
 pub unsafe fn reserve_msi(msi: Msi) -> Result<u32, ReserveError> {
@@ -272,7 +303,7 @@ pub unsafe fn reserve_msi(msi: Msi) -> Result<u32, ReserveError> {
 /// Reserve one independently maskable MSI-X vector.
 ///
 /// # Safety
-/// Call on the boot CPU with interrupts disabled, holding the exclusive
+/// Serialize route transactions and disable local interrupts, holding the exclusive
 /// covered endpoint lease. All table and pending-bit pages must be private.
 pub unsafe fn reserve_msix(msix: Msix) -> Result<u32, ReserveError> {
     reserve_extended(ExtendedInput::Message(Message::Msix(msix)))
@@ -298,8 +329,9 @@ fn reserve_extended(source: ExtendedInput) -> Result<u32, ReserveError> {
                 }
                 // Interrupt-cache invalidation drains the remapper before
                 // checking the receiving CPU for the previous delivery.
-                if old.source.idle() && routes.local.vector_idle(VECTOR_BASE + extended_line(index))
-                {
+                let vector = VECTOR_BASE + extended_line(index);
+                // SAFETY: The caller serialized this route update with IF clear.
+                if old.source.idle() && unsafe { boot_vector_idle(vector) } {
                     *slot = None;
                     continue;
                 }
@@ -486,7 +518,9 @@ pub fn set_enabled(line: u32, enabled: bool) -> Result<(), ReserveError> {
                         if enabled {
                             // Complete old messages before allowing a new binding.
                             table.sync().map_err(|_| ReserveError::RemappingFailed)?;
-                            if !routes.local.vector_idle(VECTOR_BASE + line as u8) {
+                            // SAFETY: Capability IRQ transitions run inside the
+                            // kernel's serialized entry with interrupts disabled.
+                            if !unsafe { boot_vector_idle(VECTOR_BASE + line as u8) } {
                                 return Err(ReserveError::PendingDelivery);
                             }
                         }

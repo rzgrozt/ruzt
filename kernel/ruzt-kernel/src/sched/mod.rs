@@ -227,7 +227,7 @@ fn lock_scheduler() -> SchedulerGuard {
             break lock;
         }
         #[cfg(not(test))]
-        crate::smp::poll_local_shootdown();
+        crate::smp::poll_synchronous_ipis();
         core::hint::spin_loop();
     };
     SchedulerGuard {

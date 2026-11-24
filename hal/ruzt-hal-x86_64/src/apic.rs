@@ -21,6 +21,8 @@ pub const SPURIOUS_VECTOR: u8 = 0xff;
 pub const WAKE_VECTOR: u8 = 0xf0;
 /// Fixed-vector interprocessor interrupt for address-space invalidation.
 pub const TLB_VECTOR: u8 = 0xf1;
+/// Fixed-vector interprocessor interrupt for inspecting the boot CPU's LAPIC.
+pub const LAPIC_PROBE_VECTOR: u8 = 0xf2;
 
 /// A physical unicast command sent over the local APIC.
 pub enum Ipi {
@@ -32,6 +34,8 @@ pub enum Ipi {
     Wake,
     /// Service a published TLB invalidation.
     Tlb,
+    /// Check a device vector on the CPU that receives it.
+    LapicProbe,
 }
 
 /// The boot CPU's local interrupt controller.
@@ -171,6 +175,7 @@ impl LocalApic {
             Ipi::Startup(vector) => (6 << 8) | u32::from(vector),
             Ipi::Wake => u32::from(WAKE_VECTOR),
             Ipi::Tlb => u32::from(TLB_VECTOR),
+            Ipi::LapicProbe => u32::from(LAPIC_PROBE_VECTOR),
         };
         match self.registers {
             LocalRegisters::Xapic(_) => {
