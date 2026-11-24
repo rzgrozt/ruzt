@@ -122,6 +122,7 @@ fn test_uefi_boots_user_services_with_a_randomized_kernel() {
                     "rootsrv: cleared firmware-enabled PCI bus mastering before delegation",
                     "rootsrv: PCI INTx delivered, re-armed, revoked and reclaimed",
                     "rootsrv: delegated DMA round trip, revocation and reclamation verified",
+                    "rootsrv: PCI MSI delivered, coalesced, revoked and reclaimed",
                     "rootsrv: PCI BAR mapped, delegated read-only, revoked and reclaimed",
                 ],
             );
@@ -329,6 +330,7 @@ fn test_vtd_isolates_and_reclaims_delegated_dma() {
             "rootsrv: delegated UART IRQ delivered, re-armed and reclaimed",
             "rootsrv: PCI INTx delivered, re-armed, revoked and reclaimed",
             "rootsrv: delegated DMA round trip, revocation and reclamation verified",
+            "rootsrv: PCI MSI delivered, coalesced, revoked and reclaimed",
             "rootsrv: PCI BAR mapped, delegated read-only, revoked and reclaimed",
         ],
     );

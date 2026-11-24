@@ -344,6 +344,8 @@ pub enum CapOp {
     /// Claim the non-ISA GSI in `arg3` into slot `arg2` using IRQ control.
     /// `arg4` contains the firmware-described `IRQ_*` signal flags.
     ClaimGsi = 33,
+    /// Claim one PCI MSI message into slot `arg2` using a writable device cap.
+    ClaimMsi = 34,
 }
 
 /// The interrupt is asserted low. The default is active high.

@@ -6,7 +6,7 @@ use ruzt_hal::boot::{BootInfo, FirmwareTables, MemoryRegionKind};
 use ruzt_hal::mem::{PhysFrame, VirtAddr};
 use ruzt_hal_x86_64::{
     apic::{Input, IoApic, LocalApic},
-    irq::{self, ReserveError, CASCADE, ISA_IRQ_COUNT, KEYBOARD, TIMER},
+    irq::{self, CASCADE, ISA_IRQ_COUNT, KEYBOARD, TIMER},
     mapper, pic,
 };
 use spin::Once;
@@ -226,12 +226,7 @@ pub(crate) fn reserve_gsi(gsi: u32, flags: u64) -> Result<u32, ErrorCode> {
     // SAFETY: The syscall runs on the boot CPU with interrupts disabled.
     // The validated topology identifies a unique non-ISA, non-NMI pin.
     let line = unsafe { irq::reserve_gsi(gsi, input) };
-    line.map_err(|error| match error {
-        ReserveError::Unavailable => ErrorCode::NotFound,
-        ReserveError::Occupied => ErrorCode::SlotOccupied,
-        ReserveError::NoVector => ErrorCode::NoMemory,
-        ReserveError::RemappingFailed => ErrorCode::NotImplemented,
-    })
+    line.map_err(crate::irq::hardware_error)
 }
 
 pub(crate) fn init(boot: &BootInfo) {

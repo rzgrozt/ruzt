@@ -21,6 +21,11 @@ pub fn claim_gsi(control: u64, destination: u64, gsi: u32, flags: u64) -> Result
     invoke_irq(control, CapOp::ClaimGsi, destination, u64::from(gsi), flags)
 }
 
+/// Claim a single remapped MSI message from an exclusive PCI device.
+pub fn claim_msi(device: u64, destination: u64) -> Result<(), ErrorCode> {
+    invoke_irq(device, CapOp::ClaimMsi, destination, 0, 0)
+}
+
 /// Bind an exclusively claimed interrupt to the calling driver.
 pub fn bind_irq(cap: u64) -> Result<(), ErrorCode> {
     invoke_irq(cap, CapOp::BindIrq, 0, 0, 0)

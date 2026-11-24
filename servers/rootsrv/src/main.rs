@@ -561,6 +561,11 @@ fn check_pci_mmio() -> Result<(), ErrorCode> {
     #[cfg(feature = "qemu-pci-intx-test")]
     check_pci_irq(BAR, address)?;
     check_pci_dma(DEVICE, BAR, address)?;
+    #[cfg(feature = "qemu-pci-intx-test")]
+    {
+        check_pci_msi(DEVICE, BAR, address)?;
+        open_pci_bar(DEVICE, BAR, 0, 0, 1)?;
+    }
     ruzt_ipc::delete(BAR)?;
     ruzt_ipc::delete(DEVICE)?;
     claim_pci_device(ROOTSRV_PCI_CONTROL, SPARE, address)?;
@@ -607,30 +612,10 @@ fn check_pci_irq(bar: u64, address: PciAddress) -> Result<(), ErrorCode> {
         claim_gsi(ROOTSRV_IRQ_CONTROL, SPARE, GSI, FLAGS),
         Err(ErrorCode::SlotOccupied)
     );
-
-    let mut request = IpcMessage {
-        label: console::CHECK_PCI_IRQ,
-        cap_count: 2,
-        ..IpcMessage::default()
-    };
-    let rights = CapRights::READ.union(CapRights::WRITE);
-    for (slot, cptr) in request.caps.iter_mut().zip([IRQ, bar]) {
-        *slot = CapTransferSlot { cptr, rights, badge: 0 };
-    }
-    ruzt_ipc::send(ROOTSRV_CONSOLE_REQUEST, &request)?;
-    let mut response = IpcMessage::default();
-    ruzt_ipc::recv(ROOTSRV_CONSOLE_REPLY, &mut response)?;
-    assert_eq!(response.label, console::PCI_IRQ_CHECKED);
+    exercise_pci_irq(IRQ, bar, false)?;
     assert_eq!(bind_irq(IRQ), Err(ErrorCode::SlotOccupied));
-
     ruzt_ipc::revoke(IRQ)?;
-    let request = IpcMessage {
-        label: console::CHECK_PCI_IRQ_REVOKED,
-        ..IpcMessage::default()
-    };
-    ruzt_ipc::send(ROOTSRV_CONSOLE_REQUEST, &request)?;
-    ruzt_ipc::recv(ROOTSRV_CONSOLE_REPLY, &mut response)?;
-    assert_eq!(response.label, console::PCI_IRQ_CHECKED);
+    check_pci_irq_revoked()?;
     assert_eq!(
         claim_gsi(ROOTSRV_IRQ_CONTROL, SPARE, GSI, FLAGS),
         Err(ErrorCode::SlotOccupied)
@@ -642,6 +627,83 @@ fn check_pci_irq(bar: u64, address: PciAddress) -> Result<(), ErrorCode> {
     unbind_irq(SPARE)?;
     ruzt_ipc::delete(SPARE)?;
     write_line("rootsrv: PCI INTx delivered, re-armed, revoked and reclaimed");
+    Ok(())
+}
+
+#[cfg(feature = "qemu-pci-intx-test")]
+fn check_pci_msi(device: u64, bar: u64, address: PciAddress) -> Result<(), ErrorCode> {
+    use ruzt_driver_sdk::{
+        allocate_dma_buffer, bind_dma, bind_irq, claim_msi, read_pci_config, unbind_dma, DMA_READ,
+    };
+    const BUFFER: u64 = 37;
+    const IRQ: u64 = 39;
+    const SPARE: u64 = 40;
+    const INTX_DISABLE: u32 = 1 << 10;
+
+    // QEMU sends MSI through the endpoint's bus-master address space.
+    allocate_dma_buffer(ROOTSRV_UNTYPED, BUFFER, 12)?;
+    bind_dma(device, BUFFER, DMA_READ)?;
+    let intx = read_pci_config(ROOTSRV_PCI_CONTROL, address, 4)? & INTX_DISABLE;
+    assert_eq!(claim_msi(ROOTSRV_IRQ_CONTROL, IRQ), Err(ErrorCode::InvalidCap));
+    ruzt_ipc::mint(device, SPARE, CapRights::READ, 0)?;
+    assert_eq!(claim_msi(SPARE, IRQ), Err(ErrorCode::CapRightsViolation));
+    ruzt_ipc::delete(SPARE)?;
+
+    claim_msi(device, IRQ)?;
+    exercise_pci_irq(IRQ, bar, true)?;
+    assert_eq!(bind_irq(IRQ), Err(ErrorCode::SlotOccupied));
+    assert_eq!(claim_msi(device, SPARE), Err(ErrorCode::SlotOccupied));
+    assert_eq!(read_pci_config(ROOTSRV_PCI_CONTROL, address, 4)? & INTX_DISABLE, INTX_DISABLE);
+    ruzt_ipc::revoke(IRQ)?;
+    check_pci_irq_revoked()?;
+    bind_irq(IRQ)?;
+    ruzt_ipc::delete(IRQ)?;
+    assert_eq!(read_pci_config(ROOTSRV_PCI_CONTROL, address, 4)? & INTX_DISABLE, intx);
+
+    claim_msi(device, SPARE)?;
+    exercise_pci_irq(SPARE, bar, true)?;
+    ruzt_ipc::revoke(device)?;
+    assert_eq!(bind_irq(SPARE), Err(ErrorCode::InvalidCap));
+    check_pci_irq_revoked()?;
+    assert_eq!(read_pci_config(ROOTSRV_PCI_CONTROL, address, 4)? & INTX_DISABLE, intx);
+    unbind_dma(device)?;
+    ruzt_ipc::delete(BUFFER)?;
+    write_line("rootsrv: PCI MSI delivered, coalesced, revoked and reclaimed");
+    Ok(())
+}
+
+#[cfg(feature = "qemu-pci-intx-test")]
+fn exercise_pci_irq(irq: u64, bar: u64, message: bool) -> Result<(), ErrorCode> {
+    let mut request = IpcMessage {
+        label: console::CHECK_PCI_IRQ,
+        cap_count: 2,
+        ..IpcMessage::default()
+    };
+    if message {
+        request.length = 1;
+        request.data[0] = 1;
+    }
+    let rights = CapRights::READ.union(CapRights::WRITE);
+    for (slot, cptr) in request.caps.iter_mut().zip([irq, bar]) {
+        *slot = CapTransferSlot { cptr, rights, badge: 0 };
+    }
+    ruzt_ipc::send(ROOTSRV_CONSOLE_REQUEST, &request)?;
+    let mut response = IpcMessage::default();
+    ruzt_ipc::recv(ROOTSRV_CONSOLE_REPLY, &mut response)?;
+    assert_eq!(response.label, console::PCI_IRQ_CHECKED);
+    Ok(())
+}
+
+#[cfg(feature = "qemu-pci-intx-test")]
+fn check_pci_irq_revoked() -> Result<(), ErrorCode> {
+    let request = IpcMessage {
+        label: console::CHECK_PCI_IRQ_REVOKED,
+        ..IpcMessage::default()
+    };
+    ruzt_ipc::send(ROOTSRV_CONSOLE_REQUEST, &request)?;
+    let mut response = IpcMessage::default();
+    ruzt_ipc::recv(ROOTSRV_CONSOLE_REPLY, &mut response)?;
+    assert_eq!(response.label, console::PCI_IRQ_CHECKED);
     Ok(())
 }
 

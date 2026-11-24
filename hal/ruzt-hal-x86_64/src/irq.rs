@@ -5,6 +5,7 @@ use spin::{Mutex, Once};
 
 use crate::{
     apic::{Input, IoApic, LocalApic},
+    pci::Msi,
     pic,
     vtd::InterruptTable,
 };
@@ -25,7 +26,7 @@ pub const CASCADE: usize = 2;
 struct ApicRoutes {
     local: LocalApic,
     inputs: [Option<Input>; ISA_IRQ_COUNT],
-    extended: Mutex<[Option<GsiInput>; IRQ_COUNT - ISA_IRQ_COUNT]>,
+    extended: Mutex<[Option<ExtendedRoute>; IRQ_COUNT - ISA_IRQ_COUNT]>,
     remapping: Option<IoApicRemapping>,
 }
 
@@ -52,16 +53,46 @@ impl IoApicRemapping {
 }
 
 #[derive(Clone, Copy)]
-struct GsiInput {
-    gsi: u32,
-    input: Input,
-    retired: bool,
+enum ExtendedInput {
+    Gsi { gsi: u32, input: Input },
+    Msi(Msi),
+}
+
+impl ExtendedInput {
+    fn same_source(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Gsi { gsi: a, .. }, Self::Gsi { gsi: b, .. }) => a == b,
+            (Self::Msi(a), Self::Msi(b)) => a.function() == b.function(),
+            _ => false,
+        }
+    }
+
+    fn idle(self) -> bool {
+        match self {
+            Self::Gsi { input, .. } => input.delivery_idle(),
+            // MSI enters retirement only after disabling the endpoint.
+            Self::Msi(_) => true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lease {
+    Live,
+    Retired,
+    Quarantined,
+}
+
+#[derive(Clone, Copy)]
+struct ExtendedRoute {
+    source: ExtendedInput,
+    lease: Lease,
 }
 
 /// Why an extended I/O APIC line could not be reserved.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ReserveError {
-    /// The I/O APIC backend is inactive.
+    /// The required interrupt backend is inactive.
     Unavailable,
     /// This GSI is claimed or its previous delivery is still draining.
     Occupied,
@@ -69,6 +100,10 @@ pub enum ReserveError {
     NoVector,
     /// The remapper failed to synchronize its table.
     RemappingFailed,
+    /// The PCI endpoint did not accept the requested interrupt state.
+    DeviceFailed,
+    /// The local APIC still has an interrupt from an earlier binding.
+    PendingDelivery,
 }
 
 static APIC: Once<ApicRoutes> = Once::new();
@@ -145,13 +180,30 @@ pub fn is_device_irq(line: u32) -> bool {
 /// Call on the boot CPU with local interrupts disabled. The input must
 /// designate this GSI's unique controller pin, outside the ISA and NMI routes.
 pub unsafe fn reserve_gsi(gsi: u32, input: Input) -> Result<u32, ReserveError> {
+    reserve_extended(ExtendedInput::Gsi { gsi, input })
+}
+
+/// Reserve one source-validated message interrupt for an exclusive endpoint.
+///
+/// # Safety
+/// Call on the boot CPU with interrupts disabled. The device lease must
+/// remain exclusive until the IRQ is retired, and the active remapper must
+/// cover the endpoint's exact requester ID.
+pub unsafe fn reserve_msi(msi: Msi) -> Result<u32, ReserveError> {
+    reserve_extended(ExtendedInput::Msi(msi))
+}
+
+fn reserve_extended(source: ExtendedInput) -> Result<u32, ReserveError> {
     let routes = APIC.get().ok_or(ReserveError::Unavailable)?;
+    if matches!(source, ExtendedInput::Msi(_)) && routes.remapping.is_none() {
+        return Err(ReserveError::Unavailable);
+    }
     let mut extended = routes.extended.lock();
     for (index, slot) in extended.iter_mut().enumerate() {
         if let Some(old) = slot {
             // Drain deliveries issued before masking before reusing a vector
             // for another input or reprogramming the retired pin.
-            if old.retired && old.input.delivery_idle() {
+            if old.lease == Lease::Retired && old.source.idle() {
                 if let Some(mapping) = &routes.remapping {
                     mapping
                         .table
@@ -160,14 +212,13 @@ pub unsafe fn reserve_gsi(gsi: u32, input: Input) -> Result<u32, ReserveError> {
                 }
                 // Interrupt-cache invalidation drains the remapper before
                 // checking the receiving CPU for the previous delivery.
-                if old.input.delivery_idle()
-                    && routes.local.vector_idle(VECTOR_BASE + extended_line(index))
+                if old.source.idle() && routes.local.vector_idle(VECTOR_BASE + extended_line(index))
                 {
                     *slot = None;
                     continue;
                 }
             }
-            if old.gsi == gsi {
+            if old.source.same_source(source) {
                 return Err(ReserveError::Occupied);
             }
         }
@@ -179,12 +230,20 @@ pub unsafe fn reserve_gsi(gsi: u32, input: Input) -> Result<u32, ReserveError> {
         .ok_or(ReserveError::NoVector)?;
     let line = extended_line(index);
     let remap_index = if let Some(mapping) = &routes.remapping {
-        mapping.stage(input, line, routes.local.id());
+        match source {
+            ExtendedInput::Gsi { input, .. } => mapping.stage(input, line, routes.local.id()),
+            ExtendedInput::Msi(msi) => mapping.table.stage(
+                line,
+                msi.function(),
+                VECTOR_BASE + line,
+                routes.local.id(),
+                false,
+            ),
+        }
         if mapping.table.sync().is_err() {
-            *slot = Some(GsiInput {
-                gsi,
-                input,
-                retired: true,
+            *slot = Some(ExtendedRoute {
+                source,
+                lease: Lease::Quarantined,
             });
             return Err(ReserveError::RemappingFailed);
         }
@@ -192,25 +251,74 @@ pub unsafe fn reserve_gsi(gsi: u32, input: Input) -> Result<u32, ReserveError> {
     } else {
         None
     };
-    input.configure(VECTOR_BASE + line, routes.local.id(), remap_index);
-    *slot = Some(GsiInput {
-        gsi,
-        input,
-        retired: false,
+    match source {
+        ExtendedInput::Gsi { input, .. } => {
+            input.configure(VECTOR_BASE + line, routes.local.id(), remap_index);
+        }
+        ExtendedInput::Msi(msi) => {
+            // VT-d §5.1.5.2. SHV=1 with a zero subhandle selects this IRTE.
+            let address = 0xfee0_0018 | (u32::from(line) << 5);
+            if !msi.program(address) {
+                let lease = if stop_msi(routes, msi, line) {
+                    Lease::Retired
+                } else {
+                    Lease::Quarantined
+                };
+                *slot = Some(ExtendedRoute { source, lease });
+                return Err(ReserveError::DeviceFailed);
+            }
+        }
+    }
+    *slot = Some(ExtendedRoute {
+        source,
+        lease: Lease::Live,
     });
     Ok(u32::from(line))
 }
 
-/// Mask a released extended route and retire its vector.
-pub fn release_gsi(line: u32) {
-    if let Some(index) = (line as usize).checked_sub(ISA_IRQ_COUNT) {
-        if let Some(routes) = APIC.get() {
-            if let Some(Some(route)) = routes.extended.lock().get_mut(index) {
-                route.input.set_enabled(false);
-                route.retired = true;
-            }
+/// Mask a released route. On failure the caller must keep its PCI lease pinned.
+pub fn release_extended(line: u32) -> bool {
+    let Some((routes, index)) = extended_index(line) else {
+        return true;
+    };
+    let mut extended = routes.extended.lock();
+    let Some(route) = &mut extended[index] else {
+        return true;
+    };
+    let stopped = match route.source {
+        ExtendedInput::Gsi { input, .. } => {
+            input.set_enabled(false);
+            true
         }
-    }
+        ExtendedInput::Msi(msi) => stop_msi(routes, msi, line as u8),
+    };
+    route.lease = if stopped {
+        Lease::Retired
+    } else {
+        Lease::Quarantined
+    };
+    stopped
+}
+
+fn stop_msi(routes: &ApicRoutes, msi: Msi, line: u8) -> bool {
+    let disabled = msi.set_enabled(false);
+    let table = routes.remapping.as_ref().expect("MSI uses remapping").table;
+    // Attempt to block the IRTE even if the endpoint did not confirm masking.
+    let drained = table.retire(line).is_ok();
+    disabled && drained && msi.restore_intx()
+}
+
+/// Whether this logical line carries PCI interrupt messages.
+pub fn is_message_irq(line: u32) -> bool {
+    extended_index(line).is_some_and(|(routes, index)| {
+        routes.extended.lock()[index]
+            .is_some_and(|route| matches!(route.source, ExtendedInput::Msi(_)))
+    })
+}
+
+fn extended_index(line: u32) -> Option<(&'static ApicRoutes, usize)> {
+    let index = (line as usize).checked_sub(ISA_IRQ_COUNT)?;
+    (line < IRQ_COUNT as u32).then_some((APIC.get()?, index))
 }
 
 fn extended_line(index: usize) -> u8 {
@@ -227,11 +335,11 @@ pub struct X86_64IrqController;
 
 impl IrqController for X86_64IrqController {
     fn enable(irq: IrqNumber) {
-        set_enabled(irq.0, true);
+        let _ = set_enabled(irq.0, true);
     }
 
     fn disable(irq: IrqNumber) {
-        set_enabled(irq.0, false);
+        let _ = set_enabled(irq.0, false);
     }
 
     fn route(_irq: IrqNumber, _cpu: u32) {
@@ -249,20 +357,42 @@ impl IrqController for X86_64IrqController {
     }
 }
 
-fn set_enabled(line: u32, enabled: bool) {
+/// Change a route's delivery state and report any hardware failure.
+pub fn set_enabled(line: u32, enabled: bool) -> Result<(), ReserveError> {
     match APIC.get() {
         Some(routes) => {
             let line = line as usize;
             if let Some(index) = line.checked_sub(ISA_IRQ_COUNT) {
-                if let Some(Some(route)) = routes.extended.lock().get(index) {
-                    if !route.retired {
-                        route.input.set_enabled(enabled);
-                    }
+                let mut extended = routes.extended.lock();
+                let Some(Some(route)) = extended.get_mut(index) else {
+                    return Ok(());
+                };
+                if route.lease != Lease::Live {
+                    return Err(ReserveError::Unavailable);
                 }
+                match route.source {
+                    ExtendedInput::Gsi { input, .. } => input.set_enabled(enabled),
+                    ExtendedInput::Msi(msi) => {
+                        let table = routes.remapping.as_ref().expect("MSI uses remapping").table;
+                        if enabled {
+                            // Complete old messages before allowing a new binding.
+                            table.sync().map_err(|_| ReserveError::RemappingFailed)?;
+                            if !routes.local.vector_idle(VECTOR_BASE + line as u8) {
+                                return Err(ReserveError::PendingDelivery);
+                            }
+                        }
+                        if !msi.set_enabled(enabled) {
+                            route.lease = Lease::Quarantined;
+                            let _ = table.retire(line as u8);
+                            return Err(ReserveError::DeviceFailed);
+                        }
+                    }
+                };
             } else if let Some(input) = routes.inputs[line] {
                 input.set_enabled(enabled);
             }
         }
         None => pic::set_enabled(line, enabled),
     }
+    Ok(())
 }

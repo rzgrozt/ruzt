@@ -577,6 +577,16 @@ impl CSpace {
         })
     }
 
+    pub(crate) fn claim_msi(&mut self, source: u64, destination: u64) -> Result<(), ErrorCode> {
+        self.allocate_device_object(source, destination, |cap| {
+            let CapType::PciDevice(device) = cap else {
+                return Err(ErrorCode::InvalidCap);
+            };
+            let (object, irq_num) = object::allocate_msi(KObjectId(device))?;
+            Ok((object, CapType::Irq { irq_num, id: object.0 }))
+        })
+    }
+
     pub(crate) fn open_pci_bar(
         &mut self,
         source: u64,

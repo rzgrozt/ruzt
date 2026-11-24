@@ -80,6 +80,13 @@ pub enum KernelObject {
         /// Hardware IRQ line number.
         irq_num: u32,
     },
+    /// An IRQ backed by one PCI MSI message.
+    MsiIrq {
+        /// Logical IRQ number.
+        irq_num: u32,
+        /// Keeps the exclusive PCI function leased through interrupt teardown.
+        device: KObjectId,
+    },
     /// An exclusive lease on a firmware-configured PCI function.
     PciDevice {
         /// PCI bus, device and function.
@@ -204,6 +211,30 @@ pub(super) fn allocate_gsi(gsi: u32, flags: u64) -> Result<(KObjectId, u32), Err
     let irq_num = crate::apic::reserve_gsi(gsi, flags)?;
     let entry = &mut table[id.index()];
     entry.object = Some(KernelObject::Irq { irq_num });
+    entry.generation += 1;
+    Ok((id, irq_num))
+}
+
+pub(super) fn allocate_msi(device: KObjectId) -> Result<(KObjectId, u32), ErrorCode> {
+    let mut table = TABLE.lock();
+    if table.iter().any(|entry| {
+        matches!(entry.object, Some(KernelObject::MsiIrq { device: live, .. }) if live == device)
+    }) {
+        return Err(ErrorCode::SlotOccupied);
+    }
+    let id = vacant_id(&table[..])?;
+    let parent = &mut table[device.index()];
+    if !parent.matches(device) {
+        return Err(ErrorCode::InvalidCap);
+    }
+    let Some(KernelObject::PciDevice { address, .. }) = parent.object else {
+        return Err(ErrorCode::InvalidCap);
+    };
+    let references = parent.references.checked_add(1).ok_or(ErrorCode::NoMemory)?;
+    let irq_num = crate::irq::reserve_msi(address)?;
+    parent.references = references;
+    let entry = &mut table[id.index()];
+    entry.object = Some(KernelObject::MsiIrq { irq_num, device });
     entry.generation += 1;
     Ok((id, irq_num))
 }
@@ -716,7 +747,16 @@ fn destroy(object: KernelObject, backing: Option<UntypedAllocation>) {
                 frame::deallocate_contiguous(phys, 1 << (size_bits - PAGE_BITS));
             }
         }
-        KernelObject::Irq { irq_num } => crate::irq::release(irq_num),
+        KernelObject::Irq { irq_num } => {
+            crate::irq::release(irq_num);
+        }
+        KernelObject::MsiIrq { irq_num, device } => {
+            if crate::irq::release(irq_num) {
+                release(device);
+            } else {
+                crate::serial_println!("PCI device lease remains pinned after MSI teardown failed");
+            }
+        }
         KernelObject::Mmio { device, .. } => {
             release(device);
         }

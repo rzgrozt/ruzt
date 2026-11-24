@@ -2,6 +2,9 @@
 
 use x86_64::instructions::port::{Port, PortWriteOnly};
 
+mod msi;
+pub use msi::Msi;
+
 const CONFIG_ADDRESS: u16 = 0xcf8;
 const CONFIG_DATA: u16 = 0xcfc;
 const COMMAND: u8 = 4;
@@ -44,10 +47,13 @@ fn write_config(function: u16, offset: u8, value: u32) {
 }
 
 fn write_command(function: u16, value: u16) {
-    select(function, COMMAND);
-    // SAFETY: A word write changes PCI_COMMAND without touching the
-    // write-one-to-clear PCI_STATUS register in the upper half.
-    unsafe { PortWriteOnly::<u16>::new(CONFIG_DATA).write(value) };
+    write_word(function, COMMAND, value);
+}
+
+fn write_word(function: u16, offset: u8, value: u16) {
+    select(function, offset);
+    // SAFETY: Write the selected word without touching adjacent status bits.
+    unsafe { PortWriteOnly::<u16>::new(CONFIG_DATA + u16::from(offset & 2)).write(value) };
 }
 
 /// Set or clear bus mastering on a PCI function.

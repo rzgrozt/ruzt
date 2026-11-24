@@ -97,6 +97,15 @@ pub(crate) fn permits_pci_handoff(address: PciAddress) -> bool {
         .is_some_and(|controller| controller.protects_requester(address))
 }
 
+pub(crate) fn permits_msi(address: PciAddress) -> bool {
+    CONTROLLER.get().is_some_and(|controller| {
+        controller.protects_requester(address)
+            && controller.interrupts.as_ref().is_some_and(|topology| {
+                !topology.ioapics.contains(&Some(address.bits()))
+            })
+    })
+}
+
 pub(crate) fn prepare_ioapic_remapping(
     ioapic_ids: impl IntoIterator<Item = u8>,
     x2apic: bool,

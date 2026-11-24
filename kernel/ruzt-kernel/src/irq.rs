@@ -1,8 +1,11 @@
 //! Capability-owned device interrupt routes on the boot CPU.
 
-use ruzt_abi::ErrorCode;
+use ruzt_abi::{ErrorCode, PciAddress};
 use ruzt_hal::irq::{IrqController, IrqNumber};
-use ruzt_hal_x86_64::irq::{self as hardware, X86_64IrqController, IRQ_COUNT};
+use ruzt_hal_x86_64::{
+    irq::{self as hardware, ReserveError, X86_64IrqController, IRQ_COUNT},
+    pci::Msi,
+};
 use spin::Mutex;
 
 use crate::cap::cspace::CapabilityPath;
@@ -13,6 +16,7 @@ enum State {
     Armed,
     Pending,
     AwaitingAck,
+    AwaitingAckPending,
 }
 
 #[derive(Clone, Copy)]
@@ -20,24 +24,45 @@ struct Route {
     thread: ThreadId,
     authority: CapabilityPath,
     state: State,
+    message: bool,
 }
 
 static ROUTES: Mutex<[Option<Route>; IRQ_COUNT]> = Mutex::new([None; IRQ_COUNT]);
 
 // Route transitions originate in an interrupt gate or run with local
 // interrupts disabled. No hardware port operations are needed by host tests.
-fn enable(line: u32) {
+fn set_enabled(line: u32, enabled: bool) -> Result<(), ErrorCode> {
     #[cfg(not(test))]
-    X86_64IrqController::enable(IrqNumber(line));
+    return hardware::set_enabled(line, enabled).map_err(hardware_error);
     #[cfg(test)]
-    let _ = line;
+    {
+        let _ = (line, enabled);
+        Ok(())
+    }
 }
 
-fn disable(line: u32) {
-    #[cfg(not(test))]
-    X86_64IrqController::disable(IrqNumber(line));
-    #[cfg(test)]
-    let _ = line;
+pub(crate) fn hardware_error(error: ReserveError) -> ErrorCode {
+    match error {
+        ReserveError::Unavailable => ErrorCode::NotFound,
+        ReserveError::Occupied => ErrorCode::SlotOccupied,
+        ReserveError::NoVector => ErrorCode::NoMemory,
+        ReserveError::RemappingFailed | ReserveError::DeviceFailed => ErrorCode::NotImplemented,
+        ReserveError::PendingDelivery => ErrorCode::WouldBlock,
+    }
+}
+
+pub(crate) fn reserve_msi(address: PciAddress) -> Result<u32, ErrorCode> {
+    if !crate::iommu::permits_msi(address) {
+        return Err(ErrorCode::NotFound);
+    }
+    #[allow(unsafe_code)]
+    // SAFETY: The object table owns an exclusive function lease, and the
+    // boot CPU serializes its configuration cycles with interrupts disabled.
+    let msi = unsafe { Msi::inspect(address.bits()) }.ok_or(ErrorCode::NotFound)?;
+    #[allow(unsafe_code)]
+    // SAFETY: VT-d covers this exact direct requester and the IRQ object
+    // retains the function lease until the MSI is stopped and drained.
+    unsafe { hardware::reserve_msi(msi) }.map_err(hardware_error)
 }
 
 pub(crate) fn bind(
@@ -50,12 +75,13 @@ pub(crate) fn bind(
     if route.is_some() {
         return Err(ErrorCode::SlotOccupied);
     }
+    set_enabled(line, true)?;
     *route = Some(Route {
         thread,
         authority,
         state: State::Armed,
+        message: hardware::is_message_irq(line),
     });
-    enable(line);
     Ok(())
 }
 
@@ -81,20 +107,25 @@ pub(crate) fn consume(line: u32, thread: ThreadId) -> Result<bool, ErrorCode> {
 pub(crate) fn acknowledge(line: u32, thread: ThreadId) -> Result<(), ErrorCode> {
     let mut routes = ROUTES.lock();
     let route = owned_route(&mut routes, line, thread)?;
-    if route.state != State::AwaitingAck {
-        return Err(ErrorCode::BadMessage);
-    }
-    route.state = State::Armed;
-    enable(line);
+    route.state = match route.state {
+        State::AwaitingAckPending => State::Pending,
+        State::AwaitingAck => {
+            if !route.message {
+                set_enabled(line, true)?;
+            }
+            State::Armed
+        }
+        _ => return Err(ErrorCode::BadMessage),
+    };
     Ok(())
 }
 
 pub(crate) fn unbind(line: u32, thread: ThreadId) -> Result<(), ErrorCode> {
     let mut routes = ROUTES.lock();
     owned_route(&mut routes, line, thread)?;
-    disable(line);
+    let disabled = set_enabled(line, false);
     routes[line as usize] = None;
-    Ok(())
+    disabled
 }
 
 fn owned_route(
@@ -111,21 +142,21 @@ fn owned_route(
 
 fn remove_route(line: u32) {
     let mut routes = ROUTES.lock();
-    disable(line);
+    let _ = set_enabled(line, false);
     routes[line as usize] = None;
 }
 
 /// Detach the hardware line after its last capability disappears.
-pub(crate) fn release(line: u32) {
+pub(crate) fn release(line: u32) -> bool {
     remove_route(line);
-    hardware::release_gsi(line);
+    hardware::release_extended(line)
 }
 
 pub(crate) fn detach_thread(thread: ThreadId) {
     let mut routes = ROUTES.lock();
     for (line, route) in routes.iter_mut().enumerate() {
         if route.is_some_and(|route| route.thread == thread) {
-            disable(line as u32);
+            let _ = set_enabled(line as u32, false);
             *route = None;
         }
     }
@@ -145,16 +176,20 @@ pub(crate) fn detach_revoked() {
     }
 }
 
-/// Mask an armed interrupt until the driver consumes it and acknowledges it.
-/// Return the owner to wake after dropping the routing lock.
+/// Record a device delivery and return the owner to wake after dropping the lock.
 fn latch(line: u32) -> Option<ThreadId> {
     let mut routes = ROUTES.lock();
     let route = routes[line as usize].as_mut()?;
     if route.state == State::Armed {
-        disable(line);
+        if !route.message {
+            let _ = set_enabled(line, false);
+        }
         route.state = State::Pending;
         Some(route.thread)
     } else {
+        if route.message && route.state == State::AwaitingAck {
+            route.state = State::AwaitingAckPending;
+        }
         None
     }
 }
@@ -172,7 +207,11 @@ pub(crate) fn on_interrupt(line: u8) {
         }
     } else {
         // Unclaimed lines stay masked, including stray interrupts.
-        disable(u32::from(line));
+        // Keep any live message source enabled while its driver consumes
+        // or acknowledges a pending event. Subsequent messages coalesce.
+        if !ROUTES.lock()[usize::from(line)].is_some_and(|route| route.message) {
+            let _ = set_enabled(u32::from(line), false);
+        }
     }
     end_of_interrupt(line);
 }

@@ -209,6 +209,7 @@ fn check_pci_irq(request: &IpcMessage) -> Result<(), ErrorCode> {
     const CLEAR: u64 = 0x64;
     let irq = request.caps[0].cptr;
     let bar = request.caps[1].cptr;
+    let message = request.length == 1 && request.data[0] == 1;
     let registers = map_mmio(bar, DEVICE_WINDOW, true)?;
     let probe = (|| {
         bind_irq(irq)?;
@@ -216,7 +217,10 @@ fn check_pci_irq(request: &IpcMessage) -> Result<(), ErrorCode> {
             // SAFETY: The test supervisor delegates the EDU BAR0 register
             // page. These offsets are its dword interrupt registers.
             unsafe {
-                registers.write_u32(RAISE, bit)?;
+                // The MSI case queues the second edge before acknowledging the first.
+                if bit == 1 || !message {
+                    registers.write_u32(RAISE, bit)?;
+                }
                 let deadline = ruzt_runtime::syscall::monotonic_ns()? + 1_000_000_000;
                 let event = ruzt_ipc::wait_any_until(&[irq], deadline)?;
                 if event.kind != WAIT_IRQ || registers.read_u32(STATUS)? != bit {
@@ -226,6 +230,11 @@ fn check_pci_irq(request: &IpcMessage) -> Result<(), ErrorCode> {
                 // Read back the posted MMIO write before unmasking the pin.
                 if registers.read_u32(STATUS)? != 0 {
                     return Err(ErrorCode::BadMessage);
+                }
+                if message && bit == 1 {
+                    registers.write_u32(RAISE, 2)?;
+                    let until = ruzt_runtime::syscall::monotonic_ns()? + 20_000_000;
+                    ruzt_runtime::syscall::sleep_until(until)?;
                 }
             }
             acknowledge_irq(irq)?;
