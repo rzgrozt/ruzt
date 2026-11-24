@@ -4,12 +4,13 @@ use ruzt_abi::{ErrorCode as AbiErrorCode, RetypeKind, SyscallArgs};
 use ruzt_cap::CapType;
 
 use crate::cap::ops::{cap_delete, cap_mint, cap_move, CapOp};
+use crate::transaction::Transaction;
 
 /// The `invoke` syscall handler.
 ///
 /// Reads the capability pointer from the current thread's CSpace, decodes the
 /// operation, and dispatches to the appropriate handler.
-pub fn invoke(args: &SyscallArgs) -> u64 {
+pub(crate) fn invoke(transaction: &mut Transaction, args: &SyscallArgs) -> u64 {
     crate::serial_println!("invoke: cptr={} op={}", args.arg0, args.arg1);
     let cptr = args.arg0;
     let op = CapOp::from(args.arg1, args);
@@ -73,25 +74,26 @@ pub fn invoke(args: &SyscallArgs) -> u64 {
         }
         CapOp::Send => {
             match slot.cap_type {
-                CapType::Endpoint(id) => crate::ipc::endpoint_send(id, args),
+                CapType::Endpoint(id) => crate::ipc::endpoint_send(transaction, id, args),
                 _ => AbiErrorCode::InvalidCap.as_u64(),
             }
         }
         CapOp::Recv => {
             match slot.cap_type {
-                CapType::Endpoint(id) => crate::ipc::endpoint_recv(id, args),
+                CapType::Endpoint(id) => crate::ipc::endpoint_recv(transaction, id, args),
                 _ => AbiErrorCode::InvalidCap.as_u64(),
             }
         }
         CapOp::Signal => {
             match slot.cap_type {
-                CapType::Notification(id) => crate::ipc::notification_signal(id),
+                CapType::Notification(id) => crate::ipc::notification_signal(transaction, id),
                 _ => AbiErrorCode::InvalidCap.as_u64(),
             }
         }
         CapOp::Wait => {
             match slot.cap_type {
-                CapType::Notification(id) => crate::ipc::notification_wait(id),
+                CapType::Notification(id) => crate::ipc::wait_notification(transaction, id, None)
+                    .map_or_else(AbiErrorCode::as_u64, |()| AbiErrorCode::Ok.as_u64()),
                 _ => AbiErrorCode::InvalidCap.as_u64(),
             }
         }

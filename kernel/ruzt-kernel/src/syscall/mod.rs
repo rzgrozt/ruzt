@@ -8,6 +8,8 @@ pub mod user_mem;
 
 use ruzt_abi::{ErrorCode, ProcessStatus, SyscallArgs, SyscallNumber, PROCESS_EXITED};
 
+use crate::transaction;
+
 /// Initialise the syscall entry point.
 ///
 /// Called once after IDT initialisation, before any user thread exists.
@@ -26,16 +28,19 @@ pub(crate) extern "C" fn syscall_dispatch(args: &SyscallArgs, caller_cs: u64) ->
     #[cfg(feature = "qemu-hardening-test")]
     crate::exceptions::assert_entry_flags();
     let from_user = caller_cs & 3 == 3;
+    let mut transaction = transaction::enter();
     match SyscallNumber::from(args.number) {
         // The shared kernel CSpace serves only the internal IPC self-test.
         SyscallNumber::Invoke if from_user => {
-            user::invoke(args).map_or_else(ErrorCode::as_u64, |()| ErrorCode::Ok.as_u64())
+            user::invoke(&mut transaction, args)
+                .map_or_else(ErrorCode::as_u64, |()| ErrorCode::Ok.as_u64())
         }
-        SyscallNumber::Invoke => invoke::invoke(args),
+        SyscallNumber::Invoke => invoke::invoke(&mut transaction, args),
         SyscallNumber::WaitAny if from_user => {
-            user::wait_any(args, None).map_or_else(ErrorCode::as_u64, |()| ErrorCode::Ok.as_u64())
+            user::wait_any(&mut transaction, args, None)
+                .map_or_else(ErrorCode::as_u64, |()| ErrorCode::Ok.as_u64())
         }
-        SyscallNumber::WaitAnyUntil if from_user => user::wait_any(args, Some(args.arg5))
+        SyscallNumber::WaitAnyUntil if from_user => user::wait_any(&mut transaction, args, Some(args.arg5))
             .map_or_else(ErrorCode::as_u64, |()| ErrorCode::Ok.as_u64()),
         SyscallNumber::MonotonicTime if from_user => user::monotonic_time(args.arg0)
             .map_or_else(ErrorCode::as_u64, |()| ErrorCode::Ok.as_u64()),
@@ -46,6 +51,7 @@ pub(crate) extern "C" fn syscall_dispatch(args: &SyscallArgs, caller_cs: u64) ->
         SyscallNumber::Exit if from_user => {
             let code = args.arg0 as u32;
             crate::process::terminate_current(
+                transaction,
                 ProcessStatus {
                     kind: PROCESS_EXITED,
                     code,

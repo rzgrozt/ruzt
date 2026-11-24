@@ -179,7 +179,7 @@ pub(crate) fn detach_thread(thread: ThreadId) {
 pub(crate) fn detach_revoked() {
     for line in 0..IRQ_COUNT {
         // Copy one route without nesting the route and capability tree locks.
-        // The boot CPU has interrupts disabled, so delivery cannot interleave.
+        // The kernel transaction excludes device delivery until removal completes.
         let route = ROUTES.lock()[line];
         if let Some(route) = route {
             if !route.authority.is_live() {
@@ -212,6 +212,7 @@ pub(crate) fn on_interrupt(line: u8) {
     if hardware::dismiss_spurious(line) {
         return;
     }
+    let _transaction = crate::transaction::enter();
     if let Some(thread) = latch(u32::from(line)) {
         sched::wake_irq(thread, u32::from(line));
     } else if u32::from(line) == crate::keyboard::IRQ {

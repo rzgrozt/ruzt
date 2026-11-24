@@ -22,7 +22,9 @@ Double faults switch to a dedicated supervisor stack with an unmapped guard page
 
 The x86-64 bootstrap starts firmware-enabled secondary CPUs with INIT and SIPI messages. Each secondary switches to the permanent supervisor mappings, installs its own descriptor tables and guarded stacks, and acknowledges a fixed IPI before the kernel reclaims the temporary startup pages.
 
-Each online x86-64 scheduler CPU has its own round-robin run queue and idle context. An idle CPU can steal a kernel worker once its previous CPU has saved its registers and switched stacks. The PIT routes through the BSP, which sends reschedule IPIs to secondary CPUs. User tasks and the kernel IPC test stay on the BSP while their wait registration relies on local interrupt masking. The four-CPU BIOS and UEFI QEMU fixtures migrate a saved worker across secondaries and verify that all worker stacks are reclaimed.
+Each online x86-64 scheduler CPU has its own round-robin run queue and idle context. An idle CPU can steal a kernel worker once its previous CPU has saved its registers and switched stacks. The PIT routes through the BSP, which sends reschedule IPIs to secondary CPUs. User tasks stay on the BSP while device interrupt allocation consults its local APIC. The four-CPU BIOS and UEFI QEMU fixtures migrate a saved worker across secondaries and verify that all worker stacks are reclaimed.
+
+Syscalls, device interrupt delivery, timeout processing, and user process cleanup serialize capability operations and IPC through a shared kernel transaction. Blocking calls register the wait before releasing the transaction, then reacquire it after resuming. Waking a thread on another CPU sends a reschedule IPI. The four-CPU fixtures verify a blocking endpoint rendezvous between secondary CPUs.
 
 Page-table removal waits for TLB acknowledgements from online CPUs before returning the old frame or freeing detached tables. A CPU waiting for the mapper lock can service the invalidation with interrupts disabled. The four-CPU fixtures verify replacement mappings in both the shared supervisor half and a user root active on the secondaries.
 

@@ -11,6 +11,7 @@ use ruzt_hal_x86_64::time::X86_64Timer;
 use super::{poll_packet, take_notification, ReceiveSlots};
 use crate::cap::cspace::CapabilityPath;
 use crate::cap::object::{self, KObjectId, KernelObject};
+use crate::transaction::Transaction;
 use crate::{irq, keyboard, sched};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -51,9 +52,10 @@ impl Source {
     }
 }
 
-/// Called with interrupts disabled. Readiness, consumption, and wait
-/// registration are atomic with respect to event producers on this CPU.
+/// Readiness, consumption, and wait registration share the transaction
+/// with event producers. Each retry runs under a new acquisition.
 pub(crate) fn wait_any(
+    transaction: &mut Transaction,
     sources: &Sources,
     slots: ReceiveSlots,
     deadline: Option<u64>,
@@ -83,7 +85,7 @@ pub(crate) fn wait_any(
         {
             keyboard::trace_wait();
         }
-        sched::block_wait_any(sources, deadline);
+        sched::block_wait_any(transaction, sources, deadline);
         sched::check_ipc_completion()?;
     }
 }
@@ -121,6 +123,7 @@ mod tests {
     #[test]
     fn simultaneous_notifications_are_selected_in_order_and_consumed_once() {
         let _state = crate::isolated_kernel_state();
+        let mut transaction = crate::transaction::enter();
         let mut space = CSpace::new(1);
         let mut sources = Sources::default();
         let mut ids = [KObjectId(0); 2];
@@ -143,14 +146,14 @@ mod tests {
             object::set_notification_state(id, true);
         }
         for expected in 0..2 {
-            let event = wait_any(&sources, ReceiveSlots::default(), Some(0)).unwrap();
+            let event = wait_any(&mut transaction, &sources, ReceiveSlots::default(), Some(0)).unwrap();
             assert_eq!((event.index, event.kind), (expected, WAIT_NOTIFICATION));
         }
         for id in ids {
             assert!(!take_notification(id).unwrap());
         }
         assert_eq!(
-            wait_any(&sources, ReceiveSlots::default(), Some(0)),
+            wait_any(&mut transaction, &sources, ReceiveSlots::default(), Some(0)),
             Err(ErrorCode::TimedOut)
         );
     }

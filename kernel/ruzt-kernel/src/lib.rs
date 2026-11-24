@@ -20,6 +20,7 @@ mod iommu;
 mod irq;
 mod pci;
 mod smp;
+mod transaction;
 pub mod serial;
 pub mod vga;
 pub mod exceptions;
@@ -143,7 +144,10 @@ pub fn main(boot_info: &'static mut BootInfo) -> ! {
     sched::qemu::enqueue();
     smp::start_scheduling();
     #[cfg(all(feature = "qemu-smp-test", not(test)))]
-    sched::qemu::verify();
+    {
+        sched::qemu::verify();
+        sched::qemu::verify_ipc();
+    }
     serial_println!("Scheduler initialised.");
     advance_screen();
 

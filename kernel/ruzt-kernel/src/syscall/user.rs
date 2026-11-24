@@ -14,6 +14,7 @@ use x86_64::instructions::port::{PortReadOnly, PortWriteOnly};
 
 use super::user_mem;
 use crate::cap::ops::{cap_delete, cap_mint, cap_move};
+use crate::transaction::Transaction;
 use crate::{iommu, ipc, irq, process, sched};
 
 const DATA_OFFSET: usize = offset_of!(IpcMessage, data);
@@ -25,7 +26,7 @@ const CPTR_OFFSET: usize = offset_of!(CapTransferSlot, cptr);
 const RIGHTS_OFFSET: usize = offset_of!(CapTransferSlot, rights);
 const BADGE_OFFSET: usize = offset_of!(CapTransferSlot, badge);
 
-pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
+pub(crate) fn invoke(transaction: &mut Transaction, args: &SyscallArgs) -> Result<(), ErrorCode> {
     let operation = args.arg1;
     if operation == CapOp::ClaimPciDevice as u64 {
         let address = pci_address(args.arg3)?;
@@ -150,7 +151,7 @@ pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
         if result.is_ok()
             && (operation == CapOp::Revoke as u64 || operation == CapOp::Delete as u64)
         {
-            sched::apply_capability_removals();
+            sched::apply_capability_removals(transaction);
         }
         return result;
     }
@@ -165,12 +166,13 @@ pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
         ))
     })
     .ok_or(ErrorCode::InvalidCap)??;
-    // Capability lookup is complete and the scheduler lock is released before
-    // any operation can block. User invocation currently runs on one CPU.
+    // The scheduler lock is free. The transaction keeps the capability and
+    // target valid until the operation commits or registers a wait.
     match capability.cap_type {
         CapType::Endpoint(id) if args.arg1 == CapOp::Send as u64 => {
             require(capability.rights, CapRights::WRITE)?;
             ipc::send_packet(
+                transaction,
                 id,
                 authority,
                 read_packet(root, args.arg2, capability.rights)?,
@@ -181,7 +183,7 @@ pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
             // Reject bad buffers before consuming a pending sender or blocking.
             validate_blocking_output(root, args.arg2, size_of::<IpcMessage>())?;
             let slots = receive_slots(args.arg3, args.arg4)?;
-            let message = ipc::receive_packet(id, authority, slots)?;
+            let message = ipc::receive_packet(transaction, id, authority, slots)?;
             write_message(root, args.arg2, &message)
         }
         CapType::Process(id) if args.arg1 == CapOp::WaitProcess as u64 => {
@@ -197,7 +199,7 @@ pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
             } else {
                 validate_blocking_output(root, args.arg2, length)?;
             }
-            let status = process::wait_for_status(id, authority, nonblocking)?;
+            let status = process::wait_for_status(transaction, id, authority, nonblocking)?;
             let mut bytes = [0; size_of::<ProcessStatus>()];
             bytes[..4].copy_from_slice(&status.kind.to_ne_bytes());
             bytes[4..].copy_from_slice(&status.code.to_ne_bytes());
@@ -238,13 +240,13 @@ pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
         }
         CapType::Notification(id) if args.arg1 == CapOp::Signal as u64 => {
             require(capability.rights, CapRights::WRITE)?;
-            ErrorCode::from_u64(ipc::notification_signal(id))
+            ErrorCode::from_u64(ipc::notification_signal(transaction, id))
         }
         CapType::Notification(id) if args.arg1 == CapOp::Wait as u64 => {
             require(capability.rights, CapRights::READ)?;
-            ipc::wait_notification(id, authority)
+            ipc::wait_notification(transaction, id, authority)
         }
-        CapType::Irq { irq_num, .. } => invoke_irq(args, irq_num, capability.rights),
+        CapType::Irq { irq_num, .. } => invoke_irq(transaction, args, irq_num, capability.rights),
         CapType::PciControl if operation == CapOp::ReadPciConfig as u64 => {
             require(capability.rights, CapRights::READ)?;
             let address = pci_address(args.arg2)?;
@@ -299,7 +301,12 @@ fn pci_address(bits: u64) -> Result<PciAddress, ErrorCode> {
         .map_err(|_| ErrorCode::BadMessage)
 }
 
-fn invoke_irq(args: &SyscallArgs, line: u32, rights: CapRights) -> Result<(), ErrorCode> {
+fn invoke_irq(
+    transaction: &mut Transaction,
+    args: &SyscallArgs,
+    line: u32,
+    rights: CapRights,
+) -> Result<(), ErrorCode> {
     let thread = sched::current_thread_id();
     match args.arg1 {
         operation if operation == CapOp::Wait as u64 || operation == CapOp::BindIrq as u64 => {
@@ -317,7 +324,7 @@ fn invoke_irq(args: &SyscallArgs, line: u32, rights: CapRights) -> Result<(), Er
             }
             let mut sources = ipc::wait::Sources::default();
             sources[0] = Some(ipc::wait::Source::new(path, slot, thread)?);
-            ipc::wait::wait_any(&sources, Default::default(), None).map(|_| ())
+            ipc::wait::wait_any(transaction, &sources, Default::default(), None).map(|_| ())
         }
         operation if operation == CapOp::AckIrq as u64 => {
             require(rights, CapRights::WRITE)?;
@@ -338,7 +345,11 @@ pub(crate) fn monotonic_time(destination: u64) -> Result<(), ErrorCode> {
     })
 }
 
-pub(crate) fn wait_any(args: &SyscallArgs, deadline: Option<u64>) -> Result<(), ErrorCode> {
+pub(crate) fn wait_any(
+    transaction: &mut Transaction,
+    args: &SyscallArgs,
+    deadline: Option<u64>,
+) -> Result<(), ErrorCode> {
     let count = usize::try_from(args.arg1).map_err(|_| ErrorCode::BadMessage)?;
     if count > MAX_WAIT_SOURCES || (count == 0 && deadline.is_none()) {
         return Err(ErrorCode::BadMessage);
@@ -346,7 +357,8 @@ pub(crate) fn wait_any(args: &SyscallArgs, deadline: Option<u64>) -> Result<(), 
     let root = sched::with_current_user(|process| process.root()).ok_or(ErrorCode::InvalidCap)?;
     if count == 0 {
         // A pure sleep never produces an event or uses a receive window.
-        return ipc::wait::wait_any(&Default::default(), Default::default(), deadline).map(|_| ());
+        return ipc::wait::wait_any(transaction, &Default::default(), Default::default(), deadline)
+            .map(|_| ());
     }
     let mut cptrs = [0u8; size_of::<u64>() * MAX_WAIT_SOURCES];
     let cptrs = &mut cptrs[..count * size_of::<u64>()];
@@ -364,7 +376,7 @@ pub(crate) fn wait_any(args: &SyscallArgs, deadline: Option<u64>) -> Result<(), 
         Ok(sources)
     })
     .ok_or(ErrorCode::InvalidCap)??;
-    let event = ipc::wait::wait_any(&sources, slots, deadline)?;
+    let event = ipc::wait::wait_any(transaction, &sources, slots, deadline)?;
     let mut bytes = [0; size_of::<WaitEvent>()];
     bytes[offset_of!(WaitEvent, index)..][..8].copy_from_slice(&event.index.to_ne_bytes());
     bytes[offset_of!(WaitEvent, kind)..][..8].copy_from_slice(&event.kind.to_ne_bytes());

@@ -108,6 +108,23 @@ pub(crate) fn tick_schedulers() {
     }
 }
 
+#[allow(unsafe_code)]
+#[cfg(not(test))]
+pub(crate) fn reschedule(slot: usize) {
+    let topology = apic::cpu_topology().expect("registered secondaries have LAPICs");
+    let id = if slot == 0 {
+        topology.bsp
+    } else {
+        u8::try_from(slot - 1).expect("registered APIC ID")
+    };
+    // The scheduler published ready state before notifying the remote CPU.
+    fence(Ordering::SeqCst);
+    // SAFETY: The scheduler lock is held with interrupts disabled and the
+    // registered target has acknowledged its fixed IPI gate. A failed kick
+    // will be retried by the periodic scheduling tick.
+    unsafe { irq::send_ipi(id, Ipi::Wake) };
+}
+
 /// Reserve conventional memory before the general allocator can use it.
 pub(crate) fn reserve_startup_page() -> Option<PhysFrame> {
     frame::allocate_in_range(PAGE, 0x9f000)
@@ -330,6 +347,10 @@ extern "C" fn secondary_entry(id: u64) -> ! {
 pub(crate) fn wake() {
     // SAFETY: The dedicated IDT gate runs only for a fixed local APIC IPI.
     if let Some(id) = unsafe { irq::finish_ipi() } {
+        if apic::cpu_topology().is_some_and(|topology| topology.bsp == id) {
+            sched::request_switch();
+            return;
+        }
         if let Some(slot) = STATE.get(usize::from(id)) {
             match slot.load(Ordering::Acquire) {
                 READY => slot.store(WOKEN, Ordering::Release),

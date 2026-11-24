@@ -12,6 +12,7 @@ use crate::cap::{
     object::{self, KObjectId, KernelObject, ProcessExitPublisher, UntypedBudget},
 };
 use crate::sched::{self, ThreadState};
+use crate::transaction::Transaction;
 use alloc::vec::Vec;
 use core::ops::Range;
 use ruzt_abi::{
@@ -198,23 +199,28 @@ pub(crate) fn spawn_program(
     Ok(())
 }
 
-pub(crate) fn terminate_current(status: ProcessStatus, reason: core::fmt::Arguments<'_>) -> ! {
+pub(crate) fn terminate_current(
+    transaction: Transaction,
+    status: ProcessStatus,
+    reason: core::fmt::Arguments<'_>,
+) -> ! {
     let (name, channels) = crate::sched::with_current_user(|user| {
         user.cspace.revoke_all_descendants();
         (user.name, user.exit_channels)
     })
     .expect("termination requires a user task");
-    crate::sched::apply_capability_removals();
+    crate::sched::apply_capability_removals(&transaction);
     crate::serial_println!("user process {name} terminated: {reason}");
     for channel in channels.into_iter().flatten() {
-        crate::ipc::close_endpoint(channel);
+        crate::ipc::close_endpoint(&transaction, channel);
     }
     crate::irq::detach_thread(crate::sched::current_thread_id());
     crate::iommu::detach_thread(crate::sched::current_thread_id());
-    crate::sched::retire_current_user(status)
+    crate::sched::retire_current_user(transaction, status)
 }
 
 pub(crate) fn wait_for_status(
+    transaction: &mut Transaction,
     process: ProcessId,
     authority: Option<CapabilityId>,
     nonblocking: bool,
@@ -231,9 +237,10 @@ pub(crate) fn wait_for_status(
             Some(KernelObject::Process { status: None }) => {}
             _ => return Err(ErrorCode::InvalidCap),
         }
-        // The syscall gate keeps local interrupts disabled from the status
-        // check through blocking on the boot CPU, so publication cannot race.
+        // The publisher must acquire the transaction before setting status
+        // and waking waiters. Register the wait before handing it over.
         sched::block_with_authority(
+            transaction,
             ThreadState::BlockedProcess(id),
             authority,
             Default::default(),

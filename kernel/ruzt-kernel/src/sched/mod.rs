@@ -5,6 +5,7 @@ use crate::cap::object::KObjectId;
 use crate::ipc::wait::{Sources, Target};
 use crate::ipc::{Packet, ReceiveSlots};
 use crate::process::UserProcess;
+use crate::transaction::{self, Transaction};
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -128,6 +129,12 @@ impl Scheduler {
             self.threads[id].receive_slots = ReceiveSlots::default();
             let cpu = self.threads[id].cpu;
             self.cpu_mut(cpu).run_queue.push_back(id);
+            #[cfg(not(test))]
+            if cpu == current_cpu() {
+                NEED_SWITCH[cpu].store(true, Ordering::Relaxed);
+            } else {
+                crate::smp::reschedule(cpu);
+            }
         }
     }
 
@@ -290,23 +297,18 @@ pub(crate) fn register_secondary(id: u8) -> Result<(), ErrorCode> {
     Ok(())
 }
 
-/// Block the current thread with the given reason and yield immediately.
-///
-/// Must be called with interrupts disabled.
-pub fn block_current(reason: ThreadState) {
-    block_with_authority(reason, None, ReceiveSlots::default());
-}
-
 pub(crate) fn block_with_authority(
+    transaction: &mut Transaction,
     reason: ThreadState,
     capability: Option<CapabilityId>,
     slots: ReceiveSlots,
 ) {
-    block(reason, capability, slots, None, None);
+    block(transaction, reason, capability, slots, None, None);
 }
 
-pub(crate) fn block_wait_any(sources: &Sources, deadline: Option<u64>) {
+pub(crate) fn block_wait_any(transaction: &mut Transaction, sources: &Sources, deadline: Option<u64>) {
     block(
+        transaction,
         ThreadState::BlockedAny,
         None,
         ReceiveSlots::default(),
@@ -316,6 +318,7 @@ pub(crate) fn block_wait_any(sources: &Sources, deadline: Option<u64>) {
 }
 
 fn block(
+    transaction: &mut Transaction,
     reason: ThreadState,
     capability: Option<CapabilityId>,
     slots: ReceiveSlots,
@@ -347,9 +350,10 @@ fn block(
         sched.wake_wait_any(Target::Endpoint(endpoint));
     }
 
-    // Switch to next runnable thread.
+    // The waiter is visible before releasing the transaction. The scheduler
+    // lock stays held until the context is saved, even if it wakes immediately.
     let next_id = sched.pick_next(cpu);
-    switch_to(guard, cpu, next_id);
+    transaction.park(|| switch_to(guard, cpu, next_id));
 }
 
 /// Unblock a thread and return it to the run queue.
@@ -388,7 +392,7 @@ pub(crate) fn wake_wait_any(target: Target) {
     }
 }
 
-pub(crate) fn apply_capability_removals() {
+pub(crate) fn apply_capability_removals(_transaction: &Transaction) {
     crate::irq::detach_revoked();
     crate::iommu::detach_revoked();
     let mut guard = lock_scheduler();
@@ -419,6 +423,12 @@ pub(crate) fn wake_process_waiters(process: KObjectId) {
         thread.state == ThreadState::BlockedProcess(process)
     });
     sched.wake_wait_any(Target::Process(process));
+}
+
+pub(crate) fn expire_waits(_transaction: &Transaction) {
+    if let Some(sched) = lock_scheduler().as_mut() {
+        sched.expire_waits();
+    }
 }
 
 pub(crate) fn complete_ipc(id: ThreadId, error: Option<ErrorCode>) {
@@ -470,7 +480,6 @@ pub(crate) fn wake_irq(thread_id: ThreadId, irq: u32) {
         .is_some_and(|thread| thread.waits_for(Target::Irq(irq)))
     {
         sched.mark_runnable(thread_id);
-        request_switch();
     }
 }
 
@@ -483,27 +492,28 @@ pub(crate) fn with_current_user<T>(f: impl FnOnce(&mut UserProcess) -> T) -> Opt
 
 /// Leave the dying task on its own stack until the idle thread can reap it.
 /// Called from a syscall or user fault with interrupts disabled.
-pub(crate) fn retire_current_user(status: ProcessStatus) -> ! {
-    retire_current(Some(status))
+pub(crate) fn retire_current_user(transaction: Transaction, status: ProcessStatus) -> ! {
+    retire_current(Some((transaction, status)))
 }
 
 pub(crate) fn retire_current_worker() -> ! {
     retire_current(None)
 }
 
-fn retire_current(status: Option<ProcessStatus>) -> ! {
+fn retire_current(exit: Option<(Transaction, ProcessStatus)>) -> ! {
     let mut guard = lock_scheduler();
     let sched = guard.as_mut().expect("scheduler not initialised");
     let cpu = current_cpu();
     let local = sched.cpu(cpu);
     let (id, idle) = (local.current, local.idle);
     assert_ne!(id, idle);
-    assert_eq!(sched.threads[id].user.is_some(), status.is_some());
+    assert_eq!(sched.threads[id].user.is_some(), exit.is_some());
     assert!(local.retired.is_none());
     sched.remove_ready(id);
     sched.threads[id].state = ThreadState::Exiting;
-    sched.cpu_mut(cpu).retired = Some((id, status));
+    sched.cpu_mut(cpu).retired = Some((id, exit.as_ref().map(|(_, status)| *status)));
     request_switch();
+    drop(exit);
     switch_to(guard, cpu, idle);
     unreachable!("exited thread resumed");
 }
@@ -521,26 +531,24 @@ pub(crate) fn reap_retired() {
         retired.fp = FpState::default();
         (id, retired.user.take(), retired.stack.take(), status)
     };
-    let exit = user.map(|mut user| {
+    drop(stack);
+    if let Some(mut user) = user {
+        let transaction = transaction::enter();
         let name = user.name;
         let publisher = user.exit_publisher.take();
         drop(user);
         // A shared CNode can contain caps owned by the reaped task that other
         // tasks have used for wait operations or shared mappings.
-        apply_capability_removals();
-        (name, publisher, status.expect("retired user task has an exit status"))
-    });
-    drop(stack);
+        apply_capability_removals(&transaction);
+        crate::serial_println!("reaped user process {name}");
+        if let Some(publisher) = publisher {
+            publisher.publish(&transaction, status.expect("retired user task has an exit status"));
+        }
+    }
     {
         let mut guard = lock_scheduler();
         let sched = guard.as_mut().expect("scheduler not initialised");
         sched.threads[id].state = ThreadState::Exited;
-    }
-    if let Some((name, publisher, status)) = exit {
-        crate::serial_println!("reaped user process {name}");
-        if let Some(publisher) = publisher {
-            publisher.publish(status);
-        }
     }
 }
 
@@ -582,12 +590,12 @@ pub fn spawn(f: fn() -> !) -> ThreadId {
 }
 
 pub(crate) fn spawn_user(user: UserProcess, entry: fn() -> !) -> Result<ThreadId, ErrorCode> {
-    // IPC readiness checks and wait registration still rely on local IF.
+    // Device vector allocation still checks the boot CPU's local APIC.
     spawn_thread(entry, Some(user), false)
 }
 
 /// Spawn a kernel worker that may run on any scheduler CPU. Workers must
-/// use only SMP-safe APIs. IPC and capability services still run on the BSP.
+/// use only SMP-safe APIs. Device-control operations still run on the BSP.
 pub(crate) fn spawn_worker(f: fn() -> !) -> ThreadId {
     spawn_thread(f, None, true).expect("allocate kernel worker")
 }
@@ -661,10 +669,6 @@ pub fn yield_thread() {
     let mut guard = lock_scheduler();
     let sched = guard.as_mut().expect("scheduler not initialised");
     let cpu = current_cpu();
-    // Wait deadlines and their consumers still belong to the BSP.
-    if cpu == BOOT_CPU {
-        sched.expire_waits();
-    }
     let next_id = sched.pick_next(cpu);
     if next_id != sched.cpu(cpu).current {
         switch_to(guard, cpu, next_id);
@@ -836,7 +840,7 @@ mod tests {
             scheduler.mark_blocked(revoked, ThreadState::BlockedWait(id));
         }
         caps.revoke(0).unwrap();
-        apply_capability_removals();
+        apply_capability_removals(&transaction::enter());
         let guard = lock_scheduler();
         let scheduler = guard.as_ref().unwrap();
         assert_eq!(
@@ -856,6 +860,7 @@ mod tests {
         use ruzt_cap::{CapRights, CapSlot, CapType};
 
         let _state = crate::isolated_kernel_state();
+        let mut transaction = transaction::enter();
         let (process, publisher) = ProcessExitPublisher::new().unwrap();
         let id = KObjectId(process.0);
         let mut caps = cspace::CSpace::new(2);
@@ -870,7 +875,7 @@ mod tests {
         .unwrap();
         let observer = Some(caps.capability_id(0).unwrap());
         assert_eq!(
-            crate::process::wait_for_status(process, observer, true),
+            crate::process::wait_for_status(&mut transaction, process, observer, true),
             Err(ErrorCode::WouldBlock)
         );
         fn entry() -> ! {
@@ -890,7 +895,7 @@ mod tests {
             kind: ruzt_abi::PROCESS_EXITED,
             code: 23,
         };
-        publisher.publish(expected);
+        publisher.publish(&transaction, expected);
         {
             let guard = lock_scheduler();
             let sched = guard.as_ref().unwrap();
@@ -899,11 +904,11 @@ mod tests {
             assert_eq!(sched.threads[first].ipc_error, None);
         }
         assert_eq!(
-            crate::process::wait_for_status(process, observer, false),
+            crate::process::wait_for_status(&mut transaction, process, observer, false),
             Ok(expected)
         );
         assert_eq!(
-            crate::process::wait_for_status(process, observer, true),
+            crate::process::wait_for_status(&mut transaction, process, observer, true),
             Ok(expected)
         );
         drop(caps);
@@ -917,6 +922,7 @@ mod tests {
         use ruzt_cap::{CapRights, CapSlot, CapType, EndpointId, NotificationId};
 
         let _state = crate::isolated_kernel_state();
+        let transaction = transaction::enter();
         let endpoint = object::allocate(CapType::Endpoint(EndpointId(0))).unwrap();
         let notification = object::allocate(CapType::Notification(NotificationId(0))).unwrap();
         let mut caps = cspace::CSpace::new(1);
@@ -956,7 +962,7 @@ mod tests {
                 scheduler.mark_blocked(thread, ThreadState::BlockedAny);
             }
         }
-        crate::ipc::close_endpoint(EndpointId(endpoint.0));
+        crate::ipc::close_endpoint(&transaction, EndpointId(endpoint.0));
         {
             let guard = lock_scheduler();
             let scheduler = guard.as_ref().unwrap();
@@ -965,7 +971,7 @@ mod tests {
             assert_eq!(scheduler.threads[endpoint_waiter].ipc_error, None);
         }
         caps.delete(1).unwrap();
-        apply_capability_removals();
+        apply_capability_removals(&transaction);
         let guard = lock_scheduler();
         let scheduler = guard.as_ref().unwrap();
         assert_eq!(scheduler.cpu(BOOT_CPU).run_queue, [endpoint_waiter, notification_waiter]);

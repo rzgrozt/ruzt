@@ -731,7 +731,7 @@ impl ProcessExitPublisher {
         Ok((ProcessId(id.0), Self(id)))
     }
 
-    pub(crate) fn publish(self, status: ProcessStatus) {
+    pub(crate) fn publish(self, _transaction: &crate::transaction::Transaction, status: ProcessStatus) {
         update(self.0, |object| {
             let KernelObject::Process { status: stored } = object else {
                 unreachable!("exit publisher owns a process object");

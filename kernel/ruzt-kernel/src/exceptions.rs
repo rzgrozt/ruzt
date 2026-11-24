@@ -259,6 +259,7 @@ fn fatal_fault(frame: InterruptStackFrame, vector: u32, reason: core::fmt::Argum
     assert_entry_flags();
     if frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
         crate::process::terminate_current(
+            crate::transaction::enter(),
             ProcessStatus {
                 kind: PROCESS_FAULTED,
                 code: vector,
@@ -288,6 +289,7 @@ extern "x86-interrupt" fn timer_handler(stack_frame: InterruptStackFrame) {
         );
     });
     crate::irq::end_of_interrupt(0);
+    crate::sched::expire_waits(&crate::transaction::enter());
     crate::smp::tick_schedulers();
     // Kernel execution can hold locks and schedules at its own safe points.
     if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
