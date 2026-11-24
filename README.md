@@ -16,7 +16,7 @@ The IPC library can block on up to eight endpoints, notifications, driver IRQs, 
 
 User tasks can read the monotonic clock, supply an absolute deadline to a capability wait, or sleep until a deadline without waiting on any capability. x86-64 wakes these tasks at scheduler safe points using the PIT's roughly 10 ms tick. The PIT uses the I/O APIC when firmware provides usable ACPI interrupt routing.
 
-The x86-64 kernel enables SMEP and SMAP when the CPU advertises them. Syscalls copy through supervisor-only aliases after checking access on every user page. Interrupt and syscall entry clear the live AC and DF flags and preserve the interrupted task's flags for return. The QEMU preemption test exercises this path with both protections enabled.
+The x86-64 kernel enables SMEP and SMAP when the CPU advertises them. Syscalls copy through supervisor-only aliases after checking access on every user page. Interrupt and syscall entry clear the live AC and DF flags and preserve the interrupted task's flags for return. A user trap starts on the CPU's guarded entry stack. The common entry stub moves the saved frame onto the thread's kernel stack before dispatch so the thread can block or migrate. The QEMU preemption test exercises this path with both protections enabled.
 
 Double faults switch to a dedicated supervisor stack with an unmapped guard page. The handler writes directly to COM1 before halting. The QEMU fixture reaches it with an unmapped interrupted stack and the normal serial lock held.
 

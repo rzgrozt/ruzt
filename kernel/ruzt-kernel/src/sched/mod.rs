@@ -713,12 +713,12 @@ fn switch_to(mut guard: SchedulerGuard, cpu: usize, next_id: ThreadId) {
         let stack_top = (stack.as_ptr() as u64 + stack.len() as u64) & !0xF;
         // SAFETY: Interrupts are disabled, and this owned kernel stack lies in
         // the common supervisor mapping of every supported page-table root.
-        unsafe { crate::smp::set_trap_stack(cpu, Some(stack_top)) };
+        unsafe { crate::mm::entry_stack::set_thread_stack(cpu, Some(stack_top)) };
         user.root().base.as_u64()
     } else {
-        // SAFETY: Bookkeeping runs with interrupts disabled. A kernel thread
-        // must stop using the outgoing user thread's privilege stack.
-        unsafe { crate::smp::set_trap_stack(cpu, None) };
+        // SAFETY: Bookkeeping runs with interrupts disabled. The CPU no
+        // longer has a user thread's stack published for its entry stub.
+        unsafe { crate::mm::entry_stack::set_thread_stack(cpu, None) };
         sched.kernel_cr3
     };
     sched.cpu_mut(cpu).current = next_id;

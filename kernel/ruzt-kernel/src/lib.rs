@@ -94,11 +94,12 @@ pub fn main(boot_info: &'static mut BootInfo) -> ! {
     advance_screen();
 
     mm::exception_stack::map();
+    mm::entry_stack::map_boot();
     #[allow(unsafe_code)]
     // SAFETY: Both supervisor stacks are mapped for the single boot CPU
     // before interrupts and IDT initialization.
     unsafe {
-        ruzt_hal_x86_64::gdt::init(mm::exception_stack::TOP);
+        ruzt_hal_x86_64::gdt::init(mm::entry_stack::top(0), mm::exception_stack::TOP);
         ruzt_hal_x86_64::context::init_fp();
     }
     serial_println!("GDT+TSS initialised.");

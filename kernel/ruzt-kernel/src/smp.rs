@@ -17,7 +17,7 @@ use x86_64::{
 
 use crate::{
     apic, exceptions,
-    mm::{exception_stack, frame},
+    mm::{entry_stack, exception_stack, frame},
     sched,
 };
 
@@ -67,21 +67,6 @@ pub(crate) fn scheduler_slot() -> usize {
         0
     } else {
         secondary_scheduler_slot(id)
-    }
-}
-
-#[allow(unsafe_code)]
-pub(crate) unsafe fn set_trap_stack(slot: usize, top: Option<u64>) {
-    // SAFETY: The scheduler owns the local TSS with interrupts disabled.
-    unsafe {
-        match (slot, top) {
-            (0, Some(top)) => gdt::set_trap_stack(top),
-            (0, None) => gdt::use_boot_trap_stack(),
-            (slot, top) => {
-                let id = u8::try_from(slot - 1).expect("registered APIC ID");
-                gdt::set_secondary_trap_stack(id, top.unwrap_or_else(|| stack_bounds(id).0));
-            }
-        }
     }
 }
 
@@ -243,10 +228,12 @@ fn stack_bounds(id: u8) -> (u64, u64) {
 
 fn map_stacks(id: u8) -> bool {
     let (stack, fault) = stack_bounds(id);
+    let slot = secondary_scheduler_slot(id);
+    let entry = entry_stack::bottom(slot);
     mapper::with_mapper(|mapper| {
         let first = stack - STACK_PAGES * PAGE;
         let second = fault - FAULT_PAGES * PAGE;
-        if [first - PAGE, second - PAGE]
+        if [first - PAGE, second - PAGE, entry_stack::guard(slot)]
             .into_iter()
             .any(|address| mapper.translate(VirtAddr::new(address)).is_some())
         {
@@ -254,9 +241,14 @@ fn map_stacks(id: u8) -> bool {
         }
         let pages = (first..stack)
             .step_by(PhysFrame::SIZE)
-            .chain((second..fault).step_by(PhysFrame::SIZE));
+            .chain((second..fault).step_by(PhysFrame::SIZE))
+            .chain(core::iter::once(entry));
         for (index, address) in pages.clone().enumerate() {
-            let new = frame::allocate();
+            let new = if address == entry {
+                entry_stack::allocate_frame()
+            } else {
+                frame::allocate()
+            };
             let mapped = new.is_some_and(|frame| {
                 mapper
                     .map(VirtAddr::new(address), frame, PageFlags::WRITABLE)
@@ -321,14 +313,14 @@ fn wait_for(id: u8, state: u8) -> bool {
 extern "C" fn secondary_entry(id: u64) -> ! {
     let id = u8::try_from(id).expect("validated APIC ID");
     let topology = apic::cpu_topology().expect("published APIC topology");
-    let (stack, fault) = stack_bounds(id);
+    let (_, fault) = stack_bounds(id);
     let root = *PERMANENT_ROOT.get().expect("published kernel root");
     // SAFETY: The temporary and permanent roots map the same live kernel
     // and private stacks. INIT kept interrupts disabled; load the AP's own
     // descriptors and restore supervisor protections before accepting IPIs.
     unsafe {
         core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
-        gdt::init_secondary(id, stack, fault);
+        gdt::init_secondary(id, entry_stack::top(secondary_scheduler_slot(id)), fault);
         context::init_fp();
         cpu::enable_supervisor_protection();
     }

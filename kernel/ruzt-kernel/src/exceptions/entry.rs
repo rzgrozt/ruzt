@@ -74,6 +74,37 @@ ruzt_vector_stubs:
     push rdi
     push rax
 
+    # A regular user-mode trap arrives on the CPU's fixed RSP0 stack.
+    # Move the complete frame to the current thread so it can block or migrate.
+    # Double faults are terminal and stay on their separate IST stack.
+    test word ptr [rsp + {cs_offset}], 3
+    jz .Ldispatch
+    cmp qword ptr [rsp + {vector_offset}], 8
+    je .Ldispatch
+    mov rax, rsp
+    mov rcx, {stack_base}
+    sub rax, rcx
+    shr rax, {slot_shift}
+    cmp rax, {slot_count}
+    jae .Lbad_entry
+    lea rcx, [rip + {thread_stacks}]
+    mov rdi, [rcx + rax * 8]
+    test rdi, rdi
+    jz .Lbad_entry
+    sub rdi, {trap_size}
+    mov rdx, rsp
+    mov rsi, rsp
+    mov rsp, rdi
+    mov ecx, {trap_words}
+    rep movsq
+
+    # The entry stack is per CPU and may next serve a different user thread.
+    mov rdi, rdx
+    xor eax, eax
+    mov ecx, {trap_words}
+    rep stosq
+
+.Ldispatch:
     mov rdi, rsp
     mov rbx, rsp
     and rsp, -16
@@ -97,9 +128,19 @@ ruzt_vector_stubs:
     pop r15
     add rsp, 16
     iretq
+.Lbad_entry:
+    ud2
     .p2align 12, 0xcc
     .popsection
     "#,
     dispatch = sym super::dispatch,
+    thread_stacks = sym crate::mm::entry_stack::THREAD_STACKS,
+    stack_base = const crate::mm::entry_stack::BASE,
+    slot_shift = const crate::mm::entry_stack::SLOT_SHIFT,
+    slot_count = const crate::smp::SCHEDULER_SLOTS,
+    trap_size = const size_of::<Trap>(),
+    trap_words = const size_of::<Trap>() / 8,
+    cs_offset = const offset_of!(Trap, frame) + offset_of!(InterruptStackFrameValue, code_segment),
+    vector_offset = const offset_of!(Trap, vector),
     without_ac = const !(RFlags::ALIGNMENT_CHECK.bits() as i32),
 );

@@ -19,7 +19,6 @@ const GDT_ENTRY_COUNT: usize = 7;
 const KERNEL_CODE_SELECTOR: u64 = 0x08;
 const KERNEL_DATA_SELECTOR: u64 = 0x10;
 const TSS_SELECTOR: u64 = 0x28;
-const RING3_TRAP_STACK_SIZE: usize = 64 * 1024;
 
 /// Ring-3 code-segment selector, including requested privilege level 3.
 pub const USER_CODE_SELECTOR: u64 = 0x1B;
@@ -30,38 +29,12 @@ pub const USER_DATA_SELECTOR: u64 = 0x23;
 /// Zero-based IST slot used for the double-fault stack.
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
-const _: () = assert!(RING3_TRAP_STACK_SIZE % 16 == 0);
-
-#[repr(align(16))]
-struct Ring3TrapStack {
-    bytes: UnsafeCell<[u8; RING3_TRAP_STACK_SIZE]>,
-}
-
-impl Ring3TrapStack {
-    const fn new() -> Self {
-        Self {
-            bytes: UnsafeCell::new([0; RING3_TRAP_STACK_SIZE]),
-        }
-    }
-
-    fn top(&'static self) -> VirtAddr {
-        let start = self.bytes.get().cast::<u8>();
-        VirtAddr::from_ptr(start.wrapping_add(RING3_TRAP_STACK_SIZE))
-    }
-}
-
-// SAFETY: [Category 2/9 - Data races and Send/Sync] The wrapper exposes only
-// the stack's one-past-end address. Rust never reads or writes the bytes.
-unsafe impl Sync for Ring3TrapStack {}
-
 struct GdtState {
     table: GlobalDescriptorTable<GDT_ENTRY_COUNT>,
     kernel_code: SegmentSelector,
     kernel_data: SegmentSelector,
     tss: SegmentSelector,
 }
-
-static RING3_TRAP_STACK: Ring3TrapStack = Ring3TrapStack::new();
 
 struct CpuTables {
     tss: UnsafeCell<TaskStateSegment>,
@@ -141,21 +114,20 @@ unsafe fn build_gdt(tss: *const TaskStateSegment) -> GdtState {
 /// Install the GDT and TSS on the current CPU.
 ///
 /// The GDT layout is fixed to kernel code/data, user code/data, then the
-/// two-entry TSS descriptor. The TSS starts with a dedicated 64 KiB stack,
-/// and the scheduler installs the active user thread's stack before entry.
-/// Double faults use a separate interrupt stack.
+/// two-entry TSS descriptor. Interrupts from ring 3 use the fixed privilege
+/// stack. Double faults use a separate interrupt stack.
 ///
 /// # Safety
 ///
 /// Call this exactly once from CPL0 on the boot CPU with interrupts disabled,
 /// before loading the IDT or entering ring 3. The kernel image containing the
 /// GDT, TSS, and stacks must remain mapped supervisor-only in every installed
-/// CR3. `double_fault_top` must be the aligned top of a dedicated writable
-/// stack that no other handler or CPU uses.
-pub unsafe fn init(double_fault_top: u64) {
+/// CR3. Both arguments must be aligned tops of distinct writable stacks
+/// owned by this CPU.
+pub unsafe fn init(trap_top: u64, double_fault_top: u64) {
     INIT.call_once(|| {
         // SAFETY: The boot CPU owns these tables and interrupts are disabled.
-        unsafe { BSP.load(RING3_TRAP_STACK.top().as_u64(), double_fault_top) };
+        unsafe { BSP.load(trap_top, double_fault_top) };
     });
 }
 
@@ -167,37 +139,6 @@ pub unsafe fn init(double_fault_top: u64) {
 pub unsafe fn init_secondary(id: u8, trap_top: u64, double_fault_top: u64) {
     // SAFETY: The caller exclusively owns this CPU's tables and stacks.
     unsafe { SECONDARIES[usize::from(id)].load(trap_top, double_fault_top) };
-}
-
-/// Set the kernel stack used for the next privilege transition from ring 3.
-///
-/// # Safety
-/// Call on the boot CPU with interrupts disabled. The stack must be aligned,
-/// remain live while it is installed, and be mapped supervisor-only in every
-/// active address space.
-pub unsafe fn set_trap_stack(top: u64) {
-    // SAFETY: The caller owns the boot CPU's TSS with interrupts disabled.
-    unsafe { BSP.write_trap_stack(top) };
-}
-
-/// Update the calling secondary CPU's privilege stack.
-///
-/// # Safety
-/// Use the calling CPU's APIC ID after [`init_secondary`], with interrupts
-/// disabled. The aligned stack must remain live and supervisor-only while
-/// installed in this CPU's TSS.
-pub unsafe fn set_secondary_trap_stack(id: u8, top: u64) {
-    // SAFETY: The caller owns this CPU's TSS with interrupts disabled.
-    unsafe { SECONDARIES[usize::from(id)].write_trap_stack(top) };
-}
-
-/// Restore the boot CPU's fallback privilege stack.
-///
-/// # Safety
-/// Call on the boot CPU with interrupts disabled.
-pub unsafe fn use_boot_trap_stack() {
-    // SAFETY: The static fallback stack lives for the kernel's lifetime.
-    unsafe { set_trap_stack(RING3_TRAP_STACK.top().as_u64()) };
 }
 
 #[cfg(test)]
@@ -214,14 +155,5 @@ mod tests {
         assert_eq!(u64::from(gdt.kernel_code.0), KERNEL_CODE_SELECTOR);
         assert_eq!(u64::from(gdt.kernel_data.0), KERNEL_DATA_SELECTOR);
         assert_eq!(u64::from(gdt.tss.0), TSS_SELECTOR);
-    }
-
-    #[test]
-    fn ring3_trap_stack_top_is_aligned_and_exclusive() {
-        let start = VirtAddr::from_ptr(RING3_TRAP_STACK.bytes.get()).as_u64();
-        let top = RING3_TRAP_STACK.top().as_u64();
-
-        assert_eq!(top - start, RING3_TRAP_STACK_SIZE as u64);
-        assert_eq!(top & 0xF, 0);
     }
 }
