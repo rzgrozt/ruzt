@@ -252,8 +252,14 @@ fn test_timer_preempts_cpu_bound_user_code() {
             "x86 supervisor protection (SMEP=true, SMAP=true)",
             "Local APIC and I/O APIC interrupt routing enabled",
             "consoled: syscall preserved user AC and DF",
-            "kernel: timer entry cleared user AC",
+            "consoled: reply followed by CPU-bound loop",
         ],
+    );
+    // A timer can interrupt either user program's serial output, including
+    // while the console is setting up the syscall probe.
+    assert!(
+        serial.contains("kernel: timer entry cleared user AC"),
+        "Timer entry did not report clearing user AC:\n{serial}"
     );
     assert_markers(
         &serial,

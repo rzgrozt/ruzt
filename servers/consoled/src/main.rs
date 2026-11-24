@@ -88,18 +88,14 @@ fn main() -> ! {
         };
         #[cfg(feature = "qemu-preemption-test")]
         if reply.label == console::REVOKED {
-            uart_write(b"consoled: reply followed by CPU-bound loop\n");
+            run_preemption_test(&reply);
         }
         ruzt_ipc::send(console::REPLY, &reply).expect("reply to console request");
-        #[cfg(feature = "qemu-preemption-test")]
-        if reply.label == console::REVOKED {
-            run_preemption_test();
-        }
     }
 }
 
 #[cfg(feature = "qemu-preemption-test")]
-fn run_preemption_test() -> ! {
+fn run_preemption_test(reply: &IpcMessage) -> ! {
     const AC: u64 = 1 << 18;
     const DF: u64 = 1 << 10;
     let mut timestamp = 0u64;
@@ -127,7 +123,10 @@ fn run_preemption_test() -> ! {
     assert_eq!(ErrorCode::from_u64(status), Ok(()));
     assert_ne!(timestamp, 0);
     assert_eq!(returned_flags & (AC | DF), AC | DF);
+    // Report both fixture markers while rootsrv is waiting for its reply.
     uart_write(b"consoled: syscall preserved user AC and DF\n");
+    uart_write(b"consoled: reply followed by CPU-bound loop\n");
+    ruzt_ipc::send(console::REPLY, reply).expect("reply to console request");
 
     // SAFETY: The loop touches no user data and never returns to Rust.
     unsafe {
