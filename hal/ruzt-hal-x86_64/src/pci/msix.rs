@@ -82,7 +82,8 @@ impl MsixLayout {
     }
 
     fn read(self, offset: u8) -> u32 {
-        // SAFETY: All callers hold the exclusive function lease on the boot CPU.
+        // SAFETY: All callers hold the exclusive function lease and serialize
+        // the shared configuration ports.
         unsafe { read_config(self.function, offset) }
     }
 }

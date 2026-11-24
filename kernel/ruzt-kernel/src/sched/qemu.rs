@@ -8,8 +8,8 @@ use ruzt_hal::cpu::CpuOps;
 use ruzt_hal_x86_64::cpu::X86_64Cpu;
 
 use super::{
-    current_cpu, current_thread_id, lock_scheduler, retire_current_worker, spawn_worker,
-    ThreadState,
+    current_cpu, current_thread_id, lock_scheduler, retire_current_worker, spawn_worker, Scheduler,
+    ThreadId, ThreadState,
 };
 use crate::cap::object::{self, KObjectId};
 use crate::ipc::{self, Packet, ReceiveSlots};
@@ -26,6 +26,33 @@ static SENDER_CPU: AtomicUsize = AtomicUsize::new(0);
 static IPC_COMPLETE: AtomicBool = AtomicBool::new(false);
 static VECTOR_PROBE_STARTED: AtomicBool = AtomicBool::new(false);
 const IPC_LABEL: u64 = 0x736d_702d_6970_6321;
+
+pub(super) fn trace_user_ipc(scheduler: &Scheduler, peer: ThreadId) {
+    static OBSERVED: spin::Once<()> = spin::Once::new();
+    let cpu = current_cpu();
+    let current = &scheduler.threads[scheduler.cpu(cpu).current];
+    let peer = &scheduler.threads[peer];
+    if cpu != peer.cpu && current.user.is_some() && peer.user.is_some() {
+        OBSERVED.call_once(|| {
+            crate::serial_println!("SMP user IPC crossed CPUs {cpu} and {}", peer.cpu)
+        });
+    }
+}
+
+pub(crate) fn trace_user_irq(owner: ThreadId, line: u8) {
+    static OBSERVED: spin::Once<()> = spin::Once::new();
+    let guard = lock_scheduler();
+    let scheduler = guard.as_ref().expect("scheduler initialized");
+    let owner = &scheduler.threads[owner];
+    if owner.cpu != current_cpu() && owner.user.is_some() {
+        OBSERVED.call_once(|| {
+            crate::serial_println!(
+                "SMP device IRQ {line} delivered to a user task on CPU {}",
+                owner.cpu
+            );
+        });
+    }
+}
 
 pub(crate) fn enqueue() {
     for _ in 0..SECONDARIES {

@@ -130,11 +130,7 @@ impl Scheduler {
             let cpu = self.threads[id].cpu;
             self.cpu_mut(cpu).run_queue.push_back(id);
             #[cfg(not(test))]
-            if cpu == current_cpu() {
-                NEED_SWITCH[cpu].store(true, Ordering::Relaxed);
-            } else {
-                crate::smp::reschedule(cpu);
-            }
+            signal_ready(cpu);
         }
     }
 
@@ -262,6 +258,15 @@ pub fn request_switch() {
 /// Consume a pending scheduling hint on the current CPU.
 pub fn should_switch() -> bool {
     NEED_SWITCH[current_cpu()].swap(false, Ordering::Relaxed)
+}
+
+#[cfg(not(test))]
+fn signal_ready(cpu: usize) {
+    if cpu == current_cpu() {
+        NEED_SWITCH[cpu].store(true, Ordering::Relaxed);
+    } else {
+        crate::smp::reschedule(cpu);
+    }
 }
 
 /// Initialise the scheduler, registering the current execution context as the
@@ -435,6 +440,10 @@ pub(crate) fn complete_ipc(id: ThreadId, error: Option<ErrorCode>) {
     let mut guard = lock_scheduler();
     let sched = guard.as_mut().expect("scheduler not initialised");
     sched.threads[id].ipc_error = error;
+    #[cfg(all(feature = "qemu-smp-test", not(test)))]
+    if error.is_none() {
+        qemu::trace_user_ipc(sched, id);
+    }
     sched.mark_runnable(id);
 }
 
@@ -456,6 +465,10 @@ pub(crate) fn deliver_to_waiter(id: ThreadId, packet: Packet) -> Result<(), Erro
             Err(error)
         }
     };
+    #[cfg(all(feature = "qemu-smp-test", not(test)))]
+    if status.is_ok() {
+        qemu::trace_user_ipc(sched, id);
+    }
     sched.mark_runnable(id);
     status
 }
@@ -590,12 +603,11 @@ pub fn spawn(f: fn() -> !) -> ThreadId {
 }
 
 pub(crate) fn spawn_user(user: UserProcess, entry: fn() -> !) -> Result<ThreadId, ErrorCode> {
-    // Device vector allocation still checks the boot CPU's local APIC.
-    spawn_thread(entry, Some(user), false)
+    spawn_thread(entry, Some(user), true)
 }
 
 /// Spawn a kernel worker that may run on any scheduler CPU. Workers must
-/// use only SMP-safe APIs. Device-control operations still run on the BSP.
+/// use only SMP-safe APIs.
 pub(crate) fn spawn_worker(f: fn() -> !) -> ThreadId {
     spawn_thread(f, None, true).expect("allocate kernel worker")
 }
@@ -618,7 +630,13 @@ fn spawn_thread(
 
     let mut guard = lock_scheduler();
     let sched = guard.as_mut().expect("scheduler not initialised");
-    let cpu = if migratable { current_cpu() } else { BOOT_CPU };
+    let cpu = if user.is_some() {
+        sched.least_loaded_cpu(current_cpu())
+    } else if migratable {
+        current_cpu()
+    } else {
+        BOOT_CPU
+    };
     sched
         .cpu_mut(cpu)
         .run_queue
@@ -657,6 +675,8 @@ fn spawn_thread(
         index
     };
     sched.cpu_mut(cpu).run_queue.push_back(id);
+    #[cfg(not(test))]
+    signal_ready(cpu);
 
     Ok(id)
 }

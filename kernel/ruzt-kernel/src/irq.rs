@@ -215,6 +215,8 @@ pub(crate) fn on_interrupt(line: u8) {
     }
     let _transaction = crate::transaction::enter();
     if let Some(thread) = latch(u32::from(line)) {
+        #[cfg(all(feature = "qemu-smp-test", not(test)))]
+        crate::sched::qemu::trace_user_irq(thread, line);
         sched::wake_irq(thread, u32::from(line));
     } else if u32::from(line) == crate::keyboard::IRQ {
         // The standalone kernel diagnostic has no driver binding.

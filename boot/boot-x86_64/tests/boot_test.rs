@@ -156,6 +156,7 @@ fn test_uefi_boots_user_services_with_a_randomized_kernel() {
                 "SMP scheduler migrated a saved worker and reaped all worker stacks",
                 "SMP IPC registered a waiter and completed a cross-CPU rendezvous",
                 "SMP LAPIC probe distinguished pending and idle boot CPU vectors",
+                "SMP user IPC crossed CPUs",
                 "rootsrv: console write acknowledged over IPC",
                 "rootsrv: framebuffer tile drawn",
             ],
@@ -166,6 +167,9 @@ fn test_uefi_boots_user_services_with_a_randomized_kernel() {
             "{serial}"
         );
         if isolated {
+            assert!(serial.lines().any(|line| {
+                line.starts_with("SMP device IRQ ") && line.contains(" delivered to a user task on CPU ")
+            }), "No device IRQ crossed to a user task on another CPU:\n{serial}");
             assert_markers(
                 &serial,
                 &[

@@ -119,8 +119,10 @@ pub fn init_idt() {
     idt.load();
 }
 
-extern "x86-interrupt" fn wake_handler(_frame: InterruptStackFrame) {
-    crate::smp::wake();
+extern "x86-interrupt" fn wake_handler(frame: InterruptStackFrame) {
+    if crate::smp::wake() {
+        schedule_after_interrupt(frame);
+    }
 }
 
 extern "x86-interrupt" fn tlb_handler(_frame: InterruptStackFrame) {
@@ -297,8 +299,12 @@ extern "x86-interrupt" fn timer_handler(stack_frame: InterruptStackFrame) {
     crate::irq::end_of_interrupt(0);
     crate::sched::expire_waits(&crate::transaction::enter());
     crate::smp::tick_schedulers();
+    schedule_after_interrupt(stack_frame);
+}
+
+fn schedule_after_interrupt(frame: InterruptStackFrame) {
     // Kernel execution can hold locks and schedules at its own safe points.
-    if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
+    if frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
         crate::sched::yield_thread();
     } else {
         crate::sched::request_switch();

@@ -55,8 +55,8 @@ impl UserProcess {
         }
         mappings.try_reserve(1).map_err(|_| ErrorCode::NoMemory)?;
         mapper::with_mapper(|mapper| {
-            // SAFETY: The scheduler owns this root and serializes updates on
-            // the boot CPU. The frame pin outlives the installed mapping.
+            // SAFETY: The process owns this root and the mapper guard
+            // serializes updates. The frame pin outlives the mapping.
             unsafe {
                 mapper.map_in_address_space(
                     self.space.root,

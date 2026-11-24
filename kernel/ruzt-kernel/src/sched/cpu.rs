@@ -35,6 +35,16 @@ impl Scheduler {
         self.cpus[slot].as_mut().expect("registered scheduler CPU")
     }
 
+    pub(super) fn least_loaded_cpu(&self, preferred: usize) -> usize {
+        self.cpus
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, cpu)| cpu.as_ref().map(|cpu| (slot, cpu)))
+            .min_by_key(|(slot, cpu)| (cpu.run_queue.len(), *slot != preferred))
+            .map(|(slot, _)| slot)
+            .expect("at least the boot CPU is registered")
+    }
+
     pub(super) fn pick_next(&mut self, slot: usize) -> ThreadId {
         let local = self.cpu_mut(slot);
         if local.run_queue.front() == Some(&local.current) {

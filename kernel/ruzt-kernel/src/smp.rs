@@ -354,19 +354,19 @@ extern "C" fn secondary_entry(id: u64) -> ! {
 }
 
 #[allow(unsafe_code)]
-pub(crate) fn wake() {
+pub(crate) fn wake() -> bool {
     // SAFETY: The dedicated IDT gate runs only for a fixed local APIC IPI.
     if let Some(id) = unsafe { irq::finish_ipi() } {
         if apic::cpu_topology().is_some_and(|topology| topology.bsp == id) {
-            sched::request_switch();
-            return;
+            return true;
         }
         if let Some(slot) = STATE.get(usize::from(id)) {
             match slot.load(Ordering::Acquire) {
                 READY => slot.store(WOKEN, Ordering::Release),
-                SCHEDULING => sched::request_switch(),
+                SCHEDULING => return true,
                 _ => {}
             }
         }
     }
+    false
 }

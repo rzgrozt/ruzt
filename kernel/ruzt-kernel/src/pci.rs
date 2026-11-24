@@ -109,8 +109,8 @@ pub(crate) fn read_config(address: PciAddress, offset: u8) -> Result<u32, ErrorC
         return Err(ErrorCode::BadMessage);
     }
     #[allow(unsafe_code)]
-    // SAFETY: This is the x86 boot CPU. Its syscall gate keeps interrupts
-    // disabled throughout the configuration transaction.
+    // SAFETY: This runs during boot or within a kernel transaction. Both
+    // serialize the shared configuration ports with interrupts disabled.
     Ok(unsafe { ruzt_hal_x86_64::pci::read_config(address.bits(), offset) })
 }
 
