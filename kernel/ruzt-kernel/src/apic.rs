@@ -230,6 +230,7 @@ pub(crate) fn reserve_gsi(gsi: u32, flags: u64) -> Result<u32, ErrorCode> {
         ReserveError::Unavailable => ErrorCode::NotFound,
         ReserveError::Occupied => ErrorCode::SlotOccupied,
         ReserveError::NoVector => ErrorCode::NoMemory,
+        ReserveError::RemappingFailed => ErrorCode::NotImplemented,
     })
 }
 
@@ -309,6 +310,11 @@ fn start(boot: &BootInfo) -> Result<bool, Error> {
         return Err(Error::UnusableController);
     }
 
+    let remapping = crate::iommu::prepare_ioapic_remapping(
+        controllers.iter().map(|unit| unit.hardware.id()),
+        x2,
+    );
+    let remapped = remapping.is_some();
     #[allow(unsafe_code)]
     // SAFETY: All controller mappings and routes were validated before
     // changing delivery. The matching gates are installed and IF is clear.
@@ -318,8 +324,12 @@ fn start(boot: &BootInfo) -> Result<bool, Error> {
             controllers.iter().map(|unit| unit.hardware),
             inputs,
             madt.pcat_compatible,
+            remapping,
         )
     };
+    if remapped {
+        crate::serial_println!("VT-d I/O APIC interrupt remapping enabled");
+    }
     TOPOLOGY.call_once(|| Topology {
         controllers,
         overrides: madt.overrides,

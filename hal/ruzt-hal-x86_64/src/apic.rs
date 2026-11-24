@@ -131,6 +131,7 @@ impl LocalApic {
 pub struct IoApic {
     registers: u64,
     pins: u8,
+    id: u8,
 }
 
 impl IoApic {
@@ -143,6 +144,7 @@ impl IoApic {
         let mut unit = Self {
             registers: alias.as_u64(),
             pins: 0,
+            id,
         };
         let version = unit.read(1);
         let max_pin = ((version >> 16) & 0xff) as u8;
@@ -159,6 +161,11 @@ impl IoApic {
     /// Count of implemented redirection entries.
     pub fn pin_count(self) -> u8 {
         self.pins
+    }
+
+    /// The firmware and hardware identifier of this I/O APIC.
+    pub fn id(self) -> u8 {
+        self.id
     }
 
     fn select(self, index: u8) {
@@ -183,6 +190,8 @@ impl IoApic {
             let index = REDIRECTION_START + 2 * pin;
             self.write(index, self.read(index) | REDIRECTION_MASK);
         }
+        // Read back the last update before changing the delivery format.
+        self.read(REDIRECTION_START + 2 * (self.pins - 1));
     }
 
     /// Resolve one firmware-described hardware input to a kernel route.
@@ -204,9 +213,22 @@ pub struct Input {
 }
 
 impl Input {
-    pub(crate) fn configure(self, vector: u8, destination: u8) {
-        self.unit
-            .write(self.register + 1, u32::from(destination) << 24);
+    pub(crate) fn controller_id(self) -> u8 {
+        self.unit.id()
+    }
+
+    pub(crate) fn level_triggered(self) -> bool {
+        self.flags & (1 << 15) != 0
+    }
+
+    pub(crate) fn configure(self, vector: u8, destination: u8, remap_index: Option<u8>) {
+        // These indices fit in the low 15 bits of the RTE's remapping index.
+        // Keep the same vector and trigger mode in the RTE and IRTE for EOI.
+        let high = match remap_index {
+            Some(index) => (1 << 16) | (u32::from(index) << 17),
+            None => u32::from(destination) << 24,
+        };
+        self.unit.write(self.register + 1, high);
         self.unit.write(
             self.register,
             REDIRECTION_MASK | self.flags | u32::from(vector),

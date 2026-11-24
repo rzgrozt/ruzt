@@ -17,6 +17,7 @@ const QUEUE_BYTES: u64 = PhysFrame::SIZE as u64;
 const DESCRIPTOR_BYTES: u64 = 16;
 const CONTEXT: u64 = 1;
 const IOTLB: u64 = 2;
+const INTERRUPT_ENTRY_CACHE: u64 = 4;
 const GLOBAL: u64 = 1 << 4;
 const WAIT: u64 = 5;
 const STATUS_WRITE: u64 = 1 << 5;
@@ -47,6 +48,10 @@ impl Queue {
     pub(super) fn invalidate_dma(&mut self, unit: &Unit) -> Result<(), Error> {
         let drains = ((unit.capability >> 55) & 1) << 7 | ((unit.capability >> 54) & 1) << 6;
         self.submit(unit, &[[CONTEXT | GLOBAL, 0], [IOTLB | GLOBAL | drains, 0]])
+    }
+
+    pub(super) fn invalidate_interrupts(&mut self, unit: &Unit) -> Result<(), Error> {
+        self.submit(unit, &[[INTERRUPT_ENTRY_CACHE, 0]])
     }
 
     fn submit(&mut self, unit: &Unit, descriptors: &[[u64; 2]]) -> Result<(), Error> {

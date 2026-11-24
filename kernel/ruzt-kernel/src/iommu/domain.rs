@@ -78,7 +78,7 @@ fn store(alias: VirtAddr, index: usize, value: u64) {
 }
 
 fn publish_table(alias: VirtAddr, unit: &vtd::Unit) -> Result<(), ErrorCode> {
-    publish(alias, unit.coherent()).map_err(|_| ErrorCode::NotImplemented)
+    publish(alias, unit).map_err(|_| ErrorCode::NotImplemented)
 }
 
 struct Translation {

@@ -87,7 +87,7 @@ fn test_uefi_boots_user_services_with_a_randomized_kernel() {
             "edu,addr=3",
         ];
         if isolated {
-            devices.extend(["-device", "intel-iommu,caching-mode=on"]);
+            devices.extend(["-device", "intel-iommu,caching-mode=on,intremap=on"]);
         }
         let mut guest = start_guest_with_devices(&disk, &serial_path, &devices);
         let serial = wait_for_serial(
@@ -117,6 +117,8 @@ fn test_uefi_boots_user_services_with_a_randomized_kernel() {
                 &[
                     "VT-d queued invalidation enabled",
                     "VT-d DMA translation enabled with an empty root table",
+                    "VT-d I/O APIC interrupt remapping enabled",
+                    "rootsrv: delegated UART IRQ delivered, re-armed and reclaimed",
                     "rootsrv: cleared firmware-enabled PCI bus mastering before delegation",
                     "rootsrv: PCI INTx delivered, re-armed, revoked and reclaimed",
                     "rootsrv: delegated DMA round trip, revocation and reclamation verified",
@@ -293,7 +295,11 @@ enum Services {
 #[test]
 fn test_vtd_isolates_and_reclaims_delegated_dma() {
     let temp = tempfile::tempdir().expect("create VT-d test directory");
-    let disk_image = build_image(temp.path(), "qemu-vtd-test", Services::PciInterruptConsole);
+    let disk_image = build_image(
+        temp.path(),
+        "qemu-vtd-test,qemu-rootsrv-test",
+        Services::PciInterruptConsole,
+    );
     let serial_path = temp.path().join("serial.log");
     let mut guest = start_guest_with_devices(
         &disk_image,
@@ -302,7 +308,7 @@ fn test_vtd_isolates_and_reclaims_delegated_dma() {
             "-machine",
             "q35",
             "-device",
-            "intel-iommu,caching-mode=on",
+            "intel-iommu,caching-mode=on,intremap=on",
             "-device",
             "edu,addr=3",
         ],
@@ -318,11 +324,20 @@ fn test_vtd_isolates_and_reclaims_delegated_dma() {
         &[
             "VT-d queued invalidation enabled",
             "VT-d DMA translation enabled with an empty root table",
+            "VT-d I/O APIC interrupt remapping enabled",
             "VT-d rejected an unassigned EDU DMA request",
+            "rootsrv: delegated UART IRQ delivered, re-armed and reclaimed",
             "rootsrv: PCI INTx delivered, re-armed, revoked and reclaimed",
             "rootsrv: delegated DMA round trip, revocation and reclamation verified",
             "rootsrv: PCI BAR mapped, delegated read-only, revoked and reclaimed",
         ],
+    );
+    monitor(&mut guest.child, "sendkey spc");
+    wait_for_serial(
+        &mut guest.child,
+        &serial_path,
+        "rootsrv: Space key received",
+        Instant::now() + ACTION_TIMEOUT,
     );
     monitor(&mut guest.child, "quit");
     assert!(guest.child.wait().expect("wait for VT-d guest").success());

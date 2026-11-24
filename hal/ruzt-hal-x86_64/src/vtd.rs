@@ -1,9 +1,13 @@
 //! Register interface for legacy Intel VT-d DMA translation.
 
+use core::sync::atomic::{fence, Ordering};
+
 use ruzt_hal::mem::{PhysFrame, VirtAddr};
 use spin::Mutex;
 
+mod interrupts;
 mod queue;
+pub use interrupts::InterruptTable;
 use queue::Queue;
 
 const VERSION: usize = 0;
@@ -17,7 +21,7 @@ const FAULT_EVENT_CONTROL: usize = 0x38;
 const TRANSLATION_ENABLE: u32 = 1 << 31;
 const SET_ROOT_POINTER: u32 = 1 << 30;
 const WRITE_BUFFER_FLUSH: u32 = 1 << 27;
-const GLOBAL_PERSISTENT_STATE: u32 = TRANSLATION_ENABLE | queue::ENABLE;
+const GLOBAL_PERSISTENT_STATE: u32 = TRANSLATION_ENABLE | queue::ENABLE | interrupts::ENABLE;
 const INVALIDATE: u64 = 1 << 63;
 const CONTEXT_GLOBAL: u64 = 1 << 61;
 const IOTLB_GLOBAL: u64 = 1 << 60;
@@ -35,6 +39,8 @@ pub enum Error {
     TimedOut,
     /// An invalidation failed or the queue lost synchronization.
     InvalidationFailed,
+    /// The CPU cannot publish cacheable pages for a non-coherent unit.
+    CacheMaintenance,
 }
 
 /// A remapping unit with registers mapped uncached.
@@ -86,11 +92,6 @@ impl Unit {
         Ok(unit)
     }
 
-    /// Whether the unit observes cached CPU writes to translation tables.
-    pub fn coherent(&self) -> bool {
-        self.extended & 1 != 0
-    }
-
     /// Whether second-stage leaves can force DMA to snoop processor caches.
     pub fn snoop_control(&self) -> bool {
         self.extended & (1 << 7) != 0
@@ -120,6 +121,39 @@ impl Unit {
     /// Whether translation is using the invalidation queue.
     pub fn uses_queued_invalidation(&self) -> bool {
         self.queue.is_some()
+    }
+
+    /// Whether interrupt remapping is available in the requested LAPIC mode.
+    pub fn supports_interrupt_remapping(&self, extended: bool) -> bool {
+        let mode_supported = if extended {
+            self.extended & (1 << 4) != 0
+        } else {
+            self.extended & (1 << 61) == 0
+        };
+        self.queue.is_some() && self.extended & (1 << 3) != 0 && mode_supported
+    }
+
+    /// Publish a page of translation entries to the remapper.
+    ///
+    /// # Safety
+    /// The alias must cover one aligned, mapped page of remapping entries.
+    pub unsafe fn publish_frame(&self, alias: VirtAddr) -> Result<(), Error> {
+        if self.extended & 1 == 0 {
+            let features = core::arch::x86_64::__cpuid(1);
+            let line = ((features.ebx >> 8) & 0xff) as usize * 8;
+            if features.edx & (1 << 19) == 0 || !line.is_power_of_two() || line > PhysFrame::SIZE {
+                return Err(Error::CacheMaintenance);
+            }
+            for offset in (0..PhysFrame::SIZE).step_by(line) {
+                // SAFETY: The caller guarantees the page and CPUID confirms CLFLUSH.
+                unsafe {
+                    core::arch::asm!("clflush [{address}]", address = in(reg) alias.as_u64() + offset as u64,
+                        options(nostack, preserves_flags));
+                }
+            }
+        }
+        fence(Ordering::SeqCst);
+        Ok(())
     }
 
     /// Maximum count of distinct domain IDs, including reserved ID zero.
@@ -193,6 +227,11 @@ impl Unit {
     fn command(&self, bits: u32) {
         let state = self.read32(GLOBAL_STATUS) & GLOBAL_PERSISTENT_STATE;
         self.write32(GLOBAL_COMMAND, state | bits);
+    }
+
+    fn invalidate_interrupts(&self) -> Result<(), Error> {
+        let queue = self.queue.as_ref().ok_or(Error::Unsupported)?;
+        queue.lock().invalidate_interrupts(self)
     }
 
     /// Whether the unit has logged a fault for this source and DMA page.

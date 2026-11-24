@@ -6,6 +6,7 @@ use spin::{Mutex, Once};
 use crate::{
     apic::{Input, IoApic, LocalApic},
     pic,
+    vtd::InterruptTable,
 };
 
 /// The existing ISA logical interrupt namespace.
@@ -25,6 +26,29 @@ struct ApicRoutes {
     local: LocalApic,
     inputs: [Option<Input>; ISA_IRQ_COUNT],
     extended: Mutex<[Option<GsiInput>; IRQ_COUNT - ISA_IRQ_COUNT]>,
+    remapping: Option<IoApicRemapping>,
+}
+
+/// A VT-d table and the exact requester ID of each firmware-mapped I/O APIC.
+pub struct IoApicRemapping {
+    /// A pinned table ready to be programmed.
+    pub table: &'static InterruptTable,
+    /// Requester IDs indexed by verified I/O APIC ID.
+    pub sources: &'static [Option<u16>; 256],
+}
+
+impl IoApicRemapping {
+    fn stage(&self, input: Input, line: u8, destination: u8) {
+        let source = self.sources[usize::from(input.controller_id())]
+            .expect("validate all I/O APIC requester IDs before enabling remapping");
+        self.table.stage(
+            line,
+            source,
+            VECTOR_BASE + line,
+            destination,
+            input.level_triggered(),
+        );
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -43,6 +67,8 @@ pub enum ReserveError {
     Occupied,
     /// All extended IRQ vectors are in use or draining.
     NoVector,
+    /// The remapper failed to synchronize its table.
+    RemappingFailed,
 }
 
 static APIC: Once<ApicRoutes> = Once::new();
@@ -54,11 +80,13 @@ static APIC: Once<ApicRoutes> = Once::new();
 /// gates for the IRQ range and LAPIC spurious vector. All controller windows
 /// must stay mapped uncached, and inputs must refer to unique pins on those
 /// controllers. If firmware advertises compatible PICs, set `mask_pics`.
+/// A remapping configuration must cover every supplied controller.
 pub unsafe fn install_apic(
     local: LocalApic,
     controllers: impl IntoIterator<Item = IoApic>,
     inputs: [Option<Input>; ISA_IRQ_COUNT],
     mask_pics: bool,
+    remapping: Option<IoApicRemapping>,
 ) {
     let routes = APIC.call_once(|| {
         for controller in controllers {
@@ -66,17 +94,31 @@ pub unsafe fn install_apic(
         }
         for (line, input) in inputs.iter().enumerate() {
             if let Some(input) = input {
-                input.configure(VECTOR_BASE + line as u8, local.id());
+                let line = line as u8;
+                let index = remapping.as_ref().map(|mapping| {
+                    mapping.stage(*input, line, local.id());
+                    line
+                });
+                input.configure(VECTOR_BASE + line, local.id(), index);
             }
         }
         if mask_pics {
             pic::mask_all();
         }
         local.enable();
+        if let Some(mapping) = &remapping {
+            // A failed command can leave the hardware between modes. With
+            // the inputs masked, halt before allowing any ambiguous delivery.
+            mapping
+                .table
+                .activate()
+                .expect("enable VT-d interrupt remapping");
+        }
         ApicRoutes {
             local,
             inputs,
             extended: Mutex::new([None; IRQ_COUNT - ISA_IRQ_COUNT]),
+            remapping,
         }
     });
     for line in [TIMER, KEYBOARD] {
@@ -109,12 +151,23 @@ pub unsafe fn reserve_gsi(gsi: u32, input: Input) -> Result<u32, ReserveError> {
         if let Some(old) = slot {
             // Drain deliveries issued before masking before reusing a vector
             // for another input or reprogramming the retired pin.
-            if old.retired
-                && old.input.delivery_idle()
-                && routes.local.vector_idle(extended_vector(index))
-            {
-                *slot = None;
-            } else if old.gsi == gsi {
+            if old.retired && old.input.delivery_idle() {
+                if let Some(mapping) = &routes.remapping {
+                    mapping
+                        .table
+                        .retire(extended_line(index))
+                        .map_err(|_| ReserveError::RemappingFailed)?;
+                }
+                // Interrupt-cache invalidation drains the remapper before
+                // checking the receiving CPU for the previous delivery.
+                if old.input.delivery_idle()
+                    && routes.local.vector_idle(VECTOR_BASE + extended_line(index))
+                {
+                    *slot = None;
+                    continue;
+                }
+            }
+            if old.gsi == gsi {
                 return Err(ReserveError::Occupied);
             }
         }
@@ -124,13 +177,28 @@ pub unsafe fn reserve_gsi(gsi: u32, input: Input) -> Result<u32, ReserveError> {
         .enumerate()
         .find(|(_, slot)| slot.is_none())
         .ok_or(ReserveError::NoVector)?;
-    input.configure(extended_vector(index), routes.local.id());
+    let line = extended_line(index);
+    let remap_index = if let Some(mapping) = &routes.remapping {
+        mapping.stage(input, line, routes.local.id());
+        if mapping.table.sync().is_err() {
+            *slot = Some(GsiInput {
+                gsi,
+                input,
+                retired: true,
+            });
+            return Err(ReserveError::RemappingFailed);
+        }
+        Some(line)
+    } else {
+        None
+    };
+    input.configure(VECTOR_BASE + line, routes.local.id(), remap_index);
     *slot = Some(GsiInput {
         gsi,
         input,
         retired: false,
     });
-    Ok((ISA_IRQ_COUNT + index) as u32)
+    Ok(u32::from(line))
 }
 
 /// Mask a released extended route and retire its vector.
@@ -145,8 +213,8 @@ pub fn release_gsi(line: u32) {
     }
 }
 
-fn extended_vector(index: usize) -> u8 {
-    VECTOR_BASE + (ISA_IRQ_COUNT + index) as u8
+fn extended_line(index: usize) -> u8 {
+    (ISA_IRQ_COUNT + index) as u8
 }
 
 /// Consume an 8259A spurious delivery if the legacy PIC is in use.

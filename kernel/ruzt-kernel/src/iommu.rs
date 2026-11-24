@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use ruzt_abi::PciAddress;
 use ruzt_hal::boot::{BootInfo, FirmwareTables, MemoryRegionKind};
 use ruzt_hal::mem::{PhysFrame, VirtAddr};
-use ruzt_hal_x86_64::{mapper, vtd};
+use ruzt_hal_x86_64::{irq::IoApicRemapping, mapper, vtd};
 use spin::{Mutex, Once};
 
 use crate::{acpi, mm::frame};
@@ -16,6 +16,8 @@ pub(crate) use domain::{bind, detach_revoked, detach_thread, unbind};
 mod probe;
 
 const DMAR_HEADER: usize = 48;
+const INTERRUPT_REMAP: u8 = 1;
+const X2APIC_OPT_OUT: u8 = 1 << 1;
 const INCLUDE_ALL: u8 = 1;
 const DRHD: u16 = 0;
 const RMRR: u16 = 1;
@@ -27,6 +29,13 @@ struct Remapper {
     base: u64,
     host_bits: u8,
     scope: Scope,
+    interrupts: Option<InterruptTopology>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct InterruptTopology {
+    x2apic_opt_out: bool,
+    ioapics: [Option<u16>; 256],
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -51,7 +60,6 @@ enum Error {
     UnsupportedTopology,
     BadRegisters,
     NoMemory,
-    CacheMaintenance,
     Hardware(vtd::Error),
 }
 
@@ -59,6 +67,7 @@ struct Controller {
     unit: vtd::Unit,
     root: PhysFrame,
     scope: Scope,
+    interrupts: Option<InterruptTopology>,
     host_bits: u8,
     domains: Mutex<domain::Domains>,
 }
@@ -71,6 +80,7 @@ impl Controller {
 
 static CONTROLLER: Once<Controller> = Once::new();
 static MMIO_PAGE: Once<u64> = Once::new();
+static INTERRUPT_TABLE: Once<vtd::InterruptTable> = Once::new();
 
 pub(crate) fn overlaps_mmio(start: u64, end: u64) -> bool {
     MMIO_PAGE
@@ -85,6 +95,57 @@ pub(crate) fn permits_pci_handoff(address: PciAddress) -> bool {
     CONTROLLER
         .get()
         .is_some_and(|controller| controller.protects_requester(address))
+}
+
+pub(crate) fn prepare_ioapic_remapping(
+    ioapic_ids: impl IntoIterator<Item = u8>,
+    x2apic: bool,
+) -> Option<IoApicRemapping> {
+    let controller = CONTROLLER.get()?;
+    let firmware = controller.interrupts.as_ref()?;
+    if (x2apic && firmware.x2apic_opt_out)
+        || !controller.unit.supports_interrupt_remapping(x2apic)
+        || ioapic_ids
+            .into_iter()
+            .any(|id| firmware.ioapics[usize::from(id)].is_none())
+    {
+        return None;
+    }
+    let table = match INTERRUPT_TABLE.try_call_once(|| allocate_interrupt_table(controller, x2apic))
+    {
+        Ok(table) => table,
+        Err(error) => {
+            crate::serial_println!("VT-d interrupt table unavailable: {error:?}");
+            return None;
+        }
+    };
+    Some(IoApicRemapping {
+        table,
+        sources: &firmware.ioapics,
+    })
+}
+
+fn allocate_interrupt_table(
+    controller: &'static Controller,
+    x2apic: bool,
+) -> Result<vtd::InterruptTable, Error> {
+    let frame = frame::allocate().ok_or(Error::NoMemory)?;
+    let alias = frame_alias(frame);
+    match alias {
+        #[allow(unsafe_code)]
+        Ok(alias) if frame.base.as_u64() < 1 << controller.host_bits => {
+            // SAFETY: The allocator owns this frame and the physmap covers
+            // it. It stays pinned after allocation even if activation fails.
+            Ok(unsafe {
+                mapper::zero_frame(frame);
+                vtd::InterruptTable::new(&controller.unit, frame, alias, x2apic)
+            })
+        }
+        _ => {
+            frame::deallocate(frame);
+            Err(Error::BadRegisters)
+        }
+    }
 }
 
 pub(crate) fn init(boot: &BootInfo) {
@@ -138,7 +199,10 @@ fn start(boot: &BootInfo) -> Result<Option<Controller>, Error> {
     if boot.memory_map.iter().any(|region| {
         remapper.base < region.end.as_u64()
             && region.start.as_u64() < end
-            && !matches!(region.kind, MemoryRegionKind::Reserved | MemoryRegionKind::Mmio)
+            && !matches!(
+                region.kind,
+                MemoryRegionKind::Reserved | MemoryRegionKind::Mmio
+            )
     }) {
         return Err(Error::BadRegisters);
     }
@@ -168,7 +232,7 @@ fn start(boot: &BootInfo) -> Result<Option<Controller>, Error> {
     unsafe {
         mapper::zero_frame(root)
     };
-    if let Err(error) = frame_alias(root).and_then(|alias| publish(alias, unit.coherent())) {
+    if let Err(error) = frame_alias(root).and_then(|alias| publish(alias, &unit)) {
         frame::deallocate(root);
         return Err(error);
     }
@@ -191,6 +255,7 @@ fn start(boot: &BootInfo) -> Result<Option<Controller>, Error> {
         unit,
         root,
         scope: remapper.scope,
+        interrupts: remapper.interrupts,
         host_bits: remapper.host_bits,
         domains: Mutex::new(domain::Domains::new()),
     }))
@@ -220,29 +285,10 @@ fn frame_alias(frame: PhysFrame) -> Result<VirtAddr, Error> {
         .ok_or(Error::BadRegisters)
 }
 
-fn publish(alias: VirtAddr, coherent: bool) -> Result<(), Error> {
-    if !coherent {
-        flush_frame(alias)?;
-    }
-    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-    Ok(())
-}
-
 #[allow(unsafe_code)]
-fn flush_frame(alias: VirtAddr) -> Result<(), Error> {
-    let features = core::arch::x86_64::__cpuid(1);
-    let line = ((features.ebx >> 8) & 0xff) as usize * 8;
-    if features.edx & (1 << 19) == 0 || !line.is_power_of_two() || line > PhysFrame::SIZE {
-        return Err(Error::CacheMaintenance);
-    }
-    for offset in (0..PhysFrame::SIZE).step_by(line) {
-        // SAFETY: The address lies in the fresh frame and CPUID confirms CLFSH.
-        unsafe {
-            core::arch::asm!("clflush [{address}]", address = in(reg) alias.as_u64() + offset as u64,
-                options(nostack, preserves_flags));
-        }
-    }
-    Ok(())
+fn publish(alias: VirtAddr, unit: &vtd::Unit) -> Result<(), Error> {
+    // SAFETY: Only the allocator's private, aligned remapping pages reach here.
+    unsafe { unit.publish_frame(alias) }.map_err(Error::Hardware)
 }
 
 fn parse_dmar(bytes: &[u8]) -> Result<Remapper, Error> {
@@ -253,6 +299,7 @@ fn parse_dmar(bytes: &[u8]) -> Result<Remapper, Error> {
         .filter(|bits| (32..=52).contains(bits))
         .ok_or(Error::BadDmar)?;
     let mut structures = bytes.get(DMAR_HEADER..).ok_or(Error::BadDmar)?;
+    let flags = bytes[37];
     let mut remapper = None;
     while !structures.is_empty() {
         let header = structures.get(..4).ok_or(Error::BadDmar)?;
@@ -280,11 +327,18 @@ fn parse_dmar(bytes: &[u8]) -> Result<Remapper, Error> {
                 {
                     return Err(Error::BadRegisters);
                 }
-                let scope = parse_scope(structure[4], &structure[16..])?;
+                let (scope, ioapics) = parse_scope(structure[4], &structure[16..])?;
+                let interrupts = ioapics
+                    .filter(|_| flags & INTERRUPT_REMAP != 0)
+                    .map(|ioapics| InterruptTopology {
+                        x2apic_opt_out: flags & X2APIC_OPT_OUT != 0,
+                        ioapics,
+                    });
                 remapper = Some(Remapper {
                     base,
                     host_bits,
                     scope,
+                    interrupts,
                 });
             }
             RMRR | ATSR | SATC => return Err(Error::UnsupportedTopology),
@@ -295,9 +349,13 @@ fn parse_dmar(bytes: &[u8]) -> Result<Remapper, Error> {
     remapper.ok_or(Error::UnsupportedTopology)
 }
 
-fn parse_scope(flags: u8, mut entries: &[u8]) -> Result<Scope, Error> {
+type IoApicSources = [Option<u16>; 256];
+
+fn parse_scope(flags: u8, mut entries: &[u8]) -> Result<(Scope, Option<IoApicSources>), Error> {
     let all = flags & INCLUDE_ALL != 0;
     let mut endpoints = Vec::new();
+    let mut ioapics = [None; 256];
+    let mut complete = true;
     while !entries.is_empty() {
         let header = entries.get(..6).ok_or(Error::BadDmar)?;
         let length = usize::from(header[1]);
@@ -314,18 +372,36 @@ fn parse_scope(flags: u8, mut entries: &[u8]) -> Result<Scope, Error> {
                 endpoints.try_reserve(1).map_err(|_| Error::NoMemory)?;
                 endpoints.push(address);
             }
-            3 | 4 => {} // Interrupt-only scopes do not grant DMA coverage.
+            3 if length == 8 => {
+                let id = usize::from(header[4]);
+                let source = PciAddress::new(header[5], entries[6], entries[7])
+                    .ok_or(Error::BadDmar)?
+                    .bits();
+                if ioapics[id].is_some() || ioapics.contains(&Some(source)) {
+                    return Err(Error::BadDmar);
+                }
+                ioapics[id] = Some(source);
+            }
+            3 => complete = false, // Resolving a bridged requester requires PCI topology.
+            4 => {}                // HPET is unused.
             _ => return Err(Error::UnsupportedTopology),
         }
         entries = &entries[length..];
     }
-    if all {
-        Ok(Scope::All)
-    } else if endpoints.is_empty() {
-        Err(Error::UnsupportedTopology)
-    } else {
-        Ok(Scope::Endpoints(endpoints))
+    if endpoints
+        .iter()
+        .any(|address| ioapics.contains(&Some(address.bits())))
+    {
+        return Err(Error::BadDmar);
     }
+    let scope = if all {
+        Scope::All
+    } else if endpoints.is_empty() {
+        return Err(Error::UnsupportedTopology);
+    } else {
+        Scope::Endpoints(endpoints)
+    };
+    Ok((scope, complete.then_some(ioapics)))
 }
 
 #[cfg(test)]
@@ -345,6 +421,7 @@ mod tests {
                 base: 0xfed9_0000,
                 host_bits: 40,
                 scope: Scope::All,
+                interrupts: None,
             })
         );
         assert_eq!(parse_dmar(&table[..DMAR_HEADER + 15]), Err(Error::BadDmar));
@@ -362,12 +439,33 @@ mod tests {
     fn records_direct_pci_requesters_from_scoped_units() {
         let entry = [1, 8, 0, 0, 0, 0, 3, 1];
         assert_eq!(
-            parse_scope(0, &entry),
+            parse_scope(0, &entry).map(|(scope, _)| scope),
             Ok(Scope::Endpoints(alloc::vec![
                 PciAddress::new(0, 3, 1).unwrap()
             ]))
         );
         assert_eq!(parse_scope(1, &entry), Err(Error::UnsupportedTopology));
         assert_eq!(parse_scope(0, &entry[..7]), Err(Error::BadDmar));
+    }
+
+    #[test]
+    fn keeps_ioapic_requester_ids_separate_from_dma_coverage() {
+        let endpoint = [1, 8, 0, 0, 0, 0, 3, 1];
+        let ioapic = [3, 8, 0, 0, 2, 0xff, 0, 0];
+        let (dma, sources) = parse_scope(0, &[endpoint, ioapic].concat()).unwrap();
+        assert!(dma.covers(PciAddress::new(0, 3, 1).unwrap()));
+        assert!(!dma.covers(PciAddress::new(0xff, 0, 0).unwrap()));
+        assert_eq!(sources.unwrap()[2], Some(0xff00));
+        assert_eq!(
+            parse_scope(INCLUDE_ALL, &[ioapic, ioapic].concat()),
+            Err(Error::BadDmar)
+        );
+        let bridged = [3, 10, 0, 0, 2, 0, 3, 0, 4, 0];
+        assert_eq!(parse_scope(INCLUDE_ALL, &bridged), Ok((Scope::All, None)));
+        let alias = [3, 8, 0, 0, 2, 0, 3, 1];
+        assert_eq!(
+            parse_scope(0, &[endpoint, alias].concat()),
+            Err(Error::BadDmar)
+        );
     }
 }
