@@ -19,6 +19,7 @@ mod apic;
 mod iommu;
 mod irq;
 mod pci;
+mod smp;
 pub mod serial;
 pub mod vga;
 pub mod exceptions;
@@ -66,6 +67,11 @@ pub fn main(boot_info: &'static mut BootInfo) -> ! {
     };
 
     mm::frame::init(boot_info);
+    let startup = if matches!(boot_info.firmware_tables, ruzt_hal::boot::FirmwareTables::Acpi { .. }) {
+        smp::reserve_startup_page()
+    } else {
+        None
+    };
 
     let offset = boot_info
         .physical_memory_offset
@@ -120,6 +126,7 @@ pub fn main(boot_info: &'static mut BootInfo) -> ! {
     mm::heap::smoke_test();
 
     apic::init(boot_info);
+    smp::start(startup);
 
     #[allow(unsafe_code)]
     // Safety: Called once after IRQ routing is ready, before enabling interrupts.

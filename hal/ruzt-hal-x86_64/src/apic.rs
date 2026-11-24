@@ -11,9 +11,24 @@ const VERSION: usize = 0x30;
 const LVT_MASK: u32 = 1 << 16;
 const REDIRECTION_START: u8 = 0x10;
 const REDIRECTION_MASK: u32 = 1 << 16;
+const ICR: usize = 0x300;
+const ICR_DESTINATION: usize = 0x310;
+const DELIVERY_PENDING: u32 = 1 << 12;
 
 /// Vector used for LAPIC spurious delivery. This vector needs no EOI.
 pub const SPURIOUS_VECTOR: u8 = 0xff;
+/// Fixed-vector interprocessor interrupt for the secondary CPU mailbox.
+pub const WAKE_VECTOR: u8 = 0xf0;
+
+/// A physical unicast command sent over the local APIC.
+pub enum Ipi {
+    /// Put a secondary into the wait-for-SIPI state.
+    Init,
+    /// Start at the given 4 KiB real-mode address index.
+    Startup(u8),
+    /// Interrupt a CPU whose kernel IDT is live.
+    Wake,
+}
 
 /// The boot CPU's local interrupt controller.
 pub struct LocalApic {
@@ -111,6 +126,72 @@ impl LocalApic {
     /// Physical destination ID usable by a legacy I/O APIC.
     pub fn id(&self) -> u8 {
         self.id
+    }
+
+    pub(crate) fn current_id(&self) -> u8 {
+        match self.registers {
+            LocalRegisters::Xapic(_) => (self.registers.read(0x20) >> 24) as u8,
+            LocalRegisters::X2apic => self.registers.read(0x20) as u8,
+        }
+    }
+
+    /// Match the BSP's APIC mode and enable local delivery on a secondary.
+    ///
+    /// # Safety
+    /// Call on this secondary with interrupts disabled and a live IDT.
+    /// The optional xAPIC alias is the validated uncached hardware page.
+    pub unsafe fn init_secondary(physical: u64, alias: Option<VirtAddr>) -> Option<Self> {
+        let (base, extended) = Self::location()?;
+        if base != physical || (extended && alias.is_some()) {
+            return None;
+        }
+        if !extended && alias.is_none() {
+            if core::arch::x86_64::__cpuid(1).ecx & (1 << 21) == 0 {
+                return None;
+            }
+            // SAFETY: The CPU reports x2APIC and already runs with the APIC enabled.
+            unsafe {
+                let mut msr = Msr::new(APIC_BASE_MSR);
+                msr.write(msr.read() | X2APIC_MODE);
+            }
+        }
+        // SAFETY: This CPU now uses the mode named by the validated alias.
+        let local = unsafe { Self::inspect(alias) }?;
+        local.enable();
+        Some(local)
+    }
+
+    pub(crate) fn send_ipi(&self, destination: u8, message: Ipi) -> bool {
+        let low = match message {
+            Ipi::Init => (5 << 8) | (1 << 14) | (1 << 15),
+            Ipi::Startup(vector) => (6 << 8) | u32::from(vector),
+            Ipi::Wake => u32::from(WAKE_VECTOR),
+        };
+        match self.registers {
+            LocalRegisters::Xapic(_) => {
+                if !self.icr_idle() {
+                    return false;
+                }
+                self.registers.write(ICR_DESTINATION, u32::from(destination) << 24);
+                self.registers.write(ICR, low);
+                self.icr_idle()
+            }
+            LocalRegisters::X2apic => {
+                // SAFETY: x2APIC is enabled and the command uses physical unicast.
+                unsafe { Msr::new(0x830).write((u64::from(destination) << 32) | u64::from(low)) };
+                true
+            }
+        }
+    }
+
+    fn icr_idle(&self) -> bool {
+        for _ in 0..1_000_000 {
+            if self.registers.read(ICR) & DELIVERY_PENDING == 0 {
+                return true;
+            }
+            core::hint::spin_loop();
+        }
+        false
     }
 
     pub(crate) fn end_of_interrupt(&self) {

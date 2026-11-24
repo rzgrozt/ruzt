@@ -5,7 +5,7 @@ use ruzt_abi::{ProcessStatus, PROCESS_FAULTED};
 use ruzt_hal::cpu::CpuOps;
 use ruzt_hal::time::Timer;
 use ruzt_hal_x86_64::{
-    apic::SPURIOUS_VECTOR,
+    apic::{SPURIOUS_VECTOR, WAKE_VECTOR},
     irq::{IRQ_COUNT, VECTOR_BASE},
 };
 use spin::Once;
@@ -55,6 +55,7 @@ interrupt_entry!(instruction_entry<VECTOR: u32> => instruction_fault);
 interrupt_entry!(protection_entry<VECTOR: u32> => protection_fault);
 interrupt_entry!(timer_entry => timer_handler);
 interrupt_entry!(spurious_entry => spurious_handler);
+interrupt_entry!(wake_entry => wake_handler);
 interrupt_entry!(device_entry<LINE: u8> => device_irq);
 
 /// Initialises the global IDT with breakpoint, double-fault, page-fault, timer,
@@ -106,11 +107,16 @@ pub fn init_idt() {
                 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95
             );
             gate!(idt[SPURIOUS_VECTOR], spurious_entry);
+            gate!(idt[WAKE_VECTOR], wake_entry);
             gate!(idt[0x80], syscall_handler).set_privilege_level(x86_64::PrivilegeLevel::Ring3);
         }
         idt
     });
     idt.load();
+}
+
+extern "x86-interrupt" fn wake_handler(_frame: InterruptStackFrame) {
+    crate::smp::wake();
 }
 
 #[unsafe(naked)]

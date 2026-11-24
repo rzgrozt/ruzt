@@ -1,6 +1,6 @@
 //! x86_64 global descriptor table and task-state segment setup.
 
-use core::cell::UnsafeCell;
+use core::{cell::UnsafeCell, mem::MaybeUninit};
 
 use spin::Once;
 use x86_64::{
@@ -63,13 +63,56 @@ struct GdtState {
 
 static RING3_TRAP_STACK: Ring3TrapStack = Ring3TrapStack::new();
 
-struct CpuTss(UnsafeCell<TaskStateSegment>);
+struct CpuTables {
+    tss: UnsafeCell<TaskStateSegment>,
+    gdt: UnsafeCell<MaybeUninit<GdtState>>,
+}
 
-// SAFETY: The boot CPU is the only CPU that reads or updates the TSS.
-unsafe impl Sync for CpuTss {}
+impl CpuTables {
+    const fn new() -> Self {
+        Self {
+            tss: UnsafeCell::new(TaskStateSegment::new()),
+            gdt: UnsafeCell::new(MaybeUninit::uninit()),
+        }
+    }
 
-static TASK_STATE_SEGMENT: CpuTss = CpuTss(UnsafeCell::new(TaskStateSegment::new()));
-static GDT: Once<GdtState> = Once::new();
+    unsafe fn load(&'static self, trap_top: u64, double_fault_top: u64) {
+        let tss = self.tss.get();
+        // SAFETY: This CPU exclusively owns these tables and interrupts
+        // stay disabled while it constructs and installs the descriptors.
+        unsafe {
+            self.write_trap_stack(trap_top);
+            core::ptr::addr_of_mut!((*tss).interrupt_stack_table)
+                .cast::<VirtAddr>()
+                .add(usize::from(DOUBLE_FAULT_IST_INDEX))
+                .write_unaligned(VirtAddr::new(double_fault_top));
+            let gdt = (*self.gdt.get()).write(build_gdt(tss));
+            gdt.table.load();
+            CS::set_reg(gdt.kernel_code);
+            SS::set_reg(gdt.kernel_data);
+            DS::set_reg(gdt.kernel_data);
+            ES::set_reg(gdt.kernel_data);
+            load_tss(gdt.tss);
+        }
+    }
+
+    unsafe fn write_trap_stack(&self, top: u64) {
+        let tss = self.tss.get();
+        // SAFETY: RSP0 is packed. The caller owns the CPU's TSS.
+        unsafe {
+            core::ptr::addr_of_mut!((*tss).privilege_stack_table)
+                .cast::<VirtAddr>()
+                .write_unaligned(VirtAddr::new(top));
+        }
+    }
+}
+
+// SAFETY: A CPU exclusively owns its tables after initialization. Hardware
+// marks its own GDT's TSS descriptor busy through the interior-mutable cell.
+unsafe impl Sync for CpuTables {}
+
+static BSP: CpuTables = CpuTables::new();
+static SECONDARIES: [CpuTables; 255] = [const { CpuTables::new() }; 255];
 static INIT: Once<()> = Once::new();
 
 unsafe fn build_gdt(tss: *const TaskStateSegment) -> GdtState {
@@ -111,36 +154,19 @@ unsafe fn build_gdt(tss: *const TaskStateSegment) -> GdtState {
 /// stack that no other handler or CPU uses.
 pub unsafe fn init(double_fault_top: u64) {
     INIT.call_once(|| {
-        // SAFETY: The boot CPU owns this TSS and interrupts are disabled.
-        unsafe {
-            set_trap_stack(RING3_TRAP_STACK.top().as_u64());
-            let tss = TASK_STATE_SEGMENT.0.get();
-            core::ptr::addr_of_mut!((*tss).interrupt_stack_table)
-                .cast::<VirtAddr>()
-                .add(usize::from(DOUBLE_FAULT_IST_INDEX))
-                .write_unaligned(VirtAddr::new(double_fault_top));
-        }
-        // SAFETY: The TSS lives at a fixed address for the kernel's lifetime.
-        let gdt = GDT.call_once(|| unsafe { build_gdt(TASK_STATE_SEGMENT.0.get()) });
-
-        gdt.table.load();
-
-        // SAFETY: [Category 13 - Library contract] `build_gdt` verified that
-        // this selector names the present 64-bit ring-0 code descriptor.
-        unsafe { CS::set_reg(gdt.kernel_code) };
-        // SAFETY: [Category 13 - Library contract] `build_gdt` verified that
-        // this selector names the present writable ring-0 data descriptor.
-        unsafe { SS::set_reg(gdt.kernel_data) };
-        // SAFETY: [Category 13 - Library contract] The same verified ring-0
-        // data descriptor is valid for DS in 64-bit mode.
-        unsafe { DS::set_reg(gdt.kernel_data) };
-        // SAFETY: [Category 13 - Library contract] The same verified ring-0
-        // data descriptor is valid for ES in 64-bit mode.
-        unsafe { ES::set_reg(gdt.kernel_data) };
-        // SAFETY: [Category 13 - Library contract] `gdt.tss` selects the
-        // static TSS whose canonical RSP0 points to the aligned trap stack.
-        unsafe { load_tss(gdt.tss) };
+        // SAFETY: The boot CPU owns these tables and interrupts are disabled.
+        unsafe { BSP.load(RING3_TRAP_STACK.top().as_u64(), double_fault_top) };
     });
+}
+
+/// Install distinct descriptor tables on a secondary CPU.
+///
+/// # Safety
+/// Call once on the secondary with interrupts disabled and its assigned
+/// APIC ID. Both stacks must be private, supervisor-only, and remain live.
+pub unsafe fn init_secondary(id: u8, trap_top: u64, double_fault_top: u64) {
+    // SAFETY: The caller exclusively owns this CPU's tables and stacks.
+    unsafe { SECONDARIES[usize::from(id)].load(trap_top, double_fault_top) };
 }
 
 /// Set the kernel stack used for the next privilege transition from ring 3.
@@ -150,14 +176,8 @@ pub unsafe fn init(double_fault_top: u64) {
 /// remain live while it is installed, and be mapped supervisor-only in every
 /// active address space.
 pub unsafe fn set_trap_stack(top: u64) {
-    let tss = TASK_STATE_SEGMENT.0.get();
-    // SAFETY: The caller owns this CPU's TSS. RSP0 is packed, so use an
-    // unaligned write through the raw pointer without borrowing the field.
-    unsafe {
-        core::ptr::addr_of_mut!((*tss).privilege_stack_table)
-            .cast::<VirtAddr>()
-            .write_unaligned(VirtAddr::new(top));
-    }
+    // SAFETY: The caller owns the boot CPU's TSS with interrupts disabled.
+    unsafe { BSP.write_trap_stack(top) };
 }
 
 /// Restore the boot CPU's fallback privilege stack.

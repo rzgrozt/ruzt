@@ -4,7 +4,7 @@ use ruzt_hal::irq::{IrqController, IrqNumber};
 use spin::{Mutex, Once};
 
 use crate::{
-    apic::{Input, IoApic, LocalApic},
+    apic::{Input, IoApic, Ipi, LocalApic},
     pci::{Msi, Msix},
     pic,
     vtd::InterruptTable,
@@ -155,6 +155,26 @@ pub enum ReserveError {
 }
 
 static APIC: Once<ApicRoutes> = Once::new();
+
+/// Send a physical unicast interrupt from the boot CPU.
+///
+/// # Safety
+/// The boot CPU owns the local ICR with interrupts disabled. The target
+/// and its startup or interrupt state must match the command.
+pub unsafe fn send_ipi(destination: u8, message: Ipi) -> bool {
+    APIC.get().is_some_and(|routes| routes.local.send_ipi(destination, message))
+}
+
+/// Acknowledge an IPI on the receiving CPU and return its APIC ID.
+///
+/// # Safety
+/// A fixed IPI is in service and this CPU uses the kernel's negotiated APIC mode.
+pub unsafe fn finish_ipi() -> Option<u8> {
+    let local = &APIC.get()?.local;
+    let id = local.current_id();
+    local.end_of_interrupt();
+    Some(id)
+}
 
 /// Install a validated APIC configuration and route the PIT and keyboard.
 ///

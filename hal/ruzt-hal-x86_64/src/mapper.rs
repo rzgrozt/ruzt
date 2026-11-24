@@ -143,6 +143,42 @@ pub struct X86_64Mapper {
 }
 
 impl X86_64Mapper {
+    /// Create four private startup tables with one low identity mapping.
+    ///
+    /// # Safety
+    /// All four frames must be distinct, allocator-owned and direct-mapped.
+    /// The root frame is below 4 GiB, and the startup page is below 1 MiB.
+    /// Keep the tables and shared supervisor hierarchy live until every
+    /// startup target has switched to the permanent kernel root.
+    pub unsafe fn prepare_startup_tables(
+        &mut self,
+        tables: [PhysFrame; 4],
+        startup: PhysFrame,
+    ) {
+        let [root, l3, l2, l1] = tables;
+        let offset = physical_memory_offset();
+        let table = |frame: PhysFrame| (offset + frame.base.as_u64()).as_mut_ptr::<PageTable>();
+        // SAFETY: The input frames are fresh and mutually exclusive. Only
+        // the permanent supervisor roots are borrowed, not their ownership.
+        unsafe {
+            for frame in tables {
+                table(frame).write(PageTable::new());
+            }
+            let top = &mut *table(root);
+            let bsp = self.inner.level_4_table();
+            for index in 256..512 {
+                top[index] = bsp[index].clone();
+            }
+            let present = PageTableFlags::PRESENT;
+            top[0].set_addr(X64PhysAddr::new(l3.base.as_u64()), present);
+            (&mut *table(l3))[0].set_addr(X64PhysAddr::new(l2.base.as_u64()), present);
+            (&mut *table(l2))[0].set_addr(X64PhysAddr::new(l1.base.as_u64()), present);
+            let physical = startup.base.as_u64();
+            (&mut *table(l1))[X64VirtAddr::new(physical).p1_index()]
+                .set_addr(X64PhysAddr::new(physical), present);
+        }
+    }
+
     /// Return the direct-map virtual address if the entire physical range is mapped.
     pub fn physmap_alias(&self, start: u64, bytes: u64) -> Option<VirtAddr> {
         let page = PhysFrame::SIZE as u64;

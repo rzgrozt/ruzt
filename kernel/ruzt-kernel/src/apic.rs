@@ -204,6 +204,18 @@ struct Topology {
     controllers: Vec<Controller>,
     overrides: [Option<Route>; ISA_IRQ_COUNT],
     nmi: Vec<u32>,
+    cpus: CpuTopology,
+}
+
+pub(crate) struct CpuTopology {
+    pub(crate) enabled: [bool; 255],
+    pub(crate) bsp: u8,
+    pub(crate) local_physical: u64,
+    pub(crate) local_alias: Option<VirtAddr>,
+}
+
+pub(crate) fn cpu_topology() -> Option<&'static CpuTopology> {
+    TOPOLOGY.get().map(|topology| &topology.cpus)
 }
 
 pub(crate) fn reserve_gsi(gsi: u32, flags: u64) -> Result<u32, ErrorCode> {
@@ -305,6 +317,7 @@ fn start(boot: &BootInfo) -> Result<bool, Error> {
         return Err(Error::UnusableController);
     }
 
+    let bsp = local.id();
     let remapping = crate::iommu::prepare_ioapic_remapping(
         controllers.iter().map(|unit| unit.hardware.id()),
         x2,
@@ -329,6 +342,12 @@ fn start(boot: &BootInfo) -> Result<bool, Error> {
         controllers,
         overrides: madt.overrides,
         nmi: madt.nmi,
+        cpus: CpuTopology {
+            enabled: madt.processors,
+            bsp,
+            local_physical: base,
+            local_alias,
+        },
     });
     Ok(true)
 }

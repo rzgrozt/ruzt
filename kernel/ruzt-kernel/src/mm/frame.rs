@@ -112,6 +112,14 @@ impl BitmapAllocator {
 
         None
     }
+
+    fn allocate_in_range(&mut self, start: u64, end: u64) -> Option<PhysFrame> {
+        let start = start.div_ceil(FRAME_SIZE as u64).min(MAX_FRAMES as u64) as usize;
+        let end = (end / FRAME_SIZE as u64).min(self.max_frame as u64) as usize;
+        let index = (start..end).find(|&frame| self.is_free(frame))?;
+        self.alloc_specific(index);
+        PhysFrame::from_base(PhysAddr::new((index * FRAME_SIZE) as u64))
+    }
 }
 
 impl FrameAllocator for BitmapAllocator {
@@ -171,6 +179,11 @@ pub fn allocate() -> Option<PhysFrame> {
     ALLOCATOR.lock().allocate()
 }
 
+/// Allocate one free frame whose entire page lies within an aligned range.
+pub(crate) fn allocate_in_range(start: u64, end: u64) -> Option<PhysFrame> {
+    ALLOCATOR.lock().allocate_in_range(start, end)
+}
+
 /// Allocate `count` physically contiguous 4 KiB frames.
 pub fn allocate_contiguous(count: usize) -> Option<PhysFrame> {
     ALLOCATOR.lock().allocate_contiguous(count)
@@ -228,6 +241,22 @@ mod tests {
         let f1 = a.allocate().expect("first allocate should succeed");
         let f2 = a.allocate().expect("second allocate should succeed");
         assert_ne!(f1.base.as_u64(), f2.base.as_u64());
+    }
+
+    #[test]
+    fn range_allocation_reserves_only_whole_frames() {
+        static REGIONS: [MemoryRegion; 1] = [MemoryRegion {
+            start: PhysAddr::new(0x1000),
+            end: PhysAddr::new(0x5000),
+            kind: MemoryRegionKind::Usable,
+        }];
+        let mut allocator = BitmapAllocator::new();
+        allocator.init(&boot_info_from(&REGIONS));
+        let frame = allocator.allocate_in_range(0x1800, 0x3800).unwrap();
+        assert_eq!(frame.base.as_u64(), 0x2000);
+        assert_eq!(allocator.allocate_in_range(0x1800, 0x3800), None);
+        assert_eq!(allocator.allocate().unwrap().base.as_u64(), 0x1000);
+        assert_eq!(allocator.allocate().unwrap().base.as_u64(), 0x3000);
     }
 
     #[test]

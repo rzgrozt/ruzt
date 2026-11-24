@@ -42,6 +42,24 @@ fn test_kernel_boots_and_schedules_blocking_ipc() {
 }
 
 #[test]
+fn test_bios_starts_secondary_cpus_and_delivers_ipis() {
+    let temp = tempfile::tempdir().expect("create SMP test directory");
+    let disk_image = build_image(temp.path(), "qemu-smoke-test", Services::None);
+    let serial = run_smoke_test(&disk_image, &["-smp", "4"]);
+    assert_markers(
+        &serial,
+        &[
+            "Local APIC and I/O APIC interrupt routing enabled",
+            "SMP APIC 1 online and acknowledged a wake IPI",
+            "SMP APIC 2 online and acknowledged a wake IPI",
+            "SMP APIC 3 online and acknowledged a wake IPI",
+            "SMP initialized 3 secondary CPUs",
+            "ipc_test_sender: message sent successfully",
+        ],
+    );
+}
+
+#[test]
 fn test_double_fault_uses_an_emergency_stack_even_with_serial_locked() {
     let temp = tempfile::tempdir().expect("create double-fault test directory");
     let disk = build_image(temp.path(), "qemu-double-fault-test", Services::None);
@@ -89,6 +107,8 @@ fn test_uefi_boots_user_services_with_a_randomized_kernel() {
         let mut devices = vec![
             "-machine",
             "q35",
+            "-smp",
+            "4",
             "-cpu",
             "max",
             &first,
@@ -125,6 +145,7 @@ fn test_uefi_boots_user_services_with_a_randomized_kernel() {
                 "x86 supervisor protection (SMEP=true, SMAP=true)",
                 "Breakpoint returned cleanly.",
                 "Local APIC and I/O APIC interrupt routing enabled",
+                "SMP initialized 3 secondary CPUs",
                 "rootsrv: console write acknowledged over IPC",
                 "rootsrv: framebuffer tile drawn",
             ],

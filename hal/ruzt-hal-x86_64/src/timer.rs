@@ -32,3 +32,39 @@ pub unsafe fn init() {
         PortWriteOnly::new(PIT_CH0).write((DIVISOR >> 8) as u8);
     }
 }
+
+/// Delay using the independent PIT channel 2 one-shot during AP startup.
+///
+/// # Safety
+/// Call on the boot CPU with exclusive access to the PIT and speaker ports.
+/// Keep interrupts disabled. The firmware routes IRQ0 separately on channel 0.
+pub unsafe fn startup_delay_us(microseconds: u16) -> bool {
+    use x86_64::instructions::port::Port;
+    let ticks = (u64::from(microseconds) * u64::from(_PIT_FREQUENCY)).div_ceil(1_000_000);
+    let Ok(ticks) = u16::try_from(ticks) else {
+        return false;
+    };
+    if ticks == 0 {
+        return true;
+    }
+    let mut control = Port::<u8>::new(0x61);
+    // SAFETY: The caller owns all these legacy timers during CPU startup.
+    unsafe {
+        let saved = control.read();
+        control.write(saved & !3);
+        PortWriteOnly::new(PIT_CMD).write(0xb0u8); // Channel 2, mode 0.
+        let mut count = PortWriteOnly::new(0x42);
+        count.write(ticks as u8);
+        count.write((ticks >> 8) as u8);
+        control.write((saved & !2) | 1);
+        for _ in 0..1_000_000 {
+            if control.read() & (1 << 5) != 0 {
+                control.write(saved);
+                return true;
+            }
+            core::hint::spin_loop();
+        }
+        control.write(saved);
+    }
+    false
+}
