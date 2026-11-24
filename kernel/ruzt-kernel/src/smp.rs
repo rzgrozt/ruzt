@@ -28,6 +28,11 @@ const WOKEN: u8 = 2;
 static STATE: [AtomicU8; 255] = [const { AtomicU8::new(OFFLINE) }; 255];
 static PERMANENT_ROOT: Once<u64> = Once::new();
 
+mod shootdown;
+pub(crate) use shootdown::{handle_tlb_ipi, install_shootdown};
+#[cfg(feature = "qemu-smp-test")]
+pub(crate) use shootdown::verify_shootdown;
+
 /// Reserve conventional memory before the general allocator can use it.
 pub(crate) fn reserve_startup_page() -> Option<PhysFrame> {
     frame::allocate_in_range(PAGE, 0x9f000)

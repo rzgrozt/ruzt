@@ -127,6 +127,9 @@ pub fn main(boot_info: &'static mut BootInfo) -> ! {
 
     apic::init(boot_info);
     smp::start(startup);
+    smp::install_shootdown();
+    #[cfg(feature = "qemu-smp-test")]
+    smp::verify_shootdown();
 
     #[allow(unsafe_code)]
     // Safety: Called once after IRQ routing is ready, before enabling interrupts.

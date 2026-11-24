@@ -52,6 +52,7 @@ pub mod startup;
 pub mod vtd;
 pub mod time;
 pub mod timer;
+pub mod tlb;
 
 /// Initialise the x86_64 HAL from the raw bootloader hand-off.
 ///

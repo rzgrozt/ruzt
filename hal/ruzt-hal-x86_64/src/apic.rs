@@ -19,6 +19,8 @@ const DELIVERY_PENDING: u32 = 1 << 12;
 pub const SPURIOUS_VECTOR: u8 = 0xff;
 /// Fixed-vector interprocessor interrupt for the secondary CPU mailbox.
 pub const WAKE_VECTOR: u8 = 0xf0;
+/// Fixed-vector interprocessor interrupt for address-space invalidation.
+pub const TLB_VECTOR: u8 = 0xf1;
 
 /// A physical unicast command sent over the local APIC.
 pub enum Ipi {
@@ -28,6 +30,8 @@ pub enum Ipi {
     Startup(u8),
     /// Interrupt a CPU whose kernel IDT is live.
     Wake,
+    /// Service a published TLB invalidation.
+    Tlb,
 }
 
 /// The boot CPU's local interrupt controller.
@@ -166,6 +170,7 @@ impl LocalApic {
             Ipi::Init => (5 << 8) | (1 << 14) | (1 << 15),
             Ipi::Startup(vector) => (6 << 8) | u32::from(vector),
             Ipi::Wake => u32::from(WAKE_VECTOR),
+            Ipi::Tlb => u32::from(TLB_VECTOR),
         };
         match self.registers {
             LocalRegisters::Xapic(_) => {

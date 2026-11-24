@@ -44,7 +44,7 @@ fn test_kernel_boots_and_schedules_blocking_ipc() {
 #[test]
 fn test_bios_starts_secondary_cpus_and_delivers_ipis() {
     let temp = tempfile::tempdir().expect("create SMP test directory");
-    let disk_image = build_image(temp.path(), "qemu-smoke-test", Services::None);
+    let disk_image = build_image(temp.path(), "qemu-smoke-test,qemu-smp-test", Services::None);
     let serial = run_smoke_test(&disk_image, &["-smp", "4"]);
     assert_markers(
         &serial,
@@ -54,6 +54,8 @@ fn test_bios_starts_secondary_cpus_and_delivers_ipis() {
             "SMP APIC 2 online and acknowledged a wake IPI",
             "SMP APIC 3 online and acknowledged a wake IPI",
             "SMP initialized 3 secondary CPUs",
+            "SMP TLB shootdown replaced a translation cached on every secondary",
+            "SMP TLB shootdown reclaimed page tables active on the secondaries",
             "ipc_test_sender: message sent successfully",
         ],
     );
@@ -79,7 +81,7 @@ fn test_uefi_boots_user_services_with_a_randomized_kernel() {
     let temp = tempfile::tempdir().expect("create UEFI test directory");
     let disk = build_firmware_image(
         temp.path(),
-        "qemu-rootsrv-test,qemu-kaslr-test",
+        "qemu-rootsrv-test,qemu-kaslr-test,qemu-smp-test",
         Services::PciInterruptConsole,
         true,
     );
@@ -146,6 +148,8 @@ fn test_uefi_boots_user_services_with_a_randomized_kernel() {
                 "Breakpoint returned cleanly.",
                 "Local APIC and I/O APIC interrupt routing enabled",
                 "SMP initialized 3 secondary CPUs",
+                "SMP TLB shootdown replaced a translation cached on every secondary",
+                "SMP TLB shootdown reclaimed page tables active on the secondaries",
                 "rootsrv: console write acknowledged over IPC",
                 "rootsrv: framebuffer tile drawn",
             ],

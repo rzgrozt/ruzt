@@ -156,13 +156,21 @@ pub enum ReserveError {
 
 static APIC: Once<ApicRoutes> = Once::new();
 
-/// Send a physical unicast interrupt from the boot CPU.
+/// Send a physical unicast interrupt from the current CPU.
 ///
 /// # Safety
-/// The boot CPU owns the local ICR with interrupts disabled. The target
-/// and its startup or interrupt state must match the command.
+/// The current CPU uses the negotiated APIC mode and owns its local ICR
+/// with interrupts disabled. The target state must match the command.
 pub unsafe fn send_ipi(destination: u8, message: Ipi) -> bool {
     APIC.get().is_some_and(|routes| routes.local.send_ipi(destination, message))
+}
+
+/// Report the ID of the current CPU's local APIC.
+///
+/// # Safety
+/// The current CPU must use the negotiated APIC mode, if initialized.
+pub unsafe fn current_apic_id() -> Option<u8> {
+    APIC.get().map(|routes| routes.local.current_id())
 }
 
 /// Acknowledge an IPI on the receiving CPU and return its APIC ID.

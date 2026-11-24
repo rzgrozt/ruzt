@@ -17,6 +17,8 @@ use x86_64::{
     PhysAddr as X64PhysAddr, VirtAddr as X64VirtAddr,
 };
 
+use crate::tlb::{self, Invalidation};
+
 /// Frame source for the private page tables of one user address space.
 ///
 /// # Safety
@@ -229,9 +231,9 @@ impl X86_64Mapper {
             }
             Ok(())
         })();
-        // All boot physmap changes are shared with user roots, non-global, and
-        // made on the only CPU. Flush even if a later chunk could not split.
-        x86_64::instructions::tlb::flush_all();
+        // All roots share these physmap tables. Flush even if only a prefix
+        // was changed before a later chunk failed.
+        self.flush_all_smp();
         result
     }
 
@@ -325,7 +327,7 @@ impl X86_64Mapper {
         root: PhysFrame,
         frames: &dyn UserPageFrames,
     ) {
-        assert_ne!(Cr3::read().0.start_address().as_u64(), root.base.as_u64());
+        tlb::synchronize(Invalidation::Inactive(root));
         // SAFETY: The caller owns the inactive root and all its lower-half tables.
         unsafe { Self::free_user_tables(root, 4, frames) };
     }
@@ -393,8 +395,8 @@ impl X86_64Mapper {
     /// # Safety
     ///
     /// `root` must be an exclusively managed PML4 from
-    /// [`Self::create_user_address_space`]. It can be active only on the
-    /// calling CPU. Use the same `frames` as when creating the root.
+    /// [`Self::create_user_address_space`]. Invoke with the mapper lock held.
+    /// Use the same `frames` as when creating the root.
     /// `phys` must remain valid for the mapping's lifetime.
     pub unsafe fn map_in_address_space(
         &mut self,
@@ -423,7 +425,7 @@ impl X86_64Mapper {
                 if matches!(error, MapToError::FrameAllocationFailed) {
                     // SAFETY: Only tables on the requested private path can
                     // have been allocated on failure.
-                    unsafe { Self::reclaim_user_tables(&mut mapper, page, active, frames) };
+                    unsafe { Self::reclaim_user_tables(&mut mapper, root, page, frames) };
                 }
                 return Err(convert_map_error(error));
             }
@@ -452,26 +454,24 @@ impl X86_64Mapper {
             .expect("tracked user page must be mapped");
         flush.ignore();
         // SAFETY: The caller owns the private tables on this path.
-        unsafe { Self::reclaim_user_tables(&mut mapper, page, root_is_active(root), frames) };
+        unsafe { Self::reclaim_user_tables(&mut mapper, root, page, frames) };
         PhysFrame::from_base(PhysAddr::new(frame.start_address().as_u64()))
             .expect("aligned user frame")
     }
 
     unsafe fn reclaim_user_tables(
         mapper: &mut OffsetPageTable<'_>,
+        root: PhysFrame,
         page: Page<Size4KiB>,
-        active: bool,
         frames: &dyn UserPageFrames,
     ) {
         let mut detached = DetachedTables([None; 3]);
         // SAFETY: The range is a single lower-half page. All intermediate
         // tables for that address are owned exclusively by this user root.
         unsafe { mapper.clean_up_addr_range(Page::range_inclusive(page, page), &mut detached) };
-        if active {
-            // Also discard cached intermediate entries after detaching tables.
-            x86_64::instructions::tlb::flush_all();
-        }
-        // Inactive user roots have non-global mappings and are flushed on load.
+        // A remote walk may have cached intermediate entries even if it
+        // never completed a translation for the leaf.
+        tlb::synchronize(Invalidation::User(root));
         for frame in detached.0.into_iter().flatten() {
             // SAFETY: The table is detached and cached translations for the
             // root cannot reference it on any CPU.
@@ -515,6 +515,8 @@ impl Mapper for X86_64Mapper {
                 .map_to(page, frame, page_table_flags, &mut allocator)
         }
         .map_err(convert_map_error)?;
+        // Installing a previously absent leaf cannot retain a prior remote
+        // translation. A previous unmap synchronized before returning.
         flush.flush();
 
         Ok(())
@@ -533,7 +535,8 @@ impl Mapper for X86_64Mapper {
             UnmapError::InvalidFrameAddress(_) => MapError::InvalidAlignment,
         })?;
 
-        flush.flush();
+        flush.ignore();
+        self.flush(virt);
 
         PhysFrame::from_base(PhysAddr::new(frame.start_address().as_u64()))
             .ok_or(MapError::InvalidAlignment)
@@ -550,13 +553,11 @@ impl Mapper for X86_64Mapper {
     }
 
     fn flush(&mut self, virt: VirtAddr) {
-        x86_64::instructions::tlb::flush(X64VirtAddr::new(virt.as_u64()));
+        tlb::synchronize(Invalidation::Page(virt));
     }
 
     fn flush_all_smp(&mut self) {
-        // Phase 7: broadcast IPI for TLB shootdown across all CPUs.
-        // Single-core stub — only flush the local TLB.
-        x86_64::instructions::tlb::flush_all();
+        tlb::synchronize(Invalidation::All);
     }
 }
 
@@ -797,11 +798,20 @@ pub unsafe fn init(physical_memory_offset: u64, alloc: fn() -> Option<PhysFrame>
 /// # Panics
 /// Panics if called before [`init()`].
 pub fn with_mapper<R>(f: impl FnOnce(&mut X86_64Mapper) -> R) -> R {
-    let mut guard = MAPPER.lock();
-    // SAFETY: [Category 4 - Uninitialized memory] The public contract requires
-    // `init` to complete before use, and `INIT` writes `MAPPER` exactly once.
-    let mapper = unsafe { guard.assume_init_mut() };
-    f(mapper)
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut guard = loop {
+            if let Some(guard) = MAPPER.try_lock() {
+                break guard;
+            }
+            if let Some(hooks) = tlb::HOOKS.get() {
+                // Another CPU may hold this lock while waiting for our ack.
+                (hooks.poll)();
+            }
+            core::hint::spin_loop();
+        };
+        // SAFETY: init writes the mapper once before this lock is used.
+        f(unsafe { guard.assume_init_mut() })
+    })
 }
 
 #[cfg(test)]
