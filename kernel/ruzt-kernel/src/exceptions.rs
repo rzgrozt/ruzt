@@ -288,6 +288,7 @@ extern "x86-interrupt" fn timer_handler(stack_frame: InterruptStackFrame) {
         );
     });
     crate::irq::end_of_interrupt(0);
+    crate::smp::tick_schedulers();
     // Kernel execution can hold locks and schedules at its own safe points.
     if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
         crate::sched::yield_thread();

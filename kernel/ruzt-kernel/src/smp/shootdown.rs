@@ -167,7 +167,7 @@ fn broadcast(command: u8, argument: u64) {
 }
 
 #[allow(unsafe_code)]
-fn poll_local() {
+pub(crate) fn poll_local() {
     // SAFETY: The mapper wait loop has interrupts disabled. An IPI handler
     // cannot service the same local request concurrently.
     if let Some(id) = unsafe { irq::current_apic_id() } {

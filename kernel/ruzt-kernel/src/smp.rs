@@ -1,6 +1,6 @@
-//! Bring firmware-enabled application processors into the kernel's IPI loop.
+//! Start firmware-enabled application processors and dispatch CPU-local work.
 
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{fence, AtomicU8, Ordering};
 
 use ruzt_hal::mem::{Mapper, PageFlags, PhysFrame, VirtAddr};
 use ruzt_hal_x86_64::{
@@ -10,11 +10,15 @@ use ruzt_hal_x86_64::{
     timer::startup_delay_us,
 };
 use spin::Once;
-use x86_64::registers::control::{Cr3, Cr4, Cr4Flags};
+use x86_64::{
+    instructions::interrupts,
+    registers::control::{Cr3, Cr4, Cr4Flags},
+};
 
 use crate::{
     apic, exceptions,
     mm::{exception_stack, frame},
+    sched,
 };
 
 const PAGE: u64 = PhysFrame::SIZE as u64;
@@ -24,14 +28,85 @@ const STRIDE: u64 = (STACK_PAGES + FAULT_PAGES + 2) * PAGE;
 const OFFLINE: u8 = 0;
 const READY: u8 = 1;
 const WOKEN: u8 = 2;
+const SCHEDULING: u8 = 3;
 
 static STATE: [AtomicU8; 255] = [const { AtomicU8::new(OFFLINE) }; 255];
 static PERMANENT_ROOT: Once<u64> = Once::new();
+pub(crate) const SCHEDULER_SLOTS: usize = STATE.len() + 1;
 
 mod shootdown;
 pub(crate) use shootdown::{handle_tlb_ipi, install_shootdown};
 #[cfg(feature = "qemu-smp-test")]
 pub(crate) use shootdown::verify_shootdown;
+#[cfg(not(test))]
+pub(crate) use shootdown::poll_local as poll_local_shootdown;
+
+pub(crate) fn secondary_scheduler_slot(id: u8) -> usize {
+    usize::from(id) + 1
+}
+
+#[allow(unsafe_code)]
+#[cfg(not(test))]
+pub(crate) fn scheduler_slot() -> usize {
+    let Some(topology) = apic::cpu_topology() else {
+        return 0;
+    };
+    // SAFETY: The BSP and all scheduler CPUs use the negotiated APIC mode.
+    let id = unsafe { irq::current_apic_id() }.expect("scheduler CPU has a LAPIC");
+    if id == topology.bsp {
+        0
+    } else {
+        secondary_scheduler_slot(id)
+    }
+}
+
+#[allow(unsafe_code)]
+pub(crate) unsafe fn set_trap_stack(slot: usize, top: Option<u64>) {
+    // SAFETY: The scheduler owns the local TSS with interrupts disabled.
+    unsafe {
+        match (slot, top) {
+            (0, Some(top)) => gdt::set_trap_stack(top),
+            (0, None) => gdt::use_boot_trap_stack(),
+            (slot, top) => {
+                let id = u8::try_from(slot - 1).expect("registered APIC ID");
+                gdt::set_secondary_trap_stack(id, top.unwrap_or_else(|| stack_bounds(id).0));
+            }
+        }
+    }
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn start_scheduling() {
+    for (id, state) in STATE.iter().enumerate() {
+        if state.load(Ordering::Acquire) != WOKEN {
+            continue;
+        }
+        let id = id as u8;
+        if sched::register_secondary(id).is_err() {
+            crate::serial_println!("SMP APIC {id} could not allocate its idle thread");
+            continue;
+        }
+        state.store(SCHEDULING, Ordering::Release);
+        // Publish the scheduler state before a wake via x2APIC's ICR MSR.
+        fence(Ordering::SeqCst);
+        // SAFETY: The BSP owns its ICR with interrupts disabled and the AP
+        // acknowledged an earlier fixed interrupt on this vector.
+        if !unsafe { irq::send_ipi(id, Ipi::Wake) } {
+            crate::serial_println!("SMP APIC {id} scheduler wake will retry on PIT tick");
+        }
+    }
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn tick_schedulers() {
+    for (id, state) in STATE.iter().enumerate() {
+        if state.load(Ordering::Relaxed) == SCHEDULING {
+            // SAFETY: The BSP's PIT gate runs with interrupts disabled.
+            // A busy ICR can defer a reschedule hint until the next tick.
+            unsafe { irq::send_ipi(id as u8, Ipi::Wake) };
+        }
+    }
+}
 
 /// Reserve conventional memory before the general allocator can use it.
 pub(crate) fn reserve_startup_page() -> Option<PhysFrame> {
@@ -238,10 +313,17 @@ extern "C" fn secondary_entry(id: u64) -> ! {
             x86_64::instructions::hlt();
         }
     }
-    STATE[usize::from(id)].store(READY, Ordering::Release);
+    let state = &STATE[usize::from(id)];
+    state.store(READY, Ordering::Release);
     loop {
-        x86_64::instructions::interrupts::enable_and_hlt();
+        interrupts::disable();
+        if state.load(Ordering::Acquire) == SCHEDULING {
+            break;
+        }
+        interrupts::enable_and_hlt();
     }
+    sched::request_switch();
+    crate::idle_loop();
 }
 
 #[allow(unsafe_code)]
@@ -249,8 +331,10 @@ pub(crate) fn wake() {
     // SAFETY: The dedicated IDT gate runs only for a fixed local APIC IPI.
     if let Some(id) = unsafe { irq::finish_ipi() } {
         if let Some(slot) = STATE.get(usize::from(id)) {
-            if slot.load(Ordering::Relaxed) == READY {
-                slot.store(WOKEN, Ordering::Release);
+            match slot.load(Ordering::Acquire) {
+                READY => slot.store(WOKEN, Ordering::Release),
+                SCHEDULING => sched::request_switch(),
+                _ => {}
             }
         }
     }

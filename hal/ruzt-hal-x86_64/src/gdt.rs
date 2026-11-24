@@ -180,6 +180,17 @@ pub unsafe fn set_trap_stack(top: u64) {
     unsafe { BSP.write_trap_stack(top) };
 }
 
+/// Update the calling secondary CPU's privilege stack.
+///
+/// # Safety
+/// Use the calling CPU's APIC ID after [`init_secondary`], with interrupts
+/// disabled. The aligned stack must remain live and supervisor-only while
+/// installed in this CPU's TSS.
+pub unsafe fn set_secondary_trap_stack(id: u8, top: u64) {
+    // SAFETY: The caller owns this CPU's TSS with interrupts disabled.
+    unsafe { SECONDARIES[usize::from(id)].write_trap_stack(top) };
+}
+
 /// Restore the boot CPU's fallback privilege stack.
 ///
 /// # Safety

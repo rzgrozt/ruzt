@@ -56,6 +56,7 @@ fn test_bios_starts_secondary_cpus_and_delivers_ipis() {
             "SMP initialized 3 secondary CPUs",
             "SMP TLB shootdown replaced a translation cached on every secondary",
             "SMP TLB shootdown reclaimed page tables active on the secondaries",
+            "SMP scheduler migrated a saved worker and reaped all worker stacks",
             "ipc_test_sender: message sent successfully",
         ],
     );
@@ -150,6 +151,7 @@ fn test_uefi_boots_user_services_with_a_randomized_kernel() {
                 "SMP initialized 3 secondary CPUs",
                 "SMP TLB shootdown replaced a translation cached on every secondary",
                 "SMP TLB shootdown reclaimed page tables active on the secondaries",
+                "SMP scheduler migrated a saved worker and reaped all worker stacks",
                 "rootsrv: console write acknowledged over IPC",
                 "rootsrv: framebuffer tile drawn",
             ],

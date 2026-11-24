@@ -139,6 +139,11 @@ pub fn main(boot_info: &'static mut BootInfo) -> ! {
     serial_println!("PIT timer initialised.");
 
     sched::init();
+    #[cfg(all(feature = "qemu-smp-test", not(test)))]
+    sched::qemu::enqueue();
+    smp::start_scheduling();
+    #[cfg(all(feature = "qemu-smp-test", not(test)))]
+    sched::qemu::verify();
     serial_println!("Scheduler initialised.");
     advance_screen();
 
@@ -151,8 +156,8 @@ pub fn main(boot_info: &'static mut BootInfo) -> ! {
     } else {
         assert!(!cfg!(feature = "qemu-rootsrv-test"), "rootsrv is missing from the boot image");
 
-        sched::spawn(thread_a);
-        sched::spawn(thread_b);
+        sched::spawn_worker(thread_a);
+        sched::spawn_worker(thread_b);
         serial_println!("Threads spawned.");
 
         sched::spawn(keyboard_echo);
@@ -178,7 +183,7 @@ fn idle_loop() -> ! {
     loop {
         let mut guard = ruzt_hal_x86_64::cpu::X86_64Cpu::disable_interrupts();
         if crate::sched::should_switch() {
-            crate::sched::reap_retired_user();
+            crate::sched::reap_retired();
             crate::sched::yield_thread();
         } else {
             // Pair the work check with STI/HLT so an interrupt between them
@@ -200,7 +205,7 @@ fn thread_a() -> ! {
             }
         }
     }
-    idle_loop();
+    sched::retire_current_worker();
 }
 
 fn thread_b() -> ! {
@@ -215,7 +220,7 @@ fn thread_b() -> ! {
             }
         }
     }
-    idle_loop();
+    sched::retire_current_worker();
 }
 
 /// Initialise the IPC self-test endpoint and CSpace.
