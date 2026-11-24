@@ -56,7 +56,7 @@ fn locate_edu() -> Result<(PciAddress, u64), ErrorCode> {
         if crate::pci::read_config(address, 0)? != EDU_ID {
             continue;
         }
-        let bars = crate::pci::probe(address)?;
+        let (bars, _) = crate::pci::probe(address)?;
         crate::pci::prepare_physmap(&bars)?;
         let bar = bars[0].ok_or(ErrorCode::NotFound)?;
         if bar.bytes < PhysFrame::SIZE as u64 {

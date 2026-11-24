@@ -197,6 +197,10 @@ pub mod console {
     pub const PCI_IRQ_CHECKED: u64 = 17;
     /// Verify the previous EDU interrupt capability was revoked.
     pub const CHECK_PCI_IRQ_REVOKED: u64 = 18;
+    /// Exercise two independently delegated MSI-X entries.
+    pub const CHECK_PCI_MSIX: u64 = 19;
+    /// Verify the previous MSI-X entries no longer have capabilities.
+    pub const CHECK_PCI_MSIX_REVOKED: u64 = 20;
 }
 
 /// System-call numbers.
@@ -346,6 +350,8 @@ pub enum CapOp {
     ClaimGsi = 33,
     /// Claim one PCI MSI message into slot `arg2` using a writable device cap.
     ClaimMsi = 34,
+    /// Claim MSI-X table entry `arg3` in slot `arg2` from a writable PCI device.
+    ClaimMsix = 35,
 }
 
 /// The interrupt is asserted low. The default is active high.

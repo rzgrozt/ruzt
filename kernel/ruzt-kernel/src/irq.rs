@@ -65,6 +65,20 @@ pub(crate) fn reserve_msi(address: PciAddress) -> Result<u32, ErrorCode> {
     unsafe { hardware::reserve_msi(msi) }.map_err(hardware_error)
 }
 
+pub(crate) fn reserve_msix(
+    address: PciAddress,
+    resources: crate::pci::MsixResources,
+    vector: u16,
+) -> Result<u32, ErrorCode> {
+    if !crate::iommu::permits_msi(address) {
+        return Err(ErrorCode::NotFound);
+    }
+    let msix = resources.vector(vector)?;
+    #[allow(unsafe_code)]
+    // SAFETY: VT-d covers the leased function and its table is kernel-owned.
+    unsafe { hardware::reserve_msix(msix) }.map_err(hardware_error)
+}
+
 pub(crate) fn bind(
     line: u32,
     thread: ThreadId,

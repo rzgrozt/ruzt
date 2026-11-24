@@ -80,12 +80,14 @@ pub enum KernelObject {
         /// Hardware IRQ line number.
         irq_num: u32,
     },
-    /// An IRQ backed by one PCI MSI message.
-    MsiIrq {
+    /// An IRQ backed by a PCI interrupt message.
+    PciIrq {
         /// Logical IRQ number.
         irq_num: u32,
         /// Keeps the exclusive PCI function leased through interrupt teardown.
         device: KObjectId,
+        /// MSI-X table index, or absent for a single MSI message.
+        vector: Option<u16>,
     },
     /// An exclusive lease on a firmware-configured PCI function.
     PciDevice {
@@ -93,6 +95,8 @@ pub enum KernelObject {
         address: PciAddress,
         /// Assignments validated against boot and other device resources.
         bars: crate::pci::Bars,
+        /// Interrupt-table regions reserved for this lease.
+        msix: Option<crate::pci::MsixResources>,
     },
     /// A page-aligned portion of a PCI memory BAR.
     Mmio {
@@ -215,10 +219,14 @@ pub(super) fn allocate_gsi(gsi: u32, flags: u64) -> Result<(KObjectId, u32), Err
     Ok((id, irq_num))
 }
 
-pub(super) fn allocate_msi(device: KObjectId) -> Result<(KObjectId, u32), ErrorCode> {
+pub(super) fn allocate_pci_irq(
+    device: KObjectId,
+    vector: Option<u16>,
+) -> Result<(KObjectId, u32), ErrorCode> {
     let mut table = TABLE.lock();
     if table.iter().any(|entry| {
-        matches!(entry.object, Some(KernelObject::MsiIrq { device: live, .. }) if live == device)
+        matches!(entry.object, Some(KernelObject::PciIrq { device: live, vector: used, .. })
+            if live == device && (used.is_none() || vector.is_none() || used == vector))
     }) {
         return Err(ErrorCode::SlotOccupied);
     }
@@ -227,14 +235,17 @@ pub(super) fn allocate_msi(device: KObjectId) -> Result<(KObjectId, u32), ErrorC
     if !parent.matches(device) {
         return Err(ErrorCode::InvalidCap);
     }
-    let Some(KernelObject::PciDevice { address, .. }) = parent.object else {
+    let Some(KernelObject::PciDevice { address, msix, .. }) = parent.object else {
         return Err(ErrorCode::InvalidCap);
     };
     let references = parent.references.checked_add(1).ok_or(ErrorCode::NoMemory)?;
-    let irq_num = crate::irq::reserve_msi(address)?;
+    let irq_num = match vector {
+        Some(vector) => crate::irq::reserve_msix(address, msix.ok_or(ErrorCode::NotFound)?, vector)?,
+        None => crate::irq::reserve_msi(address)?,
+    };
     parent.references = references;
     let entry = &mut table[id.index()];
-    entry.object = Some(KernelObject::MsiIrq { irq_num, device });
+    entry.object = Some(KernelObject::PciIrq { irq_num, device, vector });
     entry.generation += 1;
     Ok((id, irq_num))
 }
@@ -247,7 +258,7 @@ pub(super) fn allocate_pci_device(address: PciAddress) -> Result<KObjectId, Erro
         return Err(ErrorCode::SlotOccupied);
     }
     let id = vacant_id(&table[..])?;
-    let bars = crate::pci::probe(address)?;
+    let (bars, msix) = crate::pci::probe(address)?;
     for entry in table.iter() {
         if let Some(KernelObject::PciDevice { bars: claimed, .. }) = entry.object {
             if bars.iter().flatten().any(|bar| {
@@ -262,7 +273,7 @@ pub(super) fn allocate_pci_device(address: PciAddress) -> Result<KObjectId, Erro
     }
     crate::pci::prepare_physmap(&bars)?;
     let entry = &mut table[id.index()];
-    entry.object = Some(KernelObject::PciDevice { address, bars });
+    entry.object = Some(KernelObject::PciDevice { address, bars, msix });
     entry.generation += 1;
     Ok(id)
 }
@@ -279,7 +290,7 @@ pub(super) fn allocate_mmio(
     if !parent.matches(device) {
         return Err(ErrorCode::InvalidCap);
     }
-    let Some(KernelObject::PciDevice { bars, .. }) = parent.object else {
+    let Some(KernelObject::PciDevice { bars, msix, .. }) = parent.object else {
         return Err(ErrorCode::InvalidCap);
     };
     let range = bar_subrange(
@@ -290,6 +301,9 @@ pub(super) fn allocate_mmio(
         first,
         pages,
     )?;
+    if msix.is_some_and(|msix| msix.protects(range)) {
+        return Err(ErrorCode::CapRightsViolation);
+    }
     parent.references = parent
         .references
         .checked_add(1)
@@ -750,11 +764,11 @@ fn destroy(object: KernelObject, backing: Option<UntypedAllocation>) {
         KernelObject::Irq { irq_num } => {
             crate::irq::release(irq_num);
         }
-        KernelObject::MsiIrq { irq_num, device } => {
+        KernelObject::PciIrq { irq_num, device, .. } => {
             if crate::irq::release(irq_num) {
                 release(device);
             } else {
-                crate::serial_println!("PCI device lease remains pinned after MSI teardown failed");
+                crate::serial_println!("PCI device lease remains pinned after interrupt teardown failed");
             }
         }
         KernelObject::Mmio { device, .. } => {
@@ -921,6 +935,7 @@ mod tests {
             Ok(KernelObject::PciDevice {
                 address: PciAddress::new(0, 4, 0).unwrap(),
                 bars,
+                msix: None,
             })
         })
         .unwrap();

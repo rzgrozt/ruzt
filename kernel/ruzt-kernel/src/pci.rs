@@ -5,11 +5,66 @@ use ruzt_hal::boot::{Framebuffer, MemoryRegion};
 use ruzt_hal::mem::{Mapper, PhysFrame, VirtAddr};
 use ruzt_hal_x86_64::{
     mapper,
-    pci::{MemoryBar, BAR_COUNT},
+    pci::{MemoryBar, Msix, MsixLayout, BAR_COUNT},
 };
 use spin::Once;
 
 pub(crate) type Bars = [Option<MemoryBar>; BAR_COUNT];
+
+/// Validated physical ranges reserved for a leased PCI function's MSI-X state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MsixResources {
+    layout: MsixLayout,
+    table: MemoryBar,
+    pending: MemoryBar,
+}
+
+impl MsixResources {
+    fn new(layout: MsixLayout, bars: &Bars) -> Result<Self, ErrorCode> {
+        let table = interrupt_region(bars, layout.table())?;
+        let pending = interrupt_region(bars, layout.pba())?;
+        if overlaps(table, pending) {
+            return Err(ErrorCode::BadMessage);
+        }
+        Ok(Self {
+            layout,
+            table,
+            pending,
+        })
+    }
+
+    pub(crate) fn protects(self, range: MemoryBar) -> bool {
+        overlaps(range, self.table) || overlaps(range, self.pending)
+    }
+
+    pub(crate) fn vector(self, vector: u16) -> Result<Msix, ErrorCode> {
+        let table =
+            mapper::with_mapper(|mapper| mapper.physmap_alias(self.table.base, self.table.bytes))
+                .ok_or(ErrorCode::NotFound)?;
+        #[allow(unsafe_code)]
+        // SAFETY: The lease validated and mapped the containing BAR uncached.
+        // Whole pages intersecting either interrupt structure are kernel-only.
+        unsafe { Msix::new(self.layout, table, vector) }.ok_or(ErrorCode::BadMessage)
+    }
+}
+
+fn interrupt_region(
+    bars: &Bars,
+    (index, offset, bytes): (usize, u64, u64),
+) -> Result<MemoryBar, ErrorCode> {
+    let bar = bars
+        .get(index)
+        .copied()
+        .flatten()
+        .ok_or(ErrorCode::BadMessage)?;
+    if offset.checked_add(bytes).is_none_or(|end| end > bar.bytes) {
+        return Err(ErrorCode::BadMessage);
+    }
+    Ok(MemoryBar {
+        base: bar.base + offset,
+        bytes,
+    })
+}
 
 struct Policy {
     memory: &'static [MemoryRegion],
@@ -59,7 +114,7 @@ pub(crate) fn read_config(address: PciAddress, offset: u8) -> Result<u32, ErrorC
     Ok(unsafe { ruzt_hal_x86_64::pci::read_config(address.bits(), offset) })
 }
 
-pub(crate) fn probe(address: PciAddress) -> Result<Bars, ErrorCode> {
+pub(crate) fn probe(address: PciAddress) -> Result<(Bars, Option<MsixResources>), ErrorCode> {
     let policy = POLICY.get().ok_or(ErrorCode::NotFound)?;
     // The boot framebuffer may still be scanning out through a VGA device.
     if policy.framebuffer.is_some() && read_config(address, 8)? >> 16 == 0x0300 {
@@ -89,7 +144,14 @@ pub(crate) fn probe(address: PciAddress) -> Result<Bars, ErrorCode> {
             }
         }
     }
-    Ok(bars)
+    #[allow(unsafe_code)]
+    // SAFETY: The exclusive probe still owns the configuration transaction.
+    let layout =
+        unsafe { MsixLayout::inspect(address.bits()) }.map_err(|_| ErrorCode::BadMessage)?;
+    let msix = layout
+        .map(|layout| MsixResources::new(layout, &bars))
+        .transpose()?;
+    Ok((bars, msix))
 }
 
 pub(crate) fn prepare_physmap(bars: &Bars) -> Result<(), ErrorCode> {
@@ -151,6 +213,39 @@ fn allowed(bar: MemoryBar, policy: &Policy) -> bool {
 mod tests {
     use super::*;
     use ruzt_hal::{boot::MemoryRegionKind, mem::PhysAddr};
+
+    #[test]
+    fn interrupt_regions_must_fit_their_own_memory_bar() {
+        let mut bars = [None; BAR_COUNT];
+        bars[2] = Some(MemoryBar {
+            base: 0xfee0_0000,
+            bytes: 4096,
+        });
+        let last = interrupt_region(&bars, (2, 4088, 8)).unwrap();
+        assert_eq!(
+            last,
+            MemoryBar {
+                base: 0xfee0_0ff8,
+                bytes: 8
+            }
+        );
+        assert_eq!(
+            interrupt_region(&bars, (2, 4088, 16)),
+            Err(ErrorCode::BadMessage)
+        );
+        assert_eq!(
+            interrupt_region(&bars, (2, u64::MAX, 16)),
+            Err(ErrorCode::BadMessage)
+        );
+        assert_eq!(
+            interrupt_region(&bars, (3, 0, 16)),
+            Err(ErrorCode::BadMessage)
+        );
+        assert_eq!(
+            interrupt_region(&bars, (7, 0, 16)),
+            Err(ErrorCode::BadMessage)
+        );
+    }
 
     #[test]
     fn prevents_overlaps_with_ram_firmware_framebuffer_and_interrupt_registers() {

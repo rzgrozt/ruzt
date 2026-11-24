@@ -577,12 +577,17 @@ impl CSpace {
         })
     }
 
-    pub(crate) fn claim_msi(&mut self, source: u64, destination: u64) -> Result<(), ErrorCode> {
+    pub(crate) fn claim_pci_irq(
+        &mut self,
+        source: u64,
+        destination: u64,
+        vector: Option<u16>,
+    ) -> Result<(), ErrorCode> {
         self.allocate_device_object(source, destination, |cap| {
             let CapType::PciDevice(device) = cap else {
                 return Err(ErrorCode::InvalidCap);
             };
-            let (object, irq_num) = object::allocate_msi(KObjectId(device))?;
+            let (object, irq_num) = object::allocate_pci_irq(KObjectId(device), vector)?;
             Ok((object, CapType::Irq { irq_num, id: object.0 }))
         })
     }

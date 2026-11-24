@@ -1,16 +1,15 @@
 //! PCI MSI configuration under an exclusive function lease.
 
-use super::{read_config, write_command, write_config, write_word, COMMAND};
+use super::{intx_disabled, read_config, set_intx_disabled, write_config, write_word, COMMAND};
 
-const CAP_LIST: u32 = 1 << 20;
-const INTX_DISABLE: u16 = 1 << 10;
+pub(super) const CAP_LIST: u32 = 1 << 20;
 const MSI: u8 = 5;
-const MSIX: u8 = 0x11;
-const ENABLE: u16 = 1;
+pub(super) const MSIX: u8 = 0x11;
+pub(super) const ENABLE: u16 = 1;
 const MULTI_MESSAGE_ENABLE: u16 = 7 << 4;
 const ADDRESS_64: u16 = 1 << 7;
 const PER_VECTOR_MASK: u16 = 1 << 8;
-const MSIX_ENABLE: u16 = 1 << 15;
+pub(super) const MSIX_ENABLE: u16 = 1 << 15;
 
 /// The single-message MSI configuration of one exclusive PCI function.
 #[derive(Clone, Copy)]
@@ -38,7 +37,7 @@ impl Msi {
             function,
             offset,
             control,
-            intx_disabled: command as u16 & INTX_DISABLE != 0,
+            intx_disabled: intx_disabled(command),
         })
     }
 
@@ -49,7 +48,7 @@ impl Msi {
     pub(crate) fn program(self, address: u32) -> bool {
         // The endpoint will use remapped message data zero. It remains
         // disabled until a driver binds the corresponding IRQ capability.
-        if !self.set_enabled(false) || !self.set_intx_disabled(true) {
+        if !self.set_enabled(false) || !set_intx_disabled(self.function, true) {
             return false;
         }
         write_config(self.function, self.offset + 4, address);
@@ -76,18 +75,7 @@ impl Msi {
     }
 
     pub(crate) fn restore_intx(self) -> bool {
-        self.set_intx_disabled(self.intx_disabled)
-    }
-
-    fn set_intx_disabled(self, disabled: bool) -> bool {
-        let command = self.read(COMMAND);
-        if command == u32::MAX {
-            return false;
-        }
-        let command = (command as u16 & !INTX_DISABLE) | (u16::from(disabled) << 10);
-        write_command(self.function, command);
-        let actual = self.read(COMMAND);
-        actual != u32::MAX && (actual as u16 & INTX_DISABLE != 0) == disabled
+        set_intx_disabled(self.function, self.intx_disabled)
     }
 
     fn data_offset(self) -> u8 {
@@ -106,10 +94,23 @@ impl Msi {
 }
 
 fn find_msi(read: impl Fn(u8) -> u32) -> Option<(u8, u16)> {
+    let caps = find_interrupt_caps(read)?;
+    let (offset, control) = caps.msi?;
+    (control & ENABLE == 0 && caps.msix.is_none_or(|(_, value)| value & MSIX_ENABLE == 0))
+        .then_some((offset, control))
+}
+
+#[derive(Default)]
+pub(super) struct InterruptCaps {
+    pub(super) msi: Option<(u8, u16)>,
+    pub(super) msix: Option<(u8, u16)>,
+}
+
+pub(super) fn find_interrupt_caps(read: impl Fn(u8) -> u32) -> Option<InterruptCaps> {
     let mut offset = read(0x34) as u8;
     let mut seen = 0u64;
-    let mut msi = None;
-    let mut has_msix = false;
+    let mut bodies = 0u64;
+    let mut caps = InterruptCaps::default();
     while offset != 0 {
         if offset < 0x40 || offset % 4 != 0 || seen & (1u64 << (offset / 4)) != 0 {
             return None;
@@ -117,37 +118,30 @@ fn find_msi(read: impl Fn(u8) -> u32) -> Option<(u8, u16)> {
         seen |= 1u64 << (offset / 4);
         let header = read(offset);
         let control = (header >> 16) as u16;
-        match header as u8 {
+        let words = match header as u8 {
             MSI => {
-                if msi.is_some() || control & ENABLE != 0 {
+                if caps.msi.replace((offset, control)).is_some() {
                     return None;
                 }
-                let bytes = 10
-                    + if control & ADDRESS_64 != 0 { 4 } else { 0 }
-                    + if control & PER_VECTOR_MASK != 0 {
-                        10
-                    } else {
-                        0
-                    };
-                if usize::from(offset) + bytes > 256 {
-                    return None;
-                }
-                msi = Some((offset, control));
+                3 + u32::from(control & ADDRESS_64 != 0)
+                    + if control & PER_VECTOR_MASK != 0 { 2 } else { 0 }
             }
-            MSIX if has_msix || control & MSIX_ENABLE != 0 => return None,
-            MSIX => has_msix = true,
+            MSIX => {
+                if caps.msix.replace((offset, control)).is_some() {
+                    return None;
+                }
+                3
+            }
             0xff => return None,
-            _ => {}
+            _ => 1,
+        };
+        if u32::from(offset / 4) + words > 64 {
+            return None;
         }
+        bodies |= ((1u64 << words) - 2) << (offset / 4);
         offset = (header >> 8) as u8;
     }
-    let (offset, control) = msi?;
-    // A malformed list can link another capability inside the MSI body.
-    let words = 3
-        + u32::from(control & ADDRESS_64 != 0)
-        + if control & PER_VECTOR_MASK != 0 { 2 } else { 0 };
-    let covered = ((1u64 << words) - 2) << (offset / 4);
-    (seen & covered == 0).then_some((offset, control))
+    (seen & bodies == 0).then_some(caps)
 }
 
 #[cfg(test)]

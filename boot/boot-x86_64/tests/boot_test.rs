@@ -4,6 +4,10 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+#[path = "support/ivshmem.rs"]
+#[cfg(target_os = "linux")]
+mod ivshmem;
+
 // Firmware boot under TCG is sensitive to several guests competing on a
 // small CI runner. Keep independent image builds parallel.
 static QEMU_SLOT: Mutex<()> = Mutex::new(());
@@ -83,13 +87,32 @@ fn test_uefi_boots_user_services_with_a_randomized_kernel() {
                 .expect("copy OVMF variables");
         let isolated = index == 0;
         let mut devices = vec![
-            "-machine", "q35", "-cpu", "max", &first, &code_arg, &second, &vars_arg, "-device",
+            "-machine",
+            "q35",
+            "-cpu",
+            "max",
+            &first,
+            &code_arg,
+            &second,
+            &vars_arg,
+            "-device",
             "edu,addr=3",
         ];
         if isolated {
             devices.extend(["-device", "intel-iommu,caching-mode=on,intremap=on"]);
         }
+        #[cfg(target_os = "linux")]
+        let msix =
+            isolated.then(|| ivshmem::Fixture::new(temp.path()).expect("create MSI-X fixture"));
+        #[cfg(target_os = "linux")]
+        if let Some(fixture) = &msix {
+            devices.extend(fixture.options());
+        }
         let mut guest = start_guest_with_devices(&disk, &serial_path, &devices);
+        #[cfg(target_os = "linux")]
+        let _peer = msix
+            .as_ref()
+            .map(|fixture| drive_msix(fixture, &mut guest.child, &serial_path));
         let serial = wait_for_serial(
             &mut guest.child,
             &serial_path,
@@ -124,6 +147,8 @@ fn test_uefi_boots_user_services_with_a_randomized_kernel() {
                     "rootsrv: delegated DMA round trip, revocation and reclamation verified",
                     "rootsrv: PCI MSI delivered, coalesced, revoked and reclaimed",
                     "rootsrv: PCI BAR mapped, delegated read-only, revoked and reclaimed",
+                    #[cfg(target_os = "linux")]
+                    "rootsrv: MSI-X table protected and both vectors reclaimed",
                 ],
             );
         } else {
@@ -302,18 +327,25 @@ fn test_vtd_isolates_and_reclaims_delegated_dma() {
         Services::PciInterruptConsole,
     );
     let serial_path = temp.path().join("serial.log");
-    let mut guest = start_guest_with_devices(
-        &disk_image,
-        &serial_path,
-        &[
-            "-machine",
-            "q35",
-            "-device",
-            "intel-iommu,caching-mode=on,intremap=on",
-            "-device",
-            "edu,addr=3",
-        ],
-    );
+    let devices = [
+        "-machine",
+        "q35",
+        "-device",
+        "intel-iommu,caching-mode=on,intremap=on",
+        "-device",
+        "edu,addr=3",
+    ];
+    #[cfg(target_os = "linux")]
+    let msix = ivshmem::Fixture::new(temp.path()).expect("create MSI-X fixture");
+    #[cfg(target_os = "linux")]
+    let devices = {
+        let mut options = devices.to_vec();
+        options.extend(msix.options());
+        options
+    };
+    let mut guest = start_guest_with_devices(&disk_image, &serial_path, &devices);
+    #[cfg(target_os = "linux")]
+    let _peer = drive_msix(&msix, &mut guest.child, &serial_path);
     let serial = wait_for_serial(
         &mut guest.child,
         &serial_path,
@@ -332,6 +364,8 @@ fn test_vtd_isolates_and_reclaims_delegated_dma() {
             "rootsrv: delegated DMA round trip, revocation and reclamation verified",
             "rootsrv: PCI MSI delivered, coalesced, revoked and reclaimed",
             "rootsrv: PCI BAR mapped, delegated read-only, revoked and reclaimed",
+            #[cfg(target_os = "linux")]
+            "rootsrv: MSI-X table protected and both vectors reclaimed",
         ],
     );
     monitor(&mut guest.child, "sendkey spc");
@@ -343,6 +377,23 @@ fn test_vtd_isolates_and_reclaims_delegated_dma() {
     );
     monitor(&mut guest.child, "quit");
     assert!(guest.child.wait().expect("wait for VT-d guest").success());
+}
+
+#[cfg(target_os = "linux")]
+fn drive_msix(
+    fixture: &ivshmem::Fixture,
+    child: &mut Child,
+    serial: &Path,
+) -> std::os::unix::net::UnixStream {
+    let deadline = Instant::now() + BOOT_TIMEOUT;
+    let peer = fixture
+        .connect(child, deadline)
+        .expect("connect MSI-X fixture");
+    wait_for_serial(child, serial, "consoled: MSI-X vectors armed", deadline);
+    fixture.trigger(1).expect("interrupt vector 1");
+    wait_for_serial(child, serial, "consoled: MSI-X vector 1 received", deadline);
+    fixture.trigger(0).expect("interrupt vector 0");
+    peer
 }
 
 #[test]

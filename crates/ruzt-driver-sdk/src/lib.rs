@@ -26,6 +26,11 @@ pub fn claim_msi(device: u64, destination: u64) -> Result<(), ErrorCode> {
     invoke_irq(device, CapOp::ClaimMsi, destination, 0, 0)
 }
 
+/// Claim one independently maskable MSI-X table entry from a PCI device.
+pub fn claim_msix(device: u64, destination: u64, vector: u16) -> Result<(), ErrorCode> {
+    invoke_irq(device, CapOp::ClaimMsix, destination, u64::from(vector), 0)
+}
+
 /// Bind an exclusively claimed interrupt to the calling driver.
 pub fn bind_irq(cap: u64) -> Result<(), ErrorCode> {
     invoke_irq(cap, CapOp::BindIrq, 0, 0, 0)

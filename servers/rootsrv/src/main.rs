@@ -331,6 +331,8 @@ fn run_console() -> bool {
                 check_console_irq().expect("delegate and reclaim the console UART IRQ");
             }
             check_pci_mmio().expect("verify firmware-assigned PCI memory");
+            #[cfg(feature = "qemu-pci-intx-test")]
+            check_pci_msix().expect("delegate MSI-X interrupts");
             assert_eq!(
                 ruzt_ipc::split_untyped(
                     PROGRAM_BUDGET,
@@ -704,6 +706,72 @@ fn check_pci_irq_revoked() -> Result<(), ErrorCode> {
     let mut response = IpcMessage::default();
     ruzt_ipc::recv(ROOTSRV_CONSOLE_REPLY, &mut response)?;
     assert_eq!(response.label, console::PCI_IRQ_CHECKED);
+    Ok(())
+}
+
+#[cfg(feature = "qemu-pci-intx-test")]
+fn check_pci_msix() -> Result<(), ErrorCode> {
+    use ruzt_driver_sdk::{
+        allocate_dma_buffer, bind_dma, bind_irq, claim_msi, claim_msix, claim_pci_device,
+        open_pci_bar, read_pci_config, unbind_dma, DMA_READ,
+    };
+    const IVSHMEM: u32 = 0x1110_1af4;
+    const DEVICE: u64 = 41;
+    const BUFFER: u64 = 42;
+    const IRQ0: u64 = 43;
+    const IRQ1: u64 = 44;
+    const SPARE: u64 = 45;
+    const ENABLE: u32 = 1 << 31;
+    let address = PciAddress::new(0, 4, 0).unwrap();
+    let read = |offset| read_pci_config(ROOTSRV_PCI_CONTROL, address, offset);
+    if read(0)? != IVSHMEM {
+        return Ok(());
+    }
+    claim_pci_device(ROOTSRV_PCI_CONTROL, DEVICE, address)?;
+    assert_eq!(open_pci_bar(DEVICE, SPARE, 1, 0, 1), Err(ErrorCode::CapRightsViolation));
+    open_pci_bar(DEVICE, SPARE, 2, 0, 1)?;
+    ruzt_ipc::delete(SPARE)?;
+    allocate_dma_buffer(ROOTSRV_UNTYPED, BUFFER, 12)?;
+    bind_dma(DEVICE, BUFFER, DMA_READ)?;
+    let capability = read(0x34)? as u8;
+    assert_eq!(read(capability)? as u8, 0x11);
+    assert_eq!(claim_msix(DEVICE, SPARE, 2), Err(ErrorCode::BadMessage));
+    claim_msix(DEVICE, IRQ0, 0)?;
+    claim_msix(DEVICE, IRQ1, 1)?;
+    assert_eq!(claim_msix(DEVICE, SPARE, 1), Err(ErrorCode::SlotOccupied));
+    assert_eq!(claim_msi(DEVICE, SPARE), Err(ErrorCode::SlotOccupied));
+
+    let mut request = IpcMessage {
+        label: console::CHECK_PCI_MSIX,
+        cap_count: 2,
+        ..IpcMessage::default()
+    };
+    let rights = CapRights::READ.union(CapRights::WRITE);
+    for (slot, cptr) in request.caps.iter_mut().zip([IRQ0, IRQ1]) {
+        *slot = CapTransferSlot { cptr, rights, badge: 0 };
+    }
+    ruzt_ipc::send(ROOTSRV_CONSOLE_REQUEST, &request)?;
+    let mut response = IpcMessage::default();
+    ruzt_ipc::recv(ROOTSRV_CONSOLE_REPLY, &mut response)?;
+    assert_eq!(response.label, console::PCI_IRQ_CHECKED);
+    ruzt_ipc::revoke(IRQ0)?;
+    ruzt_ipc::delete(IRQ0)?;
+    assert_eq!(read(capability)? & ENABLE, ENABLE);
+    assert_eq!(bind_irq(IRQ1), Err(ErrorCode::SlotOccupied));
+    claim_msix(DEVICE, SPARE, 0)?;
+    ruzt_ipc::revoke(DEVICE)?;
+    assert_eq!(read(capability)? & ENABLE, 0);
+    assert_eq!(bind_irq(SPARE), Err(ErrorCode::InvalidCap));
+    let request = IpcMessage { label: console::CHECK_PCI_MSIX_REVOKED, ..IpcMessage::default() };
+    ruzt_ipc::send(ROOTSRV_CONSOLE_REQUEST, &request)?;
+    ruzt_ipc::recv(ROOTSRV_CONSOLE_REPLY, &mut response)?;
+    assert_eq!(response.label, console::PCI_IRQ_CHECKED);
+    unbind_dma(DEVICE)?;
+    ruzt_ipc::delete(BUFFER)?;
+    ruzt_ipc::delete(DEVICE)?;
+    claim_pci_device(ROOTSRV_PCI_CONTROL, SPARE, address)?;
+    ruzt_ipc::delete(SPARE)?;
+    write_line("rootsrv: MSI-X table protected and both vectors reclaimed");
     Ok(())
 }
 

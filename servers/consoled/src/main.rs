@@ -65,6 +65,15 @@ fn main() -> ! {
             #[cfg(feature = "qemu-pci-intx-test")]
             (console::CHECK_PCI_IRQ, 2) => check_pci_irq(&request).map(|()| console::PCI_IRQ_CHECKED),
             #[cfg(feature = "qemu-pci-intx-test")]
+            (console::CHECK_PCI_MSIX, 2) => check_pci_msix(&request).map(|()| console::PCI_IRQ_CHECKED),
+            #[cfg(feature = "qemu-pci-intx-test")]
+            (console::CHECK_PCI_MSIX_REVOKED, 0) => {
+                for slot in [console::RECEIVED_NOTIFICATION, console::RECEIVED_FRAME] {
+                    assert_eq!(ruzt_driver_sdk::bind_irq(slot), Err(ErrorCode::InvalidCap));
+                }
+                Ok(console::PCI_IRQ_CHECKED)
+            }
+            #[cfg(feature = "qemu-pci-intx-test")]
             (console::CHECK_PCI_IRQ_REVOKED, 0) => {
                 assert_eq!(
                     ruzt_driver_sdk::bind_irq(console::RECEIVED_NOTIFICATION),
@@ -198,6 +207,29 @@ fn check_irq(request: &IpcMessage) -> Result<(), ErrorCode> {
     ruzt_ipc::delete(enable)?;
     ruzt_ipc::delete(identify)?;
     // The supervisor revokes the remaining bound IRQ from its original cap.
+    Ok(())
+}
+
+#[cfg(feature = "qemu-pci-intx-test")]
+fn check_pci_msix(request: &IpcMessage) -> Result<(), ErrorCode> {
+    use ruzt_driver_sdk::{acknowledge_irq, bind_irq};
+    let irqs = [request.caps[0].cptr, request.caps[1].cptr];
+    for irq in irqs {
+        bind_irq(irq)?;
+    }
+    uart_write(b"consoled: MSI-X vectors armed\n");
+    for (vector, marker) in [
+        (1, b"consoled: MSI-X vector 1 received\n"),
+        (0, b"consoled: MSI-X vector 0 received\n"),
+    ] {
+        let deadline = ruzt_runtime::syscall::monotonic_ns()? + 5_000_000_000;
+        let event = ruzt_ipc::wait_any_until(&irqs, deadline)?;
+        if (event.kind, event.index) != (WAIT_IRQ, vector) {
+            return Err(ErrorCode::BadMessage);
+        }
+        acknowledge_irq(irqs[vector as usize])?;
+        uart_write(marker);
+    }
     Ok(())
 }
 

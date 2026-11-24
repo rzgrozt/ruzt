@@ -98,8 +98,13 @@ pub(crate) fn invoke(args: &SyscallArgs) -> Result<(), ErrorCode> {
         })
         .ok_or(ErrorCode::InvalidCap)?;
     }
-    if operation == CapOp::ClaimMsi as u64 {
-        return sched::with_current_user(|user| user.cspace.claim_msi(args.arg0, args.arg2))
+    if operation == CapOp::ClaimMsi as u64 || operation == CapOp::ClaimMsix as u64 {
+        let vector = if operation == CapOp::ClaimMsix as u64 {
+            Some(u16::try_from(args.arg3).map_err(|_| ErrorCode::BadMessage)?)
+        } else {
+            None
+        };
+        return sched::with_current_user(|user| user.cspace.claim_pci_irq(args.arg0, args.arg2, vector))
             .ok_or(ErrorCode::InvalidCap)?;
     }
     if operation == CapOp::Retype as u64 {

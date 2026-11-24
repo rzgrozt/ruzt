@@ -5,7 +5,7 @@ use spin::{Mutex, Once};
 
 use crate::{
     apic::{Input, IoApic, LocalApic},
-    pci::Msi,
+    pci::{Msi, Msix},
     pic,
     vtd::InterruptTable,
 };
@@ -55,14 +55,58 @@ impl IoApicRemapping {
 #[derive(Clone, Copy)]
 enum ExtendedInput {
     Gsi { gsi: u32, input: Input },
+    Message(Message),
+}
+
+#[derive(Clone, Copy)]
+enum Message {
     Msi(Msi),
+    Msix(Msix),
+}
+
+impl Message {
+    fn function(self) -> u16 {
+        match self {
+            Self::Msi(msi) => msi.function(),
+            Self::Msix(msix) => msix.function(),
+        }
+    }
+
+    fn conflicts(self, other: Self) -> bool {
+        self.function() == other.function()
+            && match (self, other) {
+                (Self::Msix(a), Self::Msix(b)) => a.vector() == b.vector(),
+                _ => true,
+            }
+    }
+
+    fn program(self, address: u32, first: bool) -> bool {
+        match self {
+            Self::Msi(msi) => msi.program(address),
+            Self::Msix(msix) => (!first || msix.start()) && msix.program(address),
+        }
+    }
+
+    fn set_enabled(self, enabled: bool) -> bool {
+        match self {
+            Self::Msi(msi) => msi.set_enabled(enabled),
+            Self::Msix(msix) => msix.set_enabled(enabled),
+        }
+    }
+
+    fn finish(self, last: bool) -> bool {
+        match self {
+            Self::Msi(msi) => msi.restore_intx(),
+            Self::Msix(msix) => !last || msix.finish(),
+        }
+    }
 }
 
 impl ExtendedInput {
     fn same_source(self, other: Self) -> bool {
         match (self, other) {
             (Self::Gsi { gsi: a, .. }, Self::Gsi { gsi: b, .. }) => a == b,
-            (Self::Msi(a), Self::Msi(b)) => a.function() == b.function(),
+            (Self::Message(a), Self::Message(b)) => a.conflicts(b),
             _ => false,
         }
     }
@@ -70,9 +114,13 @@ impl ExtendedInput {
     fn idle(self) -> bool {
         match self {
             Self::Gsi { input, .. } => input.delivery_idle(),
-            // MSI enters retirement only after disabling the endpoint.
-            Self::Msi(_) => true,
+            // Messages enter retirement only after masking the endpoint.
+            Self::Message(_) => true,
         }
+    }
+
+    fn is_function(self, function: u16) -> bool {
+        matches!(self, Self::Message(message) if message.function() == function)
     }
 }
 
@@ -190,15 +238,25 @@ pub unsafe fn reserve_gsi(gsi: u32, input: Input) -> Result<u32, ReserveError> {
 /// remain exclusive until the IRQ is retired, and the active remapper must
 /// cover the endpoint's exact requester ID.
 pub unsafe fn reserve_msi(msi: Msi) -> Result<u32, ReserveError> {
-    reserve_extended(ExtendedInput::Msi(msi))
+    reserve_extended(ExtendedInput::Message(Message::Msi(msi)))
+}
+
+/// Reserve one independently maskable MSI-X vector.
+///
+/// # Safety
+/// Call on the boot CPU with interrupts disabled, holding the exclusive
+/// covered endpoint lease. All table and pending-bit pages must be private.
+pub unsafe fn reserve_msix(msix: Msix) -> Result<u32, ReserveError> {
+    reserve_extended(ExtendedInput::Message(Message::Msix(msix)))
 }
 
 fn reserve_extended(source: ExtendedInput) -> Result<u32, ReserveError> {
     let routes = APIC.get().ok_or(ReserveError::Unavailable)?;
-    if matches!(source, ExtendedInput::Msi(_)) && routes.remapping.is_none() {
+    if matches!(source, ExtendedInput::Message(_)) && routes.remapping.is_none() {
         return Err(ReserveError::Unavailable);
     }
     let mut extended = routes.extended.lock();
+    let mut first = true;
     for (index, slot) in extended.iter_mut().enumerate() {
         if let Some(old) = slot {
             // Drain deliveries issued before masking before reusing a vector
@@ -221,6 +279,19 @@ fn reserve_extended(source: ExtendedInput) -> Result<u32, ReserveError> {
             if old.source.same_source(source) {
                 return Err(ReserveError::Occupied);
             }
+            if let ExtendedInput::Message(message) = source {
+                if old.lease != Lease::Retired && old.source.is_function(message.function()) {
+                    if old.lease == Lease::Quarantined {
+                        return Err(ReserveError::Occupied);
+                    }
+                    first = false;
+                }
+            }
+        }
+    }
+    if let ExtendedInput::Message(Message::Msix(msix)) = source {
+        if first && !msix.initially_disabled() {
+            return Err(ReserveError::DeviceFailed);
         }
     }
     let (index, slot) = extended
@@ -232,9 +303,9 @@ fn reserve_extended(source: ExtendedInput) -> Result<u32, ReserveError> {
     let remap_index = if let Some(mapping) = &routes.remapping {
         match source {
             ExtendedInput::Gsi { input, .. } => mapping.stage(input, line, routes.local.id()),
-            ExtendedInput::Msi(msi) => mapping.table.stage(
+            ExtendedInput::Message(message) => mapping.table.stage(
                 line,
-                msi.function(),
+                message.function(),
                 VECTOR_BASE + line,
                 routes.local.id(),
                 false,
@@ -255,11 +326,11 @@ fn reserve_extended(source: ExtendedInput) -> Result<u32, ReserveError> {
         ExtendedInput::Gsi { input, .. } => {
             input.configure(VECTOR_BASE + line, routes.local.id(), remap_index);
         }
-        ExtendedInput::Msi(msi) => {
+        ExtendedInput::Message(message) => {
             // VT-d §5.1.5.2. SHV=1 with a zero subhandle selects this IRTE.
             let address = 0xfee0_0018 | (u32::from(line) << 5);
-            if !msi.program(address) {
-                let lease = if stop_msi(routes, msi, line) {
+            if !message.program(address, first) {
+                let lease = if stop_message(routes, message, line, first) {
                     Lease::Retired
                 } else {
                     Lease::Quarantined
@@ -282,7 +353,7 @@ pub fn release_extended(line: u32) -> bool {
         return true;
     };
     let mut extended = routes.extended.lock();
-    let Some(route) = &mut extended[index] else {
+    let Some(route) = extended[index] else {
         return true;
     };
     let stopped = match route.source {
@@ -290,29 +361,39 @@ pub fn release_extended(line: u32) -> bool {
             input.set_enabled(false);
             true
         }
-        ExtendedInput::Msi(msi) => stop_msi(routes, msi, line as u8),
+        ExtendedInput::Message(message) => {
+            let last = !extended.iter().enumerate().any(|(other, route)| {
+                other != index
+                    && route.is_some_and(|route| {
+                        route.lease != Lease::Retired
+                            && route.source.is_function(message.function())
+                    })
+            });
+            stop_message(routes, message, line as u8, last)
+        }
     };
-    route.lease = if stopped {
+    let lease = if stopped {
         Lease::Retired
     } else {
         Lease::Quarantined
     };
+    extended[index] = Some(ExtendedRoute { lease, ..route });
     stopped
 }
 
-fn stop_msi(routes: &ApicRoutes, msi: Msi, line: u8) -> bool {
-    let disabled = msi.set_enabled(false);
+fn stop_message(routes: &ApicRoutes, message: Message, line: u8, last: bool) -> bool {
+    let disabled = message.set_enabled(false);
     let table = routes.remapping.as_ref().expect("MSI uses remapping").table;
     // Attempt to block the IRTE even if the endpoint did not confirm masking.
     let drained = table.retire(line).is_ok();
-    disabled && drained && msi.restore_intx()
+    disabled && drained && message.finish(last)
 }
 
 /// Whether this logical line carries PCI interrupt messages.
 pub fn is_message_irq(line: u32) -> bool {
     extended_index(line).is_some_and(|(routes, index)| {
         routes.extended.lock()[index]
-            .is_some_and(|route| matches!(route.source, ExtendedInput::Msi(_)))
+            .is_some_and(|route| matches!(route.source, ExtendedInput::Message(_)))
     })
 }
 
@@ -372,7 +453,7 @@ pub fn set_enabled(line: u32, enabled: bool) -> Result<(), ReserveError> {
                 }
                 match route.source {
                     ExtendedInput::Gsi { input, .. } => input.set_enabled(enabled),
-                    ExtendedInput::Msi(msi) => {
+                    ExtendedInput::Message(message) => {
                         let table = routes.remapping.as_ref().expect("MSI uses remapping").table;
                         if enabled {
                             // Complete old messages before allowing a new binding.
@@ -381,7 +462,7 @@ pub fn set_enabled(line: u32, enabled: bool) -> Result<(), ReserveError> {
                                 return Err(ReserveError::PendingDelivery);
                             }
                         }
-                        if !msi.set_enabled(enabled) {
+                        if !message.set_enabled(enabled) {
                             route.lease = Lease::Quarantined;
                             let _ = table.retire(line as u8);
                             return Err(ReserveError::DeviceFailed);

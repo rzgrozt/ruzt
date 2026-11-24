@@ -4,12 +4,32 @@ use x86_64::instructions::port::{Port, PortWriteOnly};
 
 mod msi;
 pub use msi::Msi;
+mod msix;
+pub use msix::{Msix, MsixLayout};
 
 const CONFIG_ADDRESS: u16 = 0xcf8;
 const CONFIG_DATA: u16 = 0xcfc;
 const COMMAND: u8 = 4;
 const MEMORY_DECODE: u16 = 1 << 1;
 const BUS_MASTER: u16 = 1 << 2;
+const INTX_DISABLE: u16 = 1 << 10;
+
+fn intx_disabled(command: u32) -> bool {
+    command as u16 & INTX_DISABLE != 0
+}
+
+fn set_intx_disabled(function: u16, disabled: bool) -> bool {
+    // SAFETY: The caller owns and serializes the configuration transaction.
+    let command = unsafe { read_config(function, COMMAND) };
+    if command == u32::MAX {
+        return false;
+    }
+    let new = (command as u16 & !INTX_DISABLE) | (u16::from(disabled) << 10);
+    write_command(function, new);
+    // SAFETY: This is the same serialized transaction.
+    let actual = unsafe { read_config(function, COMMAND) };
+    actual != u32::MAX && intx_disabled(actual) == disabled
+}
 
 /// Number of BAR slots in an endpoint's PCI configuration header.
 pub const BAR_COUNT: usize = 6;
