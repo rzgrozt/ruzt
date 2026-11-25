@@ -87,15 +87,17 @@ pub fn copy_to_user(kernel_buf: &[u8], user_ptr: u64) -> Result<(), ErrorCode> {
     Ok(())
 }
 
-// The scheduler restores the calling root before a blocked syscall resumes.
+// Copies walk the calling process's root through the permanent kernel map.
 // The kernel transaction keeps mappings and backing frames live during a copy.
+#[allow(unsafe_code)]
 pub(crate) fn validate_user_buffer(
     root: ruzt_hal::mem::PhysFrame,
     address: u64,
     len: usize,
     writable: bool,
 ) -> Result<(), ErrorCode> {
-    if mapper::active_user_range_accessible(root, address, len, writable) {
+    // SAFETY: The transaction pins the scheduled task's root and mappings.
+    if unsafe { mapper::user_range_accessible(root, address, len, writable) } {
         Ok(())
     } else {
         Err(ErrorCode::BadMessage)
@@ -110,7 +112,7 @@ pub(crate) fn read_user_buffer(
 ) -> Result<(), ErrorCode> {
     // SAFETY: The transaction holds this root's mappings stable, and the
     // user RAM frames are separate from the kernel's scratch buffers.
-    if unsafe { mapper::copy_from_active_user(root, address, buf) } {
+    if unsafe { mapper::copy_from_user_root(root, address, buf) } {
         Ok(())
     } else {
         Err(ErrorCode::BadMessage)
@@ -135,7 +137,7 @@ pub(crate) fn write_user_buffer_with<T: AsRef<[u8]>>(
     // SAFETY: The transaction keeps the user frames mapped. The producer runs
     // synchronously without changing mappings or scheduling, and its output
     // lives in kernel RAM separate from the user frames.
-    if unsafe { mapper::copy_to_active_user_with(root, address, len, produce) } {
+    if unsafe { mapper::copy_to_user_root_with(root, address, len, produce) } {
         Ok(())
     } else {
         Err(ErrorCode::BadMessage)

@@ -10,8 +10,9 @@ use crate::smp::SCHEDULER_SLOTS;
 
 const PAGE: u64 = PhysFrame::SIZE as u64;
 pub(crate) const BASE: u64 = HEAP_START + 64 * 1024 * 1024;
-pub(crate) const SLOT_SHIFT: u32 = 13;
-const _: () = assert!(1 << SLOT_SHIFT == 2 * PAGE);
+pub(crate) const SLOT_SHIFT: u32 = 15;
+pub(crate) const NMI_KERNEL_OFFSET: u64 = 2 * PAGE;
+const _: () = assert!(1 << SLOT_SHIFT >= 6 * PAGE);
 
 /// Thread stack tops are kernel-only data. Hardware enters on the fixed
 /// stack, and the entry stub looks up the current thread after saving state.
@@ -30,6 +31,18 @@ pub(crate) fn top(slot: usize) -> u64 {
     bottom(slot) + PAGE
 }
 
+pub(crate) fn nmi_bottom(slot: usize) -> u64 {
+    top(slot) + PAGE
+}
+
+pub(crate) fn nmi_top(slot: usize) -> u64 {
+    nmi_bottom(slot) + PAGE
+}
+
+pub(crate) fn nmi_kernel_bottom(slot: usize) -> u64 {
+    nmi_bottom(slot) + NMI_KERNEL_OFFSET
+}
+
 pub(crate) fn allocate_frame() -> Option<PhysFrame> {
     let physical = frame::allocate()?;
     #[allow(unsafe_code)]
@@ -42,11 +55,13 @@ pub(crate) fn allocate_frame() -> Option<PhysFrame> {
 
 pub(crate) fn map_boot() {
     mapper::with_mapper(|mapper| {
-        assert!(mapper.translate(VirtAddr::new(guard(0))).is_none());
-        let physical = allocate_frame().expect("boot CPU entry stack frame");
-        mapper
-            .map(VirtAddr::new(bottom(0)), physical, PageFlags::WRITABLE)
-            .expect("map boot CPU entry stack");
+        for address in [bottom(0), nmi_bottom(0), nmi_kernel_bottom(0)] {
+            assert!(mapper.translate(VirtAddr::new(address - PAGE)).is_none());
+            let physical = allocate_frame().expect("boot CPU entry stack frame");
+            mapper
+                .map(VirtAddr::new(address), physical, PageFlags::WRITABLE)
+                .expect("map boot CPU entry stack");
+        }
     });
 }
 
@@ -67,6 +82,9 @@ mod tests {
         for slot in 0..SCHEDULER_SLOTS {
             assert_eq!(bottom(slot) - guard(slot), PAGE);
             assert_eq!(top(slot) - bottom(slot), PAGE);
+            assert_eq!(nmi_bottom(slot) - top(slot), PAGE);
+            assert_eq!(nmi_top(slot) - nmi_bottom(slot), PAGE);
+            assert_eq!(nmi_kernel_bottom(slot) - nmi_top(slot), PAGE);
             for address in [bottom(slot), top(slot) - 1] {
                 assert_eq!((address - BASE) >> SLOT_SHIFT, slot as u64);
             }

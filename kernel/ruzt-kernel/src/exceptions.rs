@@ -16,10 +16,16 @@ use x86_64::structures::idt::{
 };
 
 /// Static IDT, initialised once.
-static IDT: Once<InterruptDescriptorTable> = Once::new();
+#[repr(align(4096))]
+struct DescriptorPage(InterruptDescriptorTable);
+
+const _: () = assert!(core::mem::size_of::<DescriptorPage>() == 4096);
+static IDT: Once<DescriptorPage> = Once::new();
 
 /// One-time flag so the timer handler only prints its tick value once.
 static TIMER_TICK_PRINTED: Once<()> = Once::new();
+#[cfg(feature = "qemu-hardening-test")]
+static USER_NMI: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 mod entry;
 
@@ -40,6 +46,8 @@ pub fn init_idt() {
         // dispatch. Only the syscall interrupt can be invoked from ring 3.
         unsafe {
             gate!(idt.breakpoint, 3);
+            gate!(idt.non_maskable_interrupt, 2)
+                .set_stack_index(ruzt_hal_x86_64::gdt::NMI_IST_INDEX);
             gate!(idt.double_fault, 8)
                 .set_stack_index(ruzt_hal_x86_64::gdt::DOUBLE_FAULT_IST_INDEX);
             gate!(idt.page_fault, 14);
@@ -67,17 +75,67 @@ pub fn init_idt() {
             gate!(idt[SYSCALL_VECTOR], SYSCALL_VECTOR)
                 .set_privilege_level(x86_64::PrivilegeLevel::Ring3);
         }
-        idt
+        DescriptorPage(idt)
     });
-    idt.load();
+    idt.0.load();
+}
+
+pub(crate) fn descriptor_page() -> u64 {
+    core::ptr::from_ref(IDT.get().expect("IDT installed")) as u64
+}
+
+pub(crate) fn entry_code_pages() -> impl Iterator<Item = u64> {
+    entry::code_pages()
+}
+
+/// # Safety
+/// Run on the current user's kernel stack with interrupts disabled, with
+/// both the entry point and stack mapped in its isolated root.
+#[allow(unsafe_code)]
+pub(crate) unsafe fn enter_user(ip: u64, sp: u64) -> ! {
+    // SAFETY: The caller provides the scheduled task and its validated frame.
+    unsafe { entry::enter_user(ip, sp) }
+}
+
+#[repr(C)]
+struct UserReturn {
+    entry_top: u64,
+    root: u64,
+}
+
+extern "C" fn user_return(trap: &entry::Trap) -> UserReturn {
+    let frame = trap.frame;
+    // IRET must not fault on a user-controlled noncanonical stack pointer
+    // after loading the restricted root. Only 64-bit user mode is supported.
+    if frame.stack_pointer.as_u64() >= 1 << 47 || frame.instruction_pointer.as_u64() >= 1 << 47 {
+        fatal_fault(frame, 13, format_args!("invalid user return address"));
+    }
+    let root = crate::sched::with_current_user(|user| user.root()).expect("returning user process");
+    UserReturn {
+        entry_top: crate::mm::entry_stack::top(crate::sched::current_cpu()),
+        root: root.base.as_u64(),
+    }
 }
 
 extern "C" fn dispatch(trap: &mut entry::Trap) {
     let frame = trap.frame;
     let vector = trap.vector as u8;
+    #[cfg(any(feature = "qemu-hardening-test", feature = "qemu-smp-test"))]
+    if frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
+        crate::pti::assert_kernel_root();
+    }
     match vector {
         0 | 16 | 19 => fatal_fault(frame, vector.into(), format_args!("arithmetic exception")),
         1 | 4..=7 => fatal_fault(frame, vector.into(), format_args!("instruction exception")),
+        // No NMI sources are configured. Return on the same IST without
+        // locks, scheduling, or changing the interrupted address space.
+        2 =>
+        {
+            #[cfg(feature = "qemu-hardening-test")]
+            if frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
+                USER_NMI.store(true, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
         3 => breakpoint_handler(frame),
         8 => double_fault_handler(frame, trap.error),
         10..=13 | 17 => {
@@ -209,6 +267,9 @@ fn timer_handler(stack_frame: InterruptStackFrameValue) {
     #[cfg(feature = "qemu-hardening-test")]
     {
         assert_entry_flags();
+        if USER_NMI.swap(false, core::sync::atomic::Ordering::Relaxed) {
+            serial_println!("KPTI resumed an NMI that interrupted user mode");
+        }
         if stack_frame.cpu_flags.contains(RFlags::ALIGNMENT_CHECK) {
             static USER_AC_OBSERVED: Once<()> = Once::new();
             USER_AC_OBSERVED.call_once(|| serial_println!("kernel: timer entry cleared user AC"));

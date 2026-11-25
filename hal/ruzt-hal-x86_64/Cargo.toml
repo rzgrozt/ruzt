@@ -12,3 +12,5 @@ spin = { version = "0.9.8", default-features = false, features = ["once", "mutex
 
 [features]
 default = []
+qemu-hardening-test = []
+qemu-smp-test = []

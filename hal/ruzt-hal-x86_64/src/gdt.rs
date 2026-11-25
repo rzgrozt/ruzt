@@ -28,6 +28,8 @@ pub const USER_DATA_SELECTOR: u64 = 0x23;
 
 /// Zero-based IST slot used for the double-fault stack.
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
+/// Zero-based IST slot used for non-maskable interrupts.
+pub const NMI_IST_INDEX: u16 = 1;
 
 struct GdtState {
     table: GlobalDescriptorTable<GDT_ENTRY_COUNT>,
@@ -36,6 +38,7 @@ struct GdtState {
     tss: SegmentSelector,
 }
 
+#[repr(C, align(4096))]
 struct CpuTables {
     tss: UnsafeCell<TaskStateSegment>,
     gdt: UnsafeCell<MaybeUninit<GdtState>>,
@@ -49,16 +52,17 @@ impl CpuTables {
         }
     }
 
-    unsafe fn load(&'static self, trap_top: u64, double_fault_top: u64) {
+    unsafe fn load(&'static self, trap_top: u64, double_fault_top: u64, nmi_top: u64) {
         let tss = self.tss.get();
         // SAFETY: This CPU exclusively owns these tables and interrupts
         // stay disabled while it constructs and installs the descriptors.
         unsafe {
             self.write_trap_stack(trap_top);
-            core::ptr::addr_of_mut!((*tss).interrupt_stack_table)
-                .cast::<VirtAddr>()
-                .add(usize::from(DOUBLE_FAULT_IST_INDEX))
+            let ist = core::ptr::addr_of_mut!((*tss).interrupt_stack_table).cast::<VirtAddr>();
+            ist.add(usize::from(DOUBLE_FAULT_IST_INDEX))
                 .write_unaligned(VirtAddr::new(double_fault_top));
+            ist.add(usize::from(NMI_IST_INDEX))
+                .write_unaligned(VirtAddr::new(nmi_top));
             let gdt = (*self.gdt.get()).write(build_gdt(tss));
             gdt.table.load();
             CS::set_reg(gdt.kernel_code);
@@ -80,6 +84,8 @@ impl CpuTables {
     }
 }
 
+const _: () = assert!(core::mem::size_of::<CpuTables>() == 4096);
+
 // SAFETY: A CPU exclusively owns its tables after initialization. Hardware
 // marks its own GDT's TSS descriptor busy through the interior-mutable cell.
 unsafe impl Sync for CpuTables {}
@@ -87,6 +93,12 @@ unsafe impl Sync for CpuTables {}
 static BSP: CpuTables = CpuTables::new();
 static SECONDARIES: [CpuTables; 255] = [const { CpuTables::new() }; 255];
 static INIT: Once<()> = Once::new();
+
+/// The isolated page containing one CPU's GDT and TSS.
+pub fn descriptor_page(apic_id: Option<u8>) -> u64 {
+    let tables = apic_id.map_or(&BSP, |id| &SECONDARIES[usize::from(id)]);
+    core::ptr::from_ref(tables) as u64
+}
 
 unsafe fn build_gdt(tss: *const TaskStateSegment) -> GdtState {
     let mut table = GlobalDescriptorTable::<GDT_ENTRY_COUNT>::empty();
@@ -115,19 +127,18 @@ unsafe fn build_gdt(tss: *const TaskStateSegment) -> GdtState {
 ///
 /// The GDT layout is fixed to kernel code/data, user code/data, then the
 /// two-entry TSS descriptor. Interrupts from ring 3 use the fixed privilege
-/// stack. Double faults use a separate interrupt stack.
+/// stack. Double faults and NMIs each use their own interrupt stack.
 ///
 /// # Safety
 ///
 /// Call this exactly once from CPL0 on the boot CPU with interrupts disabled,
-/// before loading the IDT or entering ring 3. The kernel image containing the
-/// GDT, TSS, and stacks must remain mapped supervisor-only in every installed
-/// CR3. Both arguments must be aligned tops of distinct writable stacks
-/// owned by this CPU.
-pub unsafe fn init(trap_top: u64, double_fault_top: u64) {
+/// before loading the IDT or entering ring 3. The descriptor page and the
+/// entry portions of the stacks must remain supervisor-only in both roots.
+/// All arguments must be aligned tops of distinct writable stacks for this CPU.
+pub unsafe fn init(trap_top: u64, double_fault_top: u64, nmi_top: u64) {
     INIT.call_once(|| {
         // SAFETY: The boot CPU owns these tables and interrupts are disabled.
-        unsafe { BSP.load(trap_top, double_fault_top) };
+        unsafe { BSP.load(trap_top, double_fault_top, nmi_top) };
     });
 }
 
@@ -135,10 +146,10 @@ pub unsafe fn init(trap_top: u64, double_fault_top: u64) {
 ///
 /// # Safety
 /// Call once on the secondary with interrupts disabled and its assigned
-/// APIC ID. Both stacks must be private, supervisor-only, and remain live.
-pub unsafe fn init_secondary(id: u8, trap_top: u64, double_fault_top: u64) {
+/// APIC ID. All stacks must be distinct, supervisor-only, and remain live.
+pub unsafe fn init_secondary(id: u8, trap_top: u64, double_fault_top: u64, nmi_top: u64) {
     // SAFETY: The caller exclusively owns this CPU's tables and stacks.
-    unsafe { SECONDARIES[usize::from(id)].load(trap_top, double_fault_top) };
+    unsafe { SECONDARIES[usize::from(id)].load(trap_top, double_fault_top, nmi_top) };
 }
 
 #[cfg(test)]

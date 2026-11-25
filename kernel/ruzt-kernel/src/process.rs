@@ -305,7 +305,8 @@ fn map_image(
     framebuffer: Option<Framebuffer>,
     budget: UntypedBudget,
 ) -> Result<(UserAddressSpace, Option<FramebufferInfo>), MapError> {
-    let root = mapper::with_mapper(|mapper| mapper.create_user_address_space(&budget))?;
+    let entry_mappings = crate::pti::entry_mappings();
+    let root = mapper::with_mapper(|mapper| mapper.create_user_address_space(entry_mappings, &budget))?;
     let mut space = UserAddressSpace {
         root,
         ram: Vec::new(),
@@ -362,17 +363,16 @@ fn map_image(
 }
 
 fn enter_user() -> ! {
-    let (entry, root, name) =
-        crate::sched::with_current_user(|user| (user.entry, user.root(), user.name))
-            .expect("scheduled user process");
+    let (entry, name) = crate::sched::with_current_user(|user| (user.entry, user.name))
+        .expect("scheduled user process");
+    #[cfg(any(feature = "qemu-hardening-test", feature = "qemu-smp-test"))]
+    crate::pti::verify_user_root(crate::sched::with_current_user(|user| user.root()).expect("user root"), entry);
     crate::serial_println!("{name} process created, entering user mode...");
     #[allow(unsafe_code)]
-    // SAFETY: The private root shares the supervisor mappings containing the
-    // kernel and its initialized GDT, TSS and IDT. The scheduler installed
-    // this thread's kernel stack for traps. The mapped entry and user stack
-    // have the permissions required by enter_user.
+    // SAFETY: This scheduled process owns the validated user entry and stack.
+    // The private root shares only the supervisor transition mappings.
     unsafe {
-        ruzt_hal_x86_64::context::enter_user(entry, initial_stack_pointer(), root.base.as_u64())
+        crate::exceptions::enter_user(entry, initial_stack_pointer())
     }
 }
 

@@ -8,7 +8,7 @@
 //!
 //! ```
 //! use ruzt_hal::mem::{MapError, PageFlags, PhysAddr, PhysFrame, VirtAddr};
-//! use ruzt_hal_x86_64::{context, gdt, mapper};
+//! use ruzt_hal_x86_64::{gdt, mapper};
 //!
 //! assert_eq!(gdt::USER_CODE_SELECTOR, 0x1B);
 //! assert_eq!(gdt::USER_DATA_SELECTOR, 0x23);
@@ -23,8 +23,7 @@
 //!     Err(MapError::InvalidAlignment),
 //! );
 //!
-//! let _: unsafe extern "C" fn(u64, u64, u64) -> ! = context::enter_user;
-//! let _: fn(&mut mapper::X86_64Mapper, &dyn mapper::UserPageFrames) -> Result<PhysFrame, MapError> =
+//! let _: fn(&mut mapper::X86_64Mapper, &mapper::UserEntryMappings, &dyn mapper::UserPageFrames) -> Result<PhysFrame, MapError> =
 //!     mapper::X86_64Mapper::create_user_address_space;
 //! let _: unsafe fn(
 //!     &mut mapper::X86_64Mapper,

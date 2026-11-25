@@ -243,7 +243,7 @@ extern "C" fn finish_switch() {
 /// CPU-local scheduling hints from interrupts and thread exit.
 static NEED_SWITCH: [AtomicBool; CPU_SLOTS] = [const { AtomicBool::new(false) }; CPU_SLOTS];
 
-fn current_cpu() -> usize {
+pub(crate) fn current_cpu() -> usize {
     #[cfg(not(test))]
     return crate::smp::scheduler_slot();
     #[cfg(test)]
@@ -705,30 +705,29 @@ fn switch_to(mut guard: SchedulerGuard, cpu: usize, next_id: ThreadId) {
     let next = &sched.threads[next_id];
     let new_rsp = next.rsp;
     let new_fp = &next.fp as *const FpState;
-    let new_cr3 = if let Some(user) = &next.user {
+    if next.user.is_some() {
         let stack = next
             .stack
             .as_ref()
             .expect("user thread needs a kernel stack");
         let stack_top = (stack.as_ptr() as u64 + stack.len() as u64) & !0xF;
-        // SAFETY: Interrupts are disabled, and this owned kernel stack lies in
-        // the common supervisor mapping of every supported page-table root.
+        // SAFETY: Interrupts are disabled and this owned stack is mapped in
+        // the permanent kernel root before the entry stub touches it.
         unsafe { crate::mm::entry_stack::set_thread_stack(cpu, Some(stack_top)) };
-        user.root().base.as_u64()
     } else {
         // SAFETY: Bookkeeping runs with interrupts disabled. The CPU no
         // longer has a user thread's stack published for its entry stub.
         unsafe { crate::mm::entry_stack::set_thread_stack(cpu, None) };
-        sched.kernel_cr3
-    };
+    }
+    let kernel_cr3 = sched.kernel_cr3;
     sched.cpu_mut(cpu).current = next_id;
     // Transfer unlock to the incoming stack. Other CPUs must not reuse this
     // context while the outgoing thread is still saving registers or CR3.
     core::mem::forget(guard.lock);
     // SAFETY: Both thread records are pinned in separate boxes, and the boot
-    // kernel heap, the switch code, and both stacks are mapped in both roots.
+    // kernel heap, switch code, and both stacks are in the permanent root.
     unsafe {
-        ruzt_hal_x86_64::context::switch(old_rsp, new_rsp, new_cr3, old_fp, new_fp, finish_switch)
+        ruzt_hal_x86_64::context::switch(old_rsp, new_rsp, kernel_cr3, old_fp, new_fp, finish_switch)
     };
 }
 

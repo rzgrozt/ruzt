@@ -5,7 +5,14 @@
 use core::mem::{offset_of, size_of};
 
 use ruzt_abi::SyscallArgs;
-use x86_64::{registers::rflags::RFlags, structures::idt::InterruptStackFrameValue, VirtAddr};
+use x86_64::{
+    instructions::segmentation::{Segment, DS, ES, FS, GS},
+    registers::rflags::RFlags,
+    structures::{gdt::SegmentSelector, idt::InterruptStackFrameValue},
+    VirtAddr,
+};
+
+use ruzt_hal_x86_64::gdt::{USER_CODE_SELECTOR, USER_DATA_SELECTOR};
 
 #[repr(C)]
 pub(super) struct Trap {
@@ -26,10 +33,55 @@ const STUB_SIZE: usize = 16;
 
 unsafe extern "C" {
     static ruzt_vector_stubs: u8;
+    static ruzt_entry_end: u8;
+    fn ruzt_return_user(frame: &Trap, entry_top: u64, root: u64) -> !;
 }
 
 pub(super) fn vector_entry(vector: u8) -> VirtAddr {
     VirtAddr::from_ptr((&raw const ruzt_vector_stubs).wrapping_add(usize::from(vector) * STUB_SIZE))
+}
+
+pub(super) fn code_pages() -> impl Iterator<Item = u64> {
+    let start = &raw const ruzt_vector_stubs as u64;
+    let end = &raw const ruzt_entry_end as u64;
+    assert_eq!(start % 4096, 0);
+    assert_eq!(end - start, 8192);
+    (start..end).step_by(4096)
+}
+
+pub(super) unsafe fn enter_user(ip: u64, sp: u64) -> ! {
+    let data = SegmentSelector(USER_DATA_SELECTOR as u16);
+    let trap = Trap {
+        args: SyscallArgs {
+            number: 0,
+            arg0: 0,
+            arg1: 0,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        saved: [0; 8],
+        vector: 0,
+        error: 0,
+        frame: InterruptStackFrameValue::new(
+            VirtAddr::new(ip),
+            SegmentSelector(USER_CODE_SELECTOR as u16),
+            RFlags::from_bits_retain(0x202),
+            VirtAddr::new(sp),
+            data,
+        ),
+    };
+    let target = super::user_return(&trap);
+    // SAFETY: The GDT supplies flat ring-3 data segments, the scheduler has
+    // installed this task, and its entry and stack are mapped in the root.
+    unsafe {
+        DS::set_reg(data);
+        ES::set_reg(data);
+        FS::set_reg(data);
+        GS::set_reg(data);
+        ruzt_return_user(&trap, target.entry_top, target.root)
+    }
 }
 
 // Every installed IDT gate lands at a fixed offset. Error-code exceptions
@@ -74,13 +126,44 @@ ruzt_vector_stubs:
     push rdi
     push rax
 
+    # An NMI can arrive even between MOV CR3 and IRET. It uses its own IST,
+    # and the dummy error slot holds the exact interrupted root for return.
+    cmp qword ptr [rsp + {vector_offset}], 2
+    je .Lnmi_entry
+    cmp qword ptr [rsp + {vector_offset}], 8
+    je .Lload_kernel_root
+    test word ptr [rsp + {cs_offset}], 3
+    jnz .Lload_kernel_root
+
+    # A fault in the shared transition code can also arrive with CPL0 and
+    # an isolated root. Other kernel traps already have a supervisor root.
+    mov rdx, [rsp + {rip_offset}]
+    lea rax, [rip + ruzt_vector_stubs]
+    cmp rdx, rax
+    jb .Ldispatch
+    lea rax, [rip + ruzt_entry_end]
+    cmp rdx, rax
+    jae .Ldispatch
+    jmp .Lload_kernel_root
+
+.Lnmi_entry:
+    mov rax, cr3
+    mov [rsp + {error_offset}], rax
+.Lload_kernel_root:
+    mov rax, [rip + {kernel_root}]
+    mov cr3, rax
+
+    # Switch from the shared, hardware-facing IST pages to kernel-only
+    # stack pages and erase the interrupted state in the shared pages.
+    cmp qword ptr [rsp + {vector_offset}], 2
+    je .Lmove_nmi
+    cmp qword ptr [rsp + {vector_offset}], 8
+    je .Lmove_double_fault
+
     # A regular user-mode trap arrives on the CPU's fixed RSP0 stack.
     # Move the complete frame to the current thread so it can block or migrate.
-    # Double faults are terminal and stay on their separate IST stack.
     test word ptr [rsp + {cs_offset}], 3
     jz .Ldispatch
-    cmp qword ptr [rsp + {vector_offset}], 8
-    je .Ldispatch
     mov rax, rsp
     mov rcx, {stack_base}
     sub rax, rcx
@@ -92,6 +175,16 @@ ruzt_vector_stubs:
     test rdi, rdi
     jz .Lbad_entry
     sub rdi, {trap_size}
+    jmp .Lmove_frame
+
+.Lmove_nmi:
+    lea rdi, [rsp + {nmi_kernel_offset}]
+    jmp .Lmove_frame
+
+.Lmove_double_fault:
+    lea rdi, [rsp - 4096]
+
+.Lmove_frame:
     mov rdx, rsp
     mov rsi, rsp
     mov rsp, rdi
@@ -109,38 +202,97 @@ ruzt_vector_stubs:
     mov rbx, rsp
     and rsp, -16
     call {dispatch}
-    mov rsp, rbx
+    cmp qword ptr [rbx + {vector_offset}], 2
+    je .Lnmi_return
+    test word ptr [rbx + {cs_offset}], 3
+    jz .Lkernel_return
 
-    pop rax
-    pop rdi
-    pop rsi
-    pop rdx
-    pop r10
-    pop r8
-    pop r9
-    pop rcx
-    pop r11
-    pop rbx
-    pop rbp
-    pop r12
-    pop r13
-    pop r14
-    pop r15
+    # The task may have migrated while it was parked inside dispatch.
+    mov rdi, rbx
+    call {user_return}
+    mov rdi, rbx
+    mov rsi, rax
+    jmp ruzt_return_user
+
+.Lnmi_return:
+    mov rdx, [rbx + {error_offset}]
+    cmp rdx, [rip + {kernel_root}]
+    je .Lkernel_return
+    # Resume an interrupted restricted root using the mapped side of its IST.
+    mov rdi, rbx
+    lea rsi, [rbx - {nmi_kernel_offset} + {trap_size}]
+    jmp ruzt_return_user
+
+.Lkernel_return:
+    mov rsp, rbx
+    jmp .Lrestore
+
+    .global ruzt_return_user
+ruzt_return_user:
+    mov rax, rdi
+    lea rdi, [rsi - {trap_size}]
+    mov rsi, rax
+    mov rsp, rdi
+    mov ecx, {trap_words}
+    rep movsq
+    # An NMI in the return window must only observe user state. Remove
+    # kernel scratch, including the source stack pointer, before switching.
+    xor eax, eax
+    xor ebx, ebx
+    xor ecx, ecx
+    xor ebp, ebp
+    xor edi, edi
+    xor esi, esi
+    xor r8d, r8d
+    xor r9d, r9d
+    xor r10d, r10d
+    xor r11d, r11d
+    xor r12d, r12d
+    xor r13d, r13d
+    xor r14d, r14d
+    xor r15d, r15d
+    mov cr3, rdx
+    jmp .Lrestore_isolated
+
+    .macro restore clear
+    .irp reg,rax,rdi,rsi,rdx,r10,r8,r9,rcx,r11,rbx,rbp,r12,r13,r14,r15
+    pop \reg
+    .if \clear
+    mov qword ptr [rsp - 8], 0
+    .endif
+    .endr
+    .if \clear
+    mov qword ptr [rsp], 0
+    mov qword ptr [rsp + 8], 0
+    .endif
     add rsp, 16
     iretq
+    .endm
+
+.Lrestore_isolated:
+    restore 1
+.Lrestore:
+    restore 0
 .Lbad_entry:
     ud2
     .p2align 12, 0xcc
+    .global ruzt_entry_end
+ruzt_entry_end:
     .popsection
     "#,
     dispatch = sym super::dispatch,
+    user_return = sym super::user_return,
+    kernel_root = sym crate::pti::KERNEL_ROOT,
     thread_stacks = sym crate::mm::entry_stack::THREAD_STACKS,
     stack_base = const crate::mm::entry_stack::BASE,
     slot_shift = const crate::mm::entry_stack::SLOT_SHIFT,
     slot_count = const crate::smp::SCHEDULER_SLOTS,
+    nmi_kernel_offset = const crate::mm::entry_stack::NMI_KERNEL_OFFSET,
     trap_size = const size_of::<Trap>(),
     trap_words = const size_of::<Trap>() / 8,
     cs_offset = const offset_of!(Trap, frame) + offset_of!(InterruptStackFrameValue, code_segment),
+    rip_offset = const offset_of!(Trap, frame) + offset_of!(InterruptStackFrameValue, instruction_pointer),
     vector_offset = const offset_of!(Trap, vector),
+    error_offset = const offset_of!(Trap, error),
     without_ac = const !(RFlags::ALIGNMENT_CHECK.bits() as i32),
 );

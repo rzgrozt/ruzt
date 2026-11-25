@@ -4,7 +4,7 @@
 //! memory at `physical_memory_offset`.  We drive those existing tables through
 //! the x86_64 crate rather than building new ones.
 
-use core::{mem::MaybeUninit, ptr};
+use core::{mem::MaybeUninit, ops::Range, ptr};
 use ruzt_hal::mem::{MapError, Mapper, PageFlags, PhysAddr, PhysFrame, VirtAddr};
 use spin::{Mutex, Once};
 use x86_64::{
@@ -143,6 +143,9 @@ pub struct X86_64Mapper {
     inner: OffsetPageTable<'static>,
     alloc: fn() -> Option<PhysFrame>,
 }
+
+/// Permanent supervisor mappings shared by the restricted user roots.
+pub struct UserEntryMappings(PhysFrame);
 
 impl X86_64Mapper {
     /// Create four private startup tables with one low identity mapping.
@@ -329,16 +332,21 @@ impl X86_64Mapper {
     ) {
         tlb::synchronize(Invalidation::Inactive(root));
         // SAFETY: The caller owns the inactive root and all its lower-half tables.
-        unsafe { Self::free_user_tables(root, 4, frames) };
+        unsafe { Self::free_tables(root, 4, 0..256, frames) };
     }
 
-    unsafe fn free_user_tables(frame: PhysFrame, level: u8, frames: &dyn UserPageFrames) {
+    unsafe fn free_tables(
+        frame: PhysFrame,
+        level: u8,
+        entries: Range<usize>,
+        frames: &dyn UserPageFrames,
+    ) {
         if level > 1 {
             // SAFETY: This owned frame is a populated page table covered by
             // the boot physmap. No CPU can walk it during destruction.
             let table = unsafe { &*frame_pointer(frame).cast::<PageTable>() };
-            let count = if level == 4 { 256 } else { 512 };
-            for entry in table.iter().take(count) {
+            for index in entries {
+                let entry = &table[index];
                 let flags = entry.flags();
                 if flags.contains(PageTableFlags::PRESENT) {
                     assert!(!flags.contains(PageTableFlags::HUGE_PAGE));
@@ -346,7 +354,7 @@ impl X86_64Mapper {
                         .expect("aligned child page table");
                     // SAFETY: Present non-leaf entries in the private part
                     // of the tree name exclusive child page tables.
-                    unsafe { Self::free_user_tables(child, level - 1, frames) };
+                    unsafe { Self::free_tables(child, level - 1, 0..512, frames) };
                 }
             }
         }
@@ -354,7 +362,55 @@ impl X86_64Mapper {
         unsafe { frames.deallocate(frame) };
     }
 
-    /// Allocate an empty user PML4 that shares only the active kernel half.
+    /// Build an independent supervisor hierarchy from selected live kernel pages.
+    ///
+    /// # Safety
+    /// The source pages must remain mapped to the same frames for the kernel's
+    /// lifetime. Only pages required for privilege transitions may be supplied.
+    pub unsafe fn create_user_entry_mappings(
+        &mut self,
+        pages: impl IntoIterator<Item = (VirtAddr, PageFlags)>,
+        frames: &dyn UserPageFrames,
+    ) -> Result<UserEntryMappings, MapError> {
+        let root = frames.allocate().ok_or(MapError::FrameAllocationFailed)?;
+        // SAFETY: The root is fresh and no CPU can activate this template.
+        unsafe { zero_frame(root) };
+        let result = (|| {
+            let mut table = unsafe { user_mapper(root) };
+            let mut allocator = CallbackFrameAlloc(|| frames.allocate());
+            for (address, flags) in pages {
+                if address.as_u64() < 0xffff_8000_0000_0000 || flags.contains(PageFlags::USER) {
+                    return Err(MapError::InvalidAlignment);
+                }
+                let source_address = X64VirtAddr::try_new(address.as_u64())
+                    .map_err(|_| MapError::InvalidAlignment)?;
+                let source = self.inner.translate_addr(source_address)
+                    .and_then(|physical| PhysFrame::from_base(PhysAddr::new(physical.as_u64())))
+                    .ok_or(MapError::InvalidAlignment)?;
+                let (page, frame, flags) = mapping_parts(address, source, flags)?;
+                // SAFETY: The template is private, and the caller pins each
+                // source frame. Parent entries are supervisor-only too.
+                unsafe {
+                    table.map_to_with_table_flags(
+                        page, frame, flags,
+                        PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+                        &mut allocator,
+                    )
+                }
+                .map_err(convert_map_error)?
+                .ignore();
+            }
+            Ok(UserEntryMappings(root))
+        })();
+        if result.is_err() {
+            // SAFETY: Even partially allocated tables are private. The
+            // walker frees table frames only, leaving source pages live.
+            unsafe { Self::free_tables(root, 4, 256..512, frames) };
+        }
+        result
+    }
+
+    /// Allocate an empty user PML4 sharing only the supervisor entry mappings.
     ///
     /// # Errors
     ///
@@ -362,15 +418,27 @@ impl X86_64Mapper {
     /// available.
     pub fn create_user_address_space(
         &mut self,
+        entry: &UserEntryMappings,
         frames: &dyn UserPageFrames,
     ) -> Result<PhysFrame, MapError> {
+        // SAFETY: The template root is initialized, permanent, and immutable.
+        let source = unsafe { &*frame_pointer(entry.0).cast::<PageTable>() };
+        Self::create_root(source, frames)
+    }
+
+    /// Build a kernel-mode probe root for the SMP invalidation fixture.
+    #[cfg(feature = "qemu-smp-test")]
+    pub fn create_test_address_space(&mut self, frames: &dyn UserPageFrames) -> Result<PhysFrame, MapError> {
+        Self::create_root(self.inner.level_4_table(), frames)
+    }
+
+    fn create_root(source: &PageTable, frames: &dyn UserPageFrames) -> Result<PhysFrame, MapError> {
         let root = frames.allocate().ok_or(MapError::FrameAllocationFailed)?;
         // SAFETY: [Categories 3/10/11 - Dangling, bounds, provenance] The
         // configured allocator returned this fresh 4 KiB frame, and `init`
         // guarantees every allocated frame is covered by the physmap.
         unsafe { zero_frame(root) };
 
-        let source = self.inner.level_4_table();
         let destination_pointer = frame_pointer(root).cast::<PageTable>();
 
         // SAFETY: [Categories 1/3/6/11 - Aliasing, dangling, alignment,
@@ -383,6 +451,19 @@ impl X86_64Mapper {
         }
 
         Ok(root)
+    }
+
+    /// Inspect a mapping in a separately owned root while holding the mapper.
+    ///
+    /// # Safety
+    /// The root and its tables must be live, owned, and stable for the call.
+    pub unsafe fn address_space_flags(&mut self, root: PhysFrame, address: VirtAddr) -> Option<PageTableFlags> {
+        // SAFETY: The caller owns the root; the mapper serializes changes.
+        let mapper = unsafe { user_mapper(root) };
+        match mapper.translate(X64VirtAddr::new(address.as_u64())) {
+            TranslateResult::Mapped { flags, .. } => Some(flags),
+            _ => None,
+        }
     }
 
     /// Map one 4 KiB page in a private, lower-half user address space.
@@ -577,11 +658,14 @@ fn frame_pointer(frame: PhysFrame) -> *mut u8 {
     (physical_memory_offset() + frame.base.as_u64()).as_mut_ptr()
 }
 
-/// Check all pages in a nonempty user buffer in the expected active root.
+/// Check all pages in a nonempty user buffer in its owning root.
 ///
 /// Every level must permit user access and, for an output buffer, writes.
 /// MMIO and DMA mappings cannot serve as syscall buffers.
-pub fn active_user_range_accessible(
+///
+/// # Safety
+/// The caller must own a live user root and keep its mappings stable.
+pub unsafe fn user_range_accessible(
     root: PhysFrame,
     address: u64,
     len: usize,
@@ -600,7 +684,7 @@ struct UserRange {
 impl UserRange {
     fn check(root: PhysFrame, address: u64, len: usize, writable: bool) -> Option<Self> {
         let last = address.checked_add(len as u64)?.checked_sub(1)?;
-        if len == 0 || address == 0 || last >= 1 << 47 || !root_is_active(root) {
+        if len == 0 || address == 0 || last >= 1 << 47 {
             return None;
         }
 
@@ -637,7 +721,7 @@ impl UserRange {
 /// # Safety
 /// The caller must keep the root, mappings, and backing frames stable for the
 /// call. The source must be ordinary RAM and disjoint from the destination.
-pub unsafe fn copy_from_active_user(root: PhysFrame, address: u64, buf: &mut [u8]) -> bool {
+pub unsafe fn copy_from_user_root(root: PhysFrame, address: u64, buf: &mut [u8]) -> bool {
     let Some(range) = UserRange::check(root, address, buf.len(), false) else {
         return false;
     };
@@ -659,7 +743,7 @@ pub unsafe fn copy_from_active_user(root: PhysFrame, address: u64, buf: &mut [u8
 /// The caller must keep the root, mappings, and backing frames stable for the
 /// call, including during `produce`. The destination must be ordinary RAM
 /// disjoint from the source.
-pub unsafe fn copy_to_active_user_with<T: AsRef<[u8]>>(
+pub unsafe fn copy_to_user_root_with<T: AsRef<[u8]>>(
     root: PhysFrame,
     address: u64,
     len: usize,
@@ -705,7 +789,7 @@ fn user_page_frame(
         .enumerate()
     {
         let virtual_addr = physical_memory_offset() + physical;
-        // SAFETY: CR3 supplies a live root and each preceding present,
+        // SAFETY: The caller supplies a live root and each preceding present,
         // non-huge entry names a live table. The boot physmap covers them.
         let table = unsafe { &*virtual_addr.as_ptr::<PageTable>() };
         let entry = &table[index];

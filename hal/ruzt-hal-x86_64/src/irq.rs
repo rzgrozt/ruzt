@@ -248,6 +248,8 @@ pub unsafe fn install_apic(
             pic::mask_all();
         }
         local.enable();
+        #[cfg(feature = "qemu-hardening-test")]
+        local.enable_monitor_nmi();
         if let Some(mapping) = &remapping {
             // A failed command can leave the hardware between modes. With
             // the inputs masked, halt before allowing any ambiguous delivery.

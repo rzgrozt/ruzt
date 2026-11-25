@@ -60,6 +60,17 @@ impl CpuOps for X86_64Cpu {
     }
 }
 
+/// Make every old translation disposable on CR3 changes for isolation.
+///
+/// # Safety
+/// Run on each CPU in ring zero before switching into a restricted root.
+pub unsafe fn disable_global_translations() {
+    assert!(!Cr4::read().contains(Cr4Flags::PCID));
+    // SAFETY: Disabling PGE invalidates old global translations. No other
+    // paging mode or CR4 setting changes.
+    unsafe { Cr4::update(|flags| flags.remove(Cr4Flags::PAGE_GLOBAL)) };
+}
+
 /// Enable SMEP and SMAP on the current CPU when CPUID reports support.
 ///
 /// Returns the active state of SMEP and SMAP, in that order.

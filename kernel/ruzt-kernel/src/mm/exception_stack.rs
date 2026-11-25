@@ -3,7 +3,7 @@
 use ruzt_hal::mem::{Mapper, PageFlags, PhysFrame, VirtAddr};
 use ruzt_hal_x86_64::mapper;
 
-use super::{frame, heap::HEAP_END};
+use super::{entry_stack, heap::HEAP_END};
 
 const PAGE_BYTES: u64 = PhysFrame::SIZE as u64;
 const STACK_PAGES: u64 = 8;
@@ -18,7 +18,7 @@ pub(crate) fn map() {
             "double-fault stack guard must be unmapped",
         );
         for address in (BOTTOM..TOP).step_by(PhysFrame::SIZE) {
-            let frame = frame::allocate().expect("double-fault stack frame");
+            let frame = entry_stack::allocate_frame().expect("double-fault stack frame");
             mapper
                 .map(VirtAddr::new(address), frame, PageFlags::WRITABLE)
                 .expect("map double-fault stack");

@@ -55,6 +55,15 @@ pub(crate) fn secondary_scheduler_slot(id: u8) -> usize {
     usize::from(id) + 1
 }
 
+pub(crate) fn entry_pages() -> impl Iterator<Item = (u8, usize, u64)> {
+    STATE.iter().enumerate().filter_map(|(id, state)| {
+        (state.load(Ordering::Acquire) >= READY).then(|| {
+            let id = id as u8;
+            (id, secondary_scheduler_slot(id), stack_bounds(id).1 - PAGE)
+        })
+    })
+}
+
 #[allow(unsafe_code)]
 #[cfg(not(test))]
 pub(crate) fn scheduler_slot() -> usize {
@@ -233,7 +242,7 @@ fn map_stacks(id: u8) -> bool {
     mapper::with_mapper(|mapper| {
         let first = stack - STACK_PAGES * PAGE;
         let second = fault - FAULT_PAGES * PAGE;
-        if [first - PAGE, second - PAGE, entry_stack::guard(slot)]
+        if [first - PAGE, second - PAGE, entry_stack::guard(slot), entry_stack::top(slot), entry_stack::nmi_top(slot)]
             .into_iter()
             .any(|address| mapper.translate(VirtAddr::new(address)).is_some())
         {
@@ -242,9 +251,9 @@ fn map_stacks(id: u8) -> bool {
         let pages = (first..stack)
             .step_by(PhysFrame::SIZE)
             .chain((second..fault).step_by(PhysFrame::SIZE))
-            .chain(core::iter::once(entry));
+            .chain([entry, entry_stack::nmi_bottom(slot), entry_stack::nmi_kernel_bottom(slot)]);
         for (index, address) in pages.clone().enumerate() {
-            let new = if address == entry {
+            let new = if address >= second {
                 entry_stack::allocate_frame()
             } else {
                 frame::allocate()
@@ -320,8 +329,10 @@ extern "C" fn secondary_entry(id: u64) -> ! {
     // descriptors and restore supervisor protections before accepting IPIs.
     unsafe {
         core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
-        gdt::init_secondary(id, entry_stack::top(secondary_scheduler_slot(id)), fault);
+        let slot = secondary_scheduler_slot(id);
+        gdt::init_secondary(id, entry_stack::top(slot), fault, entry_stack::nmi_top(slot));
         context::init_fp();
+        cpu::disable_global_translations();
         cpu::enable_supervisor_protection();
     }
     exceptions::init_idt();

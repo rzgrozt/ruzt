@@ -1,6 +1,5 @@
 //! x86_64 context switch.
 
-use crate::gdt::{USER_CODE_SELECTOR, USER_DATA_SELECTOR};
 use x86_64::registers::control::{Cr0, Cr0Flags, Cr4, Cr4Flags};
 
 /// The x87, MMX, and SSE state of one thread.
@@ -136,62 +135,6 @@ pub unsafe extern "C" fn switch(
         "pop rbx",
         "pop rbp",
         "ret",
-    );
-}
-
-/// Enter ring 3 for the first time through an `iretq` frame.
-///
-/// The System V inputs are `rdi = user_rip`, `rsi = user_rsp`, and
-/// `rdx = user_cr3`. The transition starts userspace with interrupts enabled
-/// and all general-purpose registers except RSP cleared.
-///
-/// # Safety
-///
-/// [`crate::gdt::init`] must have loaded the expected selectors and a valid
-/// TSS RSP0. `user_rip` and `user_rsp` must be canonical and mapped in
-/// `user_cr3` as user-executable and user-writable respectively. `user_cr3`
-/// must be a valid aligned PML4 root for the current paging mode and must map
-/// the current transition code and stack, plus the kernel higher half,
-/// GDT, IDT, TSS, and trap stack until `iretq` completes. Fault and NMI entry
-/// must be valid throughout the transition because `cli` masks only ordinary
-/// interrupts. This function must be called from CPL0 and never returns.
-#[unsafe(naked)]
-pub unsafe extern "C" fn enter_user(_user_rip: u64, _user_rsp: u64, _user_cr3: u64) -> ! {
-    // SAFETY: [Categories 5/13 - Invalid machine state and library contract]
-    // The caller contract proves every selector, canonical address, CR3 root,
-    // and transient kernel mapping consumed by this privileged sequence. The
-    // fixed RFLAGS value exposes only bit 1 and IF, with IOPL, NT, and DF clear.
-    core::arch::naked_asm!(
-        "cli",
-        "push {user_data}",
-        "push rsi",
-        "push 0x202",
-        "push {user_code}",
-        "push rdi",
-        "mov cr3, rdx",
-        "mov ax, {user_data}",
-        "mov ds, ax",
-        "mov es, ax",
-        "mov fs, ax",
-        "mov gs, ax",
-        "xor eax, eax",
-        "xor ebx, ebx",
-        "xor ecx, ecx",
-        "xor edx, edx",
-        "xor esi, esi",
-        "xor edi, edi",
-        "xor ebp, ebp",
-        "xor r8d, r8d",
-        "xor r9d, r9d",
-        "xor r10d, r10d",
-        "xor r11d, r11d",
-        "xor r12d, r12d",
-        "xor r13d, r13d",
-        "xor r14d, r14d",
-        "xor r15d, r15d",
-        "iretq",
-        user_code = const USER_CODE_SELECTOR,
-        user_data = const USER_DATA_SELECTOR,
     );
 }
 

@@ -77,6 +77,14 @@ impl LocalRegisters {
 }
 
 impl LocalApic {
+    #[cfg(feature = "qemu-hardening-test")]
+    pub(crate) fn enable_monitor_nmi(&self) {
+        // QEMU's external NMI input uses the local APIC's LINT1 entry.
+        const LINT1: usize = 0x360;
+        const NMI_DELIVERY: u32 = 0b100 << 8;
+        self.registers.write(LINT1, NMI_DELIVERY);
+    }
+
     /// Report the enabled local APIC's physical base and whether it uses MSRs.
     pub fn location() -> Option<(u64, bool)> {
         let features = core::arch::x86_64::__cpuid(1);

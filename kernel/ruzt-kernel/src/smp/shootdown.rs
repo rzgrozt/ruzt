@@ -254,7 +254,7 @@ pub(crate) fn verify_shootdown() {
         observe(address, REPLACEMENT);
         assert_eq!(mapper.unmap(address).unwrap(), after);
 
-        let root = mapper.create_user_address_space(&TestTables).unwrap();
+        let root = mapper.create_test_address_space(&TestTables).unwrap();
         let lower = VirtAddr::new(0x4000);
         #[allow(unsafe_code)]
         // SAFETY: The fixture exclusively owns both data frames and the user

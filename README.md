@@ -18,6 +18,8 @@ User tasks can read the monotonic clock, supply an absolute deadline to a capabi
 
 The x86-64 kernel enables SMEP and SMAP when the CPU advertises them. Syscalls copy through supervisor-only aliases after checking access on every user page. Interrupt and syscall entry clear the live AC and DF flags and preserve the interrupted task's flags for return. A user trap starts on the CPU's guarded entry stack. The common entry stub moves the saved frame onto the thread's kernel stack before dispatch so the thread can block or migrate. The QEMU preemption test exercises this path with both protections enabled.
 
+Kernel page-table isolation gives user roots only their own mappings and dedicated supervisor pages for privilege transitions. Kernel dispatch runs under a permanent root with global translations disabled. Returning to user mode installs the process root from the entry stack. The QEMU fixtures check that the kernel heap, physical-memory map, and kernel-only stacks are absent from the user root, then exercise user IPC and interrupt delivery with isolated roots.
+
 Double faults switch to a dedicated supervisor stack with an unmapped guard page. The handler writes directly to COM1 before halting. The QEMU fixture reaches it with an unmapped interrupted stack and the normal serial lock held.
 
 The x86-64 bootstrap starts firmware-enabled secondary CPUs with INIT and SIPI messages. Each secondary switches to the permanent supervisor mappings, installs its own descriptor tables and guarded stacks, and acknowledges a fixed IPI before the kernel reclaims the temporary startup pages.

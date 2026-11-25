@@ -156,6 +156,7 @@ fn test_uefi_boots_user_services_with_a_randomized_kernel() {
                 "SMP scheduler migrated a saved worker and reaped all worker stacks",
                 "SMP IPC registered a waiter and completed a cross-CPU rendezvous",
                 "SMP LAPIC probe distinguished pending and idle boot CPU vectors",
+                "KPTI user root excludes the kernel heap and physmap",
                 "SMP user IPC crossed CPUs",
                 "rootsrv: console write acknowledged over IPC",
                 "rootsrv: framebuffer tile drawn",
@@ -315,6 +316,7 @@ fn test_timer_preempts_cpu_bound_user_code() {
         &[
             "x86 supervisor protection (SMEP=true, SMAP=true)",
             "Local APIC and I/O APIC interrupt routing enabled",
+            "KPTI user root excludes the kernel heap and physmap",
             "consoled: syscall preserved user AC and DF",
             "consoled: reply followed by CPU-bound loop",
         ],
@@ -331,6 +333,13 @@ fn test_timer_preempts_cpu_bound_user_code() {
             "rootsrv: timed wait and sleep woke at monotonic deadlines",
             "rootsrv: syscall copy checked both pages before writing",
         ],
+    );
+    monitor(&mut vm.child, "nmi");
+    wait_for_serial(
+        &mut vm.child,
+        &serial_path,
+        "KPTI resumed an NMI that interrupted user mode",
+        Instant::now() + ACTION_TIMEOUT,
     );
     monitor(&mut vm.child, "sendkey spc");
     wait_for_serial(
