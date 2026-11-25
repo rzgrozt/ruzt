@@ -66,6 +66,7 @@ pub(crate) fn verify() {
             crate::serial_println!(
                 "SMP scheduler migrated a saved worker and reaped all worker stacks"
             );
+            crate::serial_println!("SMP heap released a CPU-local allocation after migration");
             return;
         }
         core::hint::spin_loop();
@@ -217,6 +218,17 @@ fn parent() -> ! {
     let cpu = current_cpu();
     let id = current_thread_id();
     assert_ne!(cpu, 0, "the BSP cannot run the migration probe");
+    let local = alloc::boxed::Box::new(id);
+    assert_eq!(
+        crate::mm::heap::owner(core::ptr::from_ref(&*local) as u64),
+        Some(cpu)
+    );
+    let large = alloc::boxed::Box::new([0u8; 8192]);
+    assert_eq!(
+        crate::mm::heap::owner(core::ptr::from_ref(&*large) as u64),
+        None
+    );
+    drop(large);
     let _ = LEADER.compare_exchange(0, cpu, Ordering::Release, Ordering::Relaxed);
     rendezvous(&PARENTS);
 
@@ -228,6 +240,8 @@ fn parent() -> ! {
         super::yield_thread();
     }
     assert_eq!(current_thread_id(), id);
+    assert_eq!(*local, id);
+    drop(local);
     if current_cpu() != cpu {
         MIGRATED.store(true, Ordering::Release);
     }

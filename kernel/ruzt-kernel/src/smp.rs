@@ -90,6 +90,7 @@ pub(crate) fn start_scheduling() {
             crate::serial_println!("SMP APIC {id} could not allocate its idle thread");
             continue;
         }
+        crate::mm::heap::provision_cpu(secondary_scheduler_slot(id));
         state.store(SCHEDULING, Ordering::Release);
         // Publish the scheduler state before a wake via x2APIC's ICR MSR.
         fence(Ordering::SeqCst);

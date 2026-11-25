@@ -26,6 +26,8 @@ The x86-64 bootstrap starts firmware-enabled secondary CPUs with INIT and SIPI m
 
 Each online x86-64 scheduler CPU has its own round-robin run queue and idle context. User threads start on a least-loaded CPU, and an idle CPU can steal a ready user thread or kernel worker after its previous CPU saves its context. The PIT routes through the BSP, which sends reschedule IPIs that can preempt user code on secondary CPUs. The four-CPU BIOS and UEFI QEMU fixtures migrate a saved worker across secondaries and verify stack reclamation. The UEFI fixture also verifies an IPC transfer between user services on different CPU queues.
 
+Small kernel allocations use a bounded per-CPU heap. Large allocations and local exhaustion use the shared heap. A block's address identifies its original heap when a task frees it after migrating. The four-CPU fixtures verify both allocation paths and free a CPU-local block on a different CPU.
+
 Syscalls, device interrupt delivery, timeout processing, and user process cleanup serialize capability operations and IPC through a shared kernel transaction. Blocking calls register the wait before releasing the transaction, then reacquire it after resuming. Waking a thread on another CPU sends a reschedule IPI. The four-CPU fixtures verify a blocking endpoint rendezvous between secondary CPUs.
 
 Device interrupts target the BSP. Interrupt vector reuse and re-arming check that CPU's local APIC, using a synchronous IPI when the request comes from a secondary. The four-CPU fixtures distinguish a pending vector from an idle vector while the BSP waits for the transaction with interrupts masked.
