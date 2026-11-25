@@ -91,6 +91,9 @@ bitflags! {
         const SENSITIVE     = 1 << 6;
         /// This mapping can be accessed asynchronously by a DMA device.
         const DMA           = 1 << 7;
+        /// Hardware user shadow-stack memory. Requires architecture support
+        /// and is only valid together with USER.
+        const SHADOW_STACK  = 1 << 8;
     }
 }
 

@@ -115,7 +115,7 @@ pub fn main(boot_info: &'static mut BootInfo) -> ! {
     // SAFETY: The kernel and physmap use supervisor mappings. Every IDT
     // entry clears AC and DF before entering Rust, and interrupts are off.
     let (smep, smap) = unsafe { ruzt_hal_x86_64::cpu::enable_supervisor_protection() };
-    let ibt = cet::init_cpu();
+    let ibt = cet::init_cpu(0);
     serial_println!("x86 supervisor protection (SMEP={smep}, SMAP={smap})");
     serial_println!("x86 CET supervisor IBT enabled: {ibt}");
     #[cfg(feature = "qemu-hardening-test")]
@@ -149,6 +149,7 @@ pub fn main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(all(feature = "qemu-smp-test", not(test)))]
     sched::qemu::enqueue();
     smp::start_scheduling();
+    cet::finish_smp();
     #[cfg(all(feature = "qemu-smp-test", not(test)))]
     {
         sched::qemu::verify();

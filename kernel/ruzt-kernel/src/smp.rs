@@ -55,6 +55,12 @@ pub(crate) fn secondary_scheduler_slot(id: u8) -> usize {
     usize::from(id) + 1
 }
 
+pub(crate) fn scheduler_slots() -> impl Iterator<Item = usize> {
+    core::iter::once(0).chain(STATE.iter().enumerate().filter_map(|(id, state)| {
+        (state.load(Ordering::Acquire) == SCHEDULING).then_some(id + 1)
+    }))
+}
+
 pub(crate) fn entry_pages() -> impl Iterator<Item = (u8, usize, u64)> {
     STATE.iter().enumerate().filter_map(|(id, state)| {
         (state.load(Ordering::Acquire) >= READY).then(|| {
@@ -337,7 +343,7 @@ extern "C" fn secondary_entry(id: u64) -> ! {
         cpu::enable_supervisor_protection();
     }
     exceptions::init_idt();
-    crate::cet::init_cpu();
+    crate::cet::init_cpu(secondary_scheduler_slot(id));
     // SAFETY: This AP owns its LAPIC and has a valid IDT and stacks.
     let local = unsafe { LocalApic::init_secondary(topology.local_physical, topology.local_alias) };
     if local.is_none_or(|local| local.id() != id) {

@@ -16,6 +16,7 @@ use ruzt_hal_x86_64::gdt::{USER_CODE_SELECTOR, USER_DATA_SELECTOR};
 
 #[repr(C)]
 pub(super) struct Trap {
+    pub(super) ssp: u64,
     pub(super) args: SyscallArgs,
     saved: [u64; 8],
     pub(super) vector: u64,
@@ -24,9 +25,9 @@ pub(super) struct Trap {
 }
 
 const _: () = {
-    assert!(offset_of!(Trap, vector) == 15 * 8);
-    assert!(offset_of!(Trap, frame) == 17 * 8);
-    assert!(size_of::<Trap>() == 22 * 8);
+    assert!(offset_of!(Trap, vector) == 16 * 8);
+    assert!(offset_of!(Trap, frame) == 18 * 8);
+    assert!(size_of::<Trap>() == 23 * 8);
 };
 
 const STUB_SIZE: usize = 16;
@@ -49,9 +50,10 @@ pub(super) fn code_pages() -> impl Iterator<Item = u64> {
     (start..end).step_by(4096)
 }
 
-pub(super) unsafe fn enter_user(ip: u64, sp: u64) -> ! {
+pub(super) unsafe fn enter_user(ip: u64, sp: u64, ssp: u64) -> ! {
     let data = SegmentSelector(USER_DATA_SELECTOR as u16);
     let trap = Trap {
+        ssp,
         args: SyscallArgs {
             number: 0,
             arg0: 0,
@@ -126,6 +128,7 @@ ruzt_vector_stubs:
     push rsi
     push rdi
     push rax
+    push 0 # Software slot for the saved user SSP.
 
     # An NMI can arrive even between MOV CR3 and IRET. It uses its own IST,
     # and the dummy error slot holds the exact interrupted root for return.
@@ -257,6 +260,10 @@ ruzt_return_user:
     jmp .Lrestore_isolated
 
     .macro restore clear
+    .if \clear
+    mov qword ptr [rsp], 0
+    .endif
+    add rsp, 8
     .irp reg,rax,rdi,rsi,rdx,r10,r8,r9,rcx,r11,rbx,rbp,r12,r13,r14,r15
     pop \reg
     .if \clear

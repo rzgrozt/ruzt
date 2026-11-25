@@ -301,7 +301,51 @@ fn test_cet_under_kvm() {
     verify_user_preemption(&["-accel", "kvm", "-cpu", "host"], true);
 }
 
-fn verify_user_preemption(devices: &[&str], require_ibt: bool) {
+#[test]
+#[ignore = "requires KVM with host CET support"]
+fn test_cet_under_kvm_smp() {
+    let temp = tempfile::tempdir().expect("create CET SMP test directory");
+    let disk = build_image(
+        temp.path(),
+        "qemu-rootsrv-test,qemu-hardening-test,qemu-smp-test",
+        Services::Console,
+    );
+    let serial_path = temp.path().join("serial.log");
+    let mut vm = start_guest_with_devices(
+        &disk,
+        &serial_path,
+        &["-accel", "kvm", "-cpu", "host", "-smp", "4"],
+    );
+    let serial = wait_for_serial(
+        &mut vm.child,
+        &serial_path,
+        "rootsrv thread waiting for keyboard IRQ",
+        Instant::now() + BOOT_TIMEOUT,
+    );
+    assert_cet(&serial);
+    assert_markers(
+        &serial,
+        &[
+            "SMP initialized 3 secondary CPUs",
+            "SMP scheduler migrated a saved worker and reaped all worker stacks",
+            "SMP user IPC crossed CPUs",
+            "rootsrv: console write acknowledged over IPC",
+        ],
+    );
+}
+
+fn assert_cet(serial: &str) {
+    assert_markers(
+        serial,
+        &[
+            "x86 CET supervisor IBT enabled: true",
+            "x86 CET user shadow stacks enabled: true",
+            "kernel: syscall saved an active user shadow stack",
+        ],
+    );
+}
+
+fn verify_user_preemption(devices: &[&str], require_cet: bool) {
     let temp = tempfile::tempdir().expect("Failed to create boot test directory");
     let disk_image = build_image(
         temp.path(),
@@ -323,8 +367,8 @@ fn verify_user_preemption(devices: &[&str], require_ibt: bool) {
         "rootsrv thread waiting for keyboard IRQ",
         boot_deadline,
     );
-    if require_ibt {
-        assert!(serial.lines().any(|line| line == "x86 CET supervisor IBT enabled: true"), "IBT was not enabled:\n{serial}");
+    if require_cet {
+        assert_cet(&serial);
     }
     assert_markers(
         &serial,

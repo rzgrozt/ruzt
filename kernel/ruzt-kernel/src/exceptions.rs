@@ -91,11 +91,11 @@ pub(crate) fn entry_code_pages() -> impl Iterator<Item = u64> {
 
 /// # Safety
 /// Run on the current user's kernel stack with interrupts disabled, with
-/// both the entry point and stack mapped in its isolated root.
+/// its entry point, stack, and optional shadow stack mapped in its isolated root.
 #[allow(unsafe_code)]
-pub(crate) unsafe fn enter_user(ip: u64, sp: u64) -> ! {
+pub(crate) unsafe fn enter_user(ip: u64, sp: u64, ssp: u64) -> ! {
     // SAFETY: The caller provides the scheduled task and its validated frame.
-    unsafe { entry::enter_user(ip, sp) }
+    unsafe { entry::enter_user(ip, sp, ssp) }
 }
 
 #[repr(C)]
@@ -112,6 +112,14 @@ extern "C" fn user_return(trap: &entry::Trap) -> UserReturn {
         fatal_fault(frame, 13, format_args!("invalid user return address"));
     }
     let root = crate::sched::with_current_user(|user| user.root()).expect("returning user process");
+    if crate::cet::user_shadow_stack_enabled() {
+        #[allow(unsafe_code)]
+        // SAFETY: Every scheduling CPU enables CET. This CPU has IF clear
+        // and owns the incoming thread and its hardware-saved or initial SSP.
+        unsafe {
+            ruzt_hal_x86_64::cet::restore_user_ssp(trap.ssp)
+        };
+    }
     UserReturn {
         entry_top: crate::mm::entry_stack::top(crate::sched::current_cpu()),
         root: root.base.as_u64(),
@@ -121,6 +129,17 @@ extern "C" fn user_return(trap: &entry::Trap) -> UserReturn {
 extern "C" fn dispatch(trap: &mut entry::Trap) {
     let frame = trap.frame;
     let vector = trap.vector as u8;
+    if !matches!(vector, 2 | 8)
+        && frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3
+        && crate::cet::user_shadow_stack_enabled()
+    {
+        #[allow(unsafe_code)]
+        // SAFETY: This CPU supports CET and the trap arrived from its current
+        // user. The thread keeps the saved SSP even if it blocks or migrates.
+        unsafe {
+            trap.ssp = ruzt_hal_x86_64::cet::saved_user_ssp();
+        }
+    }
     #[cfg(any(feature = "qemu-hardening-test", feature = "qemu-smp-test"))]
     if frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
         crate::pti::assert_kernel_root();
@@ -156,6 +175,8 @@ extern "C" fn dispatch(trap: &mut entry::Trap) {
             crate::irq::on_interrupt(irq - VECTOR_BASE);
         }
         SYSCALL_VECTOR => {
+            #[cfg(feature = "qemu-hardening-test")]
+            crate::process::observe_user_ssp(trap.ssp);
             trap.args.number =
                 crate::syscall::syscall_dispatch(&trap.args, frame.code_segment.0.into());
         }

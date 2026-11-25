@@ -90,6 +90,11 @@ fn convert_flags(flags: PageFlags) -> PageTableFlags {
     if flags.contains(PageFlags::DMA) {
         f |= DMA_PAGE;
     }
+    if flags.contains(PageFlags::SHADOW_STACK) {
+        assert_eq!(flags, PageFlags::SHADOW_STACK | PageFlags::USER);
+        // CET identifies a shadow-stack leaf by dirty and read-only bits.
+        f |= PageTableFlags::DIRTY;
+    }
     // SENSITIVE has no x86_64 page-table equivalent — the allocator zeroes
     // the frame on deallocation.
 
@@ -498,7 +503,23 @@ impl X86_64Mapper {
 
         // SAFETY: The destination is in the private half and the mapped frame
         // stays live. The allocator supplies exclusive intermediate tables.
-        let result = unsafe { mapper.map_to(page, frame, page_table_flags, &mut allocator) };
+        let result = unsafe {
+            if flags.contains(PageFlags::SHADOW_STACK) {
+                // CET requires writable ancestors and a read-only, dirty leaf.
+                let parents = PageTableFlags::PRESENT
+                    | PageTableFlags::USER_ACCESSIBLE
+                    | PageTableFlags::WRITABLE;
+                mapper.map_to_with_table_flags(
+                    page,
+                    frame,
+                    page_table_flags,
+                    parents,
+                    &mut allocator,
+                )
+            } else {
+                mapper.map_to(page, frame, page_table_flags, &mut allocator)
+            }
+        };
         match result {
             Ok(flush) if active => flush.flush(),
             Ok(flush) => flush.ignore(),

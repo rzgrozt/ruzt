@@ -45,13 +45,21 @@ const STACK_REGION: Region = Region {
     start: 0x7fff_0000,
     page_count: 32,
 };
+const SHADOW_STACK_GUARD: u64 = 0x8100_0000;
+const SHADOW_STACK_REGION: Region = Region {
+    start: SHADOW_STACK_GUARD + PAGE_SIZE,
+    page_count: STACK_REGION.page_count,
+};
 const HEAP_REGION: Region = Region {
     start: USER_HEAP_START,
     page_count: USER_HEAP_INITIAL_BYTES as u64 / PAGE_SIZE,
 };
 
-fn overlaps_heap(start: u64, end: u64) -> bool {
-    start < USER_HEAP_LIMIT && USER_HEAP_START < end
+fn overlaps_reserved(start: u64, end: u64) -> bool {
+    (start < USER_HEAP_LIMIT && USER_HEAP_START < end)
+        || (crate::cet::user_shadow_stack_enabled()
+            && start < SHADOW_STACK_REGION.end().unwrap()
+            && SHADOW_STACK_GUARD < end)
 }
 
 fn page_range(address: u64, count: u64) -> Result<Range<u64>, ErrorCode> {
@@ -68,6 +76,16 @@ fn page_range(address: u64, count: u64) -> Result<Range<u64>, ErrorCode> {
 fn initial_stack_pointer() -> u64 {
     // System V function entry expects an 8-byte return-address bias.
     STACK_REGION.end().unwrap() - 8
+}
+
+#[cfg(feature = "qemu-hardening-test")]
+pub(crate) fn observe_user_ssp(ssp: u64) {
+    if crate::cet::user_shadow_stack_enabled()
+        && (SHADOW_STACK_REGION.start..SHADOW_STACK_REGION.end().unwrap()).contains(&ssp)
+    {
+        static OBSERVED: spin::Once<()> = spin::Once::new();
+        OBSERVED.call_once(|| crate::serial_println!("kernel: syscall saved an active user shadow stack"));
+    }
 }
 
 pub(crate) struct UserProcess {
@@ -323,7 +341,7 @@ fn map_image(
             }
             let start = segment.vaddr & !(PAGE_SIZE - 1);
             let end = (segment.vaddr + segment.mem_size).next_multiple_of(PAGE_SIZE);
-            if overlaps_heap(start, end) {
+            if overlaps_reserved(start, end) {
                 return Err(MapError::AlreadyMapped);
             }
             let data_end = segment.vaddr + segment.data.len() as u64;
@@ -352,6 +370,12 @@ fn map_image(
                 map_page(mapper, &mut space, page, PageFlags::WRITABLE, 0, &[])?;
             }
         }
+        if crate::cet::user_shadow_stack_enabled() {
+            let region = SHADOW_STACK_REGION;
+            for page in (region.start..region.end().unwrap()).step_by(PhysFrame::SIZE) {
+                map_page(mapper, &mut space, page, PageFlags::SHADOW_STACK, 0, &[])?;
+            }
+        }
         Ok::<_, MapError>(
             framebuffer
                 .map(|framebuffer| framebuffer::map(mapper, root, framebuffer, &space.budget))
@@ -368,11 +392,16 @@ fn enter_user() -> ! {
     #[cfg(any(feature = "qemu-hardening-test", feature = "qemu-smp-test"))]
     crate::pti::verify_user_root(crate::sched::with_current_user(|user| user.root()).expect("user root"), entry);
     crate::serial_println!("{name} process created, entering user mode...");
+    let ssp = if crate::cet::user_shadow_stack_enabled() {
+        SHADOW_STACK_REGION.end().unwrap()
+    } else {
+        0
+    };
     #[allow(unsafe_code)]
     // SAFETY: This scheduled process owns the validated user entry and stack.
     // The private root shares only the supervisor transition mappings.
     unsafe {
-        crate::exceptions::enter_user(entry, initial_stack_pointer())
+        crate::exceptions::enter_user(entry, initial_stack_pointer(), ssp)
     }
 }
 

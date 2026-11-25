@@ -20,6 +20,8 @@ The x86-64 kernel enables SMEP and SMAP when the CPU advertises them. Syscalls c
 
 Kernel page-table isolation gives user roots only their own mappings and dedicated supervisor pages for privilege transitions. Kernel dispatch runs under a permanent root with global translations disabled. Returning to user mode installs the process root from the entry stack. The QEMU fixtures check that the kernel heap, physical-memory map, and kernel-only stacks are absent from the user root, then exercise user IPC and interrupt delivery with isolated roots.
 
+On CET-capable x86-64 CPUs, an instrumented kernel enables supervisor indirect branch tracking. When all scheduler CPUs support user shadow stacks, each user process receives a guarded shadow stack. The kernel saves its pointer with the thread's trap frame and restores it on return to user mode, including after a scheduling migration.
+
 Double faults switch to a dedicated supervisor stack with an unmapped guard page. The handler writes directly to COM1 before halting. The QEMU fixture reaches it with an unmapped interrupted stack and the normal serial lock held.
 
 The x86-64 bootstrap starts firmware-enabled secondary CPUs with INIT and SIPI messages. Each secondary switches to the permanent supervisor mappings, installs its own descriptor tables and guarded stacks, and acknowledges a fixed IPI before the kernel reclaims the temporary startup pages.
@@ -86,6 +88,12 @@ Run the kernel-only and ring-3 QEMU tests with the pinned Rust nightly and compo
 
 ```sh
 cargo test --locked -p boot-x86_64 --test boot_test -- --nocapture
+```
+
+On a Linux host with KVM and both CET features exposed to guests, run the hardware-assisted CET fixture.
+
+```sh
+cargo test --locked -p boot-x86_64 --test boot_test -- test_cet_under_kvm --ignored
 ```
 
 Each test builds a BIOS image in a fresh temporary directory. The kernel-only test checks breakpoint recovery, scheduling, and blocking IPC. The ring-3 test packages both services in a ustar archive and checks a console write from shared memory, notification transfer, rights attenuation, and removal of the console mapping on revocation. It then injects Space with the QEMU monitor and verifies the tile's color change in screenshots.

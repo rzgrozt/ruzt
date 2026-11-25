@@ -4,7 +4,7 @@ use ruzt_abi::{CapRights, ErrorCode};
 use ruzt_hal::mem::{MapError, PageFlags, PhysFrame, VirtAddr};
 use ruzt_hal_x86_64::mapper::{self, UserPageFrames};
 
-use super::{overlaps_heap, UserProcess, PAGE_SIZE};
+use super::{overlaps_reserved, UserProcess, PAGE_SIZE};
 use crate::cap::{cspace, cspace::CapabilityId, object::FramePin};
 
 pub(super) struct Mapping {
@@ -36,7 +36,7 @@ impl UserProcess {
         if address == 0 || address >= 1 << 47 || address % PAGE_SIZE != 0 {
             return Err(ErrorCode::BadMessage);
         }
-        if overlaps_heap(address, address + PAGE_SIZE) {
+        if overlaps_reserved(address, address + PAGE_SIZE) {
             return Err(ErrorCode::MappingExists);
         }
         let mut rights = CapRights::READ;

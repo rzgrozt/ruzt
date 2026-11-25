@@ -5,7 +5,7 @@ use ruzt_abi::{CapRights, ErrorCode};
 use ruzt_hal::mem::{MapError, PageFlags, PhysAddr, PhysFrame, VirtAddr};
 use ruzt_hal_x86_64::mapper::{self, UserPageFrames, X86_64Mapper};
 
-use super::{overlaps_heap, page_range, UserProcess, PAGE_SIZE};
+use super::{overlaps_reserved, page_range, UserProcess, PAGE_SIZE};
 use crate::cap::{
     cspace::CapabilityPath,
     object::{DmaPin, MmioPin},
@@ -100,7 +100,7 @@ impl UserProcess {
         backing: Backing,
     ) -> Result<(), ErrorCode> {
         let addresses = page_range(address, backing.pages())?;
-        if overlaps_heap(addresses.start, addresses.end) {
+        if overlaps_reserved(addresses.start, addresses.end) {
             return Err(ErrorCode::MappingExists);
         }
         let root = self.root();

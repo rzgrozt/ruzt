@@ -7,7 +7,7 @@ use ruzt_cap::AddressSpaceId;
 use ruzt_hal::mem::{MapError, PageFlags, PhysFrame, VirtAddr};
 use ruzt_hal_x86_64::mapper::{self, UserPageFrames, X86_64Mapper};
 
-use super::{map_owned_page, overlaps_heap, page_range, UserProcess, PAGE_SIZE};
+use super::{map_owned_page, overlaps_reserved, page_range, UserProcess, PAGE_SIZE};
 use crate::cap::object::{self, KObjectId, KernelObject, UntypedBudget};
 
 pub(super) struct PrivatePage {
@@ -49,7 +49,7 @@ impl UserProcess {
     ) -> Result<(), ErrorCode> {
         self.require_own_space(id)?;
         let range = page_range(address, count)?;
-        if overlaps_heap(range.start, range.end) {
+        if overlaps_reserved(range.start, range.end) {
             return Err(ErrorCode::MappingExists);
         }
         let flags = if writable {
