@@ -5,3 +5,7 @@ json-target-spec = true
 
 [build]
 target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+# Keep IBT tracking enabled for every indirect branch, including switch dispatch.
+rustflags = ["-Zcf-protection=branch", "-Cjump-tables=no"]

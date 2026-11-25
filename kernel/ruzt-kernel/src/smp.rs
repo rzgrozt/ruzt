@@ -337,6 +337,7 @@ extern "C" fn secondary_entry(id: u64) -> ! {
         cpu::enable_supervisor_protection();
     }
     exceptions::init_idt();
+    crate::cet::init_cpu();
     // SAFETY: This AP owns its LAPIC and has a valid IDT and stacks.
     let local = unsafe { LocalApic::init_secondary(topology.local_physical, topology.local_alias) };
     if local.is_none_or(|local| local.id() != id) {

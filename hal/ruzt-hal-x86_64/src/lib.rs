@@ -39,6 +39,7 @@
 
 pub mod apic;
 pub mod boot;
+pub mod cet;
 pub mod console;
 pub mod context;
 pub mod cpu;

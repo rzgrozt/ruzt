@@ -13,6 +13,7 @@ extern crate alloc;
 extern crate std;
 
 mod boot_screen;
+pub mod cet;
 mod acpi;
 mod apic;
 mod iommu;
@@ -114,7 +115,9 @@ pub fn main(boot_info: &'static mut BootInfo) -> ! {
     // SAFETY: The kernel and physmap use supervisor mappings. Every IDT
     // entry clears AC and DF before entering Rust, and interrupts are off.
     let (smep, smap) = unsafe { ruzt_hal_x86_64::cpu::enable_supervisor_protection() };
+    let ibt = cet::init_cpu();
     serial_println!("x86 supervisor protection (SMEP={smep}, SMAP={smap})");
+    serial_println!("x86 CET supervisor IBT enabled: {ibt}");
     #[cfg(feature = "qemu-hardening-test")]
     assert!(smep && smap, "the hardening fixture requires SMEP and SMAP");
     #[cfg(feature = "qemu-double-fault-test")]

@@ -28,6 +28,8 @@ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 fn kernel_main(raw_boot_info: &'static mut RawBootInfo) -> ! {
+    // SAFETY: The loader pinned the original kernel ELF and mapped physical memory.
+    unsafe { ruzt_kernel::cet::configure(raw_boot_info) };
     // SAFETY: Called exactly once at kernel entry, before any concurrent code.
     let boot_info = unsafe { ruzt_hal_x86_64::boot::normalize(raw_boot_info) };
     ruzt_kernel::main(boot_info)

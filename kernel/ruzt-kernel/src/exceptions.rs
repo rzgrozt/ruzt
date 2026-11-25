@@ -64,6 +64,7 @@ pub fn init_idt() {
             gate!(idt.stack_segment_fault, 12);
             gate!(idt.general_protection_fault, 13);
             gate!(idt.alignment_check, 17);
+            gate!(idt.cp_protection_exception, 21);
             for line in 0..IRQ_COUNT as u8 {
                 let vector = VECTOR_BASE + line;
                 gate!(idt[vector], vector);
@@ -149,6 +150,7 @@ extern "C" fn dispatch(trap: &mut entry::Trap) {
             let code = PageFaultErrorCode::from_bits_retain(trap.error);
             fatal_fault(frame, 14, format_args!("page fault ({code:?})"));
         }
+        21 => fatal_fault(frame, 21, format_args!("control-protection fault ({:#x})", trap.error)),
         VECTOR_BASE => timer_handler(frame),
         irq if (VECTOR_BASE..VECTOR_BASE + IRQ_COUNT as u8).contains(&irq) => {
             crate::irq::on_interrupt(irq - VECTOR_BASE);

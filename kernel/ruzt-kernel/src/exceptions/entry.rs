@@ -95,6 +95,7 @@ core::arch::global_asm!(
 ruzt_vector_stubs:
     .set .Lvector, 0
     .rept 256
+    endbr64
     .if .Lvector != 8 && .Lvector != 10 && .Lvector != 11 && .Lvector != 12 && .Lvector != 13 && .Lvector != 14 && .Lvector != 17 && .Lvector != 21 && .Lvector != 29 && .Lvector != 30
     push 0
     .endif
@@ -229,6 +230,7 @@ ruzt_vector_stubs:
 
     .global ruzt_return_user
 ruzt_return_user:
+    endbr64
     mov rax, rdi
     lea rdi, [rsi - {trap_size}]
     mov rsi, rax

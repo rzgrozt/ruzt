@@ -106,6 +106,7 @@ pub unsafe extern "C" fn switch(
     // created by `init_stack` or `switch`, and disabled interrupts. Each push,
     // pop, and the final return stays within those live kernel stacks.
     core::arch::naked_asm!(
+        "endbr64",
         "push rbp",
         "push rbx",
         "push r12",

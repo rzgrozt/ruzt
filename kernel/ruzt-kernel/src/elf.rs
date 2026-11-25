@@ -51,7 +51,7 @@ struct ElfHeader {
 /// Returns [`ErrorCode::BadMessage`] for malformed or unsupported input and
 /// [`ErrorCode::NoMemory`] if segment metadata cannot be allocated.
 pub fn load_elf(bytes: &'static [u8]) -> Result<LoadedElf, ErrorCode> {
-    let header = parse_header(bytes)?;
+    let header = parse_header(bytes, 2)?;
     let program_header_count = header.program_headers.len() / PROGRAM_HEADER_SIZE;
     let mut segments = Vec::new();
     segments
@@ -89,13 +89,55 @@ pub fn load_elf(bytes: &'static [u8]) -> Result<LoadedElf, ErrorCode> {
     })
 }
 
-fn parse_header(bytes: &[u8]) -> Result<ElfHeader, ErrorCode> {
+pub(crate) fn has_kernel_ibt(bytes: &[u8]) -> bool {
+    kernel_ibt_property(bytes).unwrap_or(false)
+}
+
+fn kernel_ibt_property(bytes: &[u8]) -> Result<bool, ErrorCode> {
+    const PT_GNU_PROPERTY: u32 = 0x6474_e553;
+    const GNU_PROPERTY_X86_FEATURE_1_AND: u32 = 0xc000_0002;
+    let kind = read_u16(bytes, 16)?;
+    if !matches!(kind, 2 | 3) {
+        return Err(ErrorCode::BadMessage);
+    }
+    let header = parse_header(bytes, kind)?;
+    for ph in bytes[header.program_headers].chunks_exact(PROGRAM_HEADER_SIZE) {
+        if read_u32(ph, 0)? != PT_GNU_PROPERTY {
+            continue;
+        }
+        let start = usize::try_from(read_u64(ph, 8)?).map_err(|_| ErrorCode::BadMessage)?;
+        let size = usize::try_from(read_u64(ph, 32)?).map_err(|_| ErrorCode::BadMessage)?;
+        let end = start.checked_add(size).ok_or(ErrorCode::BadMessage)?;
+        let note = bytes.get(start..end).ok_or(ErrorCode::BadMessage)?;
+        if read_u32(note, 0)? != 4 || read_u32(note, 8)? != 5 || read::<4>(note, 12)? != *b"GNU\0" {
+            return Err(ErrorCode::BadMessage);
+        }
+        let size = read_u32(note, 4)? as usize;
+        if size != note.len() - 16 || size % 8 != 0 {
+            return Err(ErrorCode::BadMessage);
+        }
+        let mut properties = &note[16..];
+        while !properties.is_empty() {
+            let kind = read_u32(properties, 0)?;
+            let length = read_u32(properties, 4)? as usize;
+            let end = 8 + length.next_multiple_of(8);
+            let property = properties.get(..end).ok_or(ErrorCode::BadMessage)?;
+            if kind == GNU_PROPERTY_X86_FEATURE_1_AND {
+                return Ok(length == 4 && read_u32(property, 8)? & 1 != 0);
+            }
+            properties = &properties[end..];
+        }
+    }
+    Ok(false)
+}
+
+fn parse_header(bytes: &[u8], kind: u16) -> Result<ElfHeader, ErrorCode> {
     if bytes.len() < ELF_HEADER_SIZE
         || bytes[..4] != *b"\x7fELF"
         || bytes[4] != 2
         || bytes[5] != 1
         || bytes[6] != 1
-        || read_u16(bytes, 16)? != 2
+        || read_u16(bytes, 16)? != kind
         || read_u16(bytes, 18)? != 62
         || read_u32(bytes, 20)? != 1
         || usize::from(read_u16(bytes, 52)?) != ELF_HEADER_SIZE

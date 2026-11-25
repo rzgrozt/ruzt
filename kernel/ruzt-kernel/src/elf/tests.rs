@@ -75,6 +75,24 @@ static NON_EXEC_ENTRY_ELF: [u8; ELF_LEN] =
 static BAD_MAGIC: [u8; 64] = [0; 64];
 
 #[test]
+fn requires_a_complete_linked_ibt_property() {
+    let mut bytes = [0u8; 152];
+    bytes[..ELF_LEN].copy_from_slice(&VALID_ELF);
+    bytes[16..18].copy_from_slice(&3u16.to_le_bytes());
+    bytes[64..68].copy_from_slice(&0x6474_e553u32.to_le_bytes());
+    bytes[96..104].copy_from_slice(&32u64.to_le_bytes());
+    bytes[120..].copy_from_slice(&[
+        4, 0, 0, 0, 16, 0, 0, 0, 5, 0, 0, 0, b'G', b'N', b'U', 0,
+        2, 0, 0, 0xc0, 4, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
+    ]);
+    assert!(super::has_kernel_ibt(&bytes));
+    assert!(!super::has_kernel_ibt(&bytes[..151]));
+    bytes[144] = 2;
+    assert!(!super::has_kernel_ibt(&bytes));
+    assert!(!super::has_kernel_ibt(&VALID_ELF));
+}
+
+#[test]
 fn parses_valid_elf64_executable_when_header_and_segment_are_well_formed() {
     // Given: a little-endian x86_64 ET_EXEC with one executable load segment.
     // When: the image is parsed at the kernel boundary.

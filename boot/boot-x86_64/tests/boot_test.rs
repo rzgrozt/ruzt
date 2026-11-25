@@ -292,6 +292,16 @@ fn test_rootsrv_updates_the_framebuffer_from_keyboard_input() {
 
 #[test]
 fn test_timer_preempts_cpu_bound_user_code() {
+    verify_user_preemption(&["-cpu", "max"], false);
+}
+
+#[test]
+#[ignore = "requires KVM with host CET support"]
+fn test_cet_under_kvm() {
+    verify_user_preemption(&["-accel", "kvm", "-cpu", "host"], true);
+}
+
+fn verify_user_preemption(devices: &[&str], require_ibt: bool) {
     let temp = tempfile::tempdir().expect("Failed to create boot test directory");
     let disk_image = build_image(
         temp.path(),
@@ -299,7 +309,7 @@ fn test_timer_preempts_cpu_bound_user_code() {
         Services::CpuBoundConsole,
     );
     let serial_path = temp.path().join("serial.log");
-    let mut vm = start_guest_with_devices(&disk_image, &serial_path, &["-cpu", "max"]);
+    let mut vm = start_guest_with_devices(&disk_image, &serial_path, devices);
     let boot_deadline = Instant::now() + BOOT_TIMEOUT;
     wait_for_serial(
         &mut vm.child,
@@ -313,6 +323,9 @@ fn test_timer_preempts_cpu_bound_user_code() {
         "rootsrv thread waiting for keyboard IRQ",
         boot_deadline,
     );
+    if require_ibt {
+        assert!(serial.lines().any(|line| line == "x86 CET supervisor IBT enabled: true"), "IBT was not enabled:\n{serial}");
+    }
     assert_markers(
         &serial,
         &[
