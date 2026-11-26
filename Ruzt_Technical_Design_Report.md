@@ -709,6 +709,8 @@ fn main() {
 
 **Design the driver SDK first.** `ruzt-driver-sdk` provides MMIO accessors, DMA buffers, IRQ helpers, hot-plug events, and a debug-tracing format. Every driver consumes this SDK. It is the contract between the kernel team and the driver team.
 
+Hardware driver services are implemented in Rust. Existing specifications and drivers guide command ordering, hardware quirks and recovery, with those protocols expressed through Rust ownership and bounded state machines. Existing Rust driver components can be adapted to the capability SDK. The graphics API layer may use Mesa during subsequent Vulkan and OpenGL integration.
+
 **Bus enumeration is itself a user-space service.** A `pcid` (PCI enumerator) on x86_64 / a `dtsrv` (device tree server) on aarch64 walks the bus, identifies devices, and hands out the right MMIO/IRQ caps to drivers as the supervisor spawns them. This is also the natural place to gate "which devices exist for which apps" — though for now, the answer is "all devices belong to drivers, and drivers are trusted system services".
 
 ---
@@ -732,9 +734,9 @@ pub trait BlockDevice: Send + Sync {
 
 Don't try to be a research filesystem. Aim for "a clean re-implementation of ZFS's main ideas, simplified":
 
-- **Copy-on-write everything.** Crash safety is free.
-- **Merkle tree of block hashes.** Integrity is free.
-- **Snapshots are nearly free** — keep an old root pointer alive.
+- **Copy-on-write transactions.** Durable data and metadata writes precede publication of a validated root checkpoint. Interrupted commits recover through the last valid committed state.
+- **Merkle tree of block hashes.** Validate data and metadata when reading. Repair requires an additional valid copy.
+- **Snapshots retain prior roots.** Track references, bound retention and reclaim blocks only after their last live reference disappears.
 - **Per-file encryption keys** wrapped by a master key, master key wrapped by a user key derived via Argon2id from a passphrase. Better than block-level FDE because backups can be stored encrypted without re-encryption.
 - **Endian-portable on-disk format.** Always little-endian on disk regardless of host. (Important when x86_64 and aarch64 share a disk.)
 
@@ -757,6 +759,8 @@ Be honest about timing: a *correct* COW FS is 6–12 months of focused work. For
 - **In memory:** sensitive memory regions (key material, keyboard buffers in password fields) are mapped with the `Sensitive` flag — the kernel zeros them on free.
 
 ### 10.4 VFS broker
+
+The native interface operates on file and folder capabilities. A granted folder defines the application's lookup scope. Stable object identities survive rename, while the capability determines access rights. Saves publish a new version through a transaction. The POSIX shim translates path operations into this native interface. Persistent policy is used to issue fresh session capabilities after reboot.
 
 The `vfs` server is a user-space process that holds:
 - A mount table mapping path prefixes to filesystem-server endpoints.
@@ -1477,7 +1481,7 @@ When `wifid` completes association, it sends `netd` a `NewInterface` message wit
 The GPU's MMIO region has two facets:
 
 - **KMS (display output):** owned exclusively by `displayd`. Never shared with apps.
-- **Render (3D/compute):** a separate sub-region exposed as a `GpuRender` capability. `displayd` mints one per application that requests GPU access and passes it at launch. This is the DRM render-node model (`/dev/dri/renderD128`) translated into capabilities.
+- **Render (3D/compute):** a per-application `GpuRender` capability authorizes submissions to the Rust GPU driver service. The service manages contexts, validated buffer references, synchronization and resource lifetime. Privileged control registers remain owned by the driver service. `displayd` receives the authority needed to allocate and present its composition buffers.
 
 An app with a `GpuRender` cap submits GPU command buffers but cannot write to the scanout framebuffer — that requires submitting a `wl_buffer` to `displayd` via the Wayland protocol.
 

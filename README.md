@@ -127,4 +127,6 @@ cargo run --locked -p boot-x86_64 -- --uefi /usr/share/OVMF/OVMF_CODE_4M.fd /usr
 
 ## Design
 
+The current [storage and Rust driver milestone](docs/pre-desktop.md) records the accepted pre-desktop direction and its completion criteria.
+
 Read [Project Philosophy](PHILOSOPHY.md) for the project's principles and the [Technical Design Report](Ruzt_Technical_Design_Report.md) for the architecture, roadmap, and proposed licensing model.
