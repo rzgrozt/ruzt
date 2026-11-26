@@ -12,6 +12,8 @@ Capabilities keep kernel objects alive while copies exist. A caller with grant r
 
 Processes can retype Untyped memory into capability tables, or CNodes, with up to 256 slots per table. Root slot numbers remain valid, and `ruzt_abi::cptr_path` addresses deeper slots for invocation, slot operations, and IPC transfers. Traversal requires read authority on each CNode, while slot changes also require write authority along the path. A shared CNode exposes only grantable capabilities owned by another process. The kernel rejects cycles, and deleting the last reference to a CNode releases its slots and returns its page to the budget.
 
+Capability metadata is limited to 1,024 live records per process and 8,192 system-wide. Moving a capability preserves its original accounting owner. Metadata allocation and quota failures return `NoMemory` before publishing a slot. A failed IPC grant batch rolls back its partial installations.
+
 The IPC library can block on up to eight endpoints, notifications, driver IRQs, and process status capabilities in one call. The kernel selects the first ready source in list order and consumes its message or signal as part of the wait. Endpoint messages can include capability grants, and a closed endpoint or reaped process wakes the waiter. Revoking a wait source or a CNode capability on its path cancels the wait.
 
 User tasks can read the monotonic clock, supply an absolute deadline to a capability wait, or sleep until a deadline without waiting on any capability. x86-64 wakes these tasks at scheduler safe points using the PIT's roughly 10 ms tick. The PIT uses the I/O APIC when firmware provides usable ACPI interrupt routing.

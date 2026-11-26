@@ -6,3 +6,4 @@ pub mod object;
 pub mod cspace;
 pub mod ops;
 mod region;
+mod metadata;

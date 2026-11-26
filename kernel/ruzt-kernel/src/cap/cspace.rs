@@ -1,7 +1,7 @@
 //! Per-process capability tables and the kernel-wide derivation tree.
 
-use alloc::{collections::BTreeMap, vec::Vec};
-use core::ops::Bound::{Excluded, Unbounded};
+use super::metadata::MetadataMap;
+use alloc::vec::Vec;
 use ruzt_abi::{
     cptr_depth, ErrorCode, PciAddress, RetypeKind, IPC_CAP_SLOTS, MAX_CNODE_RADIX, MAX_CPTR_DEPTH,
 };
@@ -66,20 +66,36 @@ impl Node {
 }
 
 struct DerivationTree {
-    nodes: BTreeMap<CapabilityId, Node>,
-    cnodes: BTreeMap<KObjectId, Vec<Option<CapabilityId>>>,
+    nodes: MetadataMap<CapabilityId, Node>,
+    cnodes: MetadataMap<KObjectId, Vec<Option<CapabilityId>>>,
     next: u64,
     next_space: u64,
 }
 
+// Bound live metadata independently of aliases of kernel objects. A process
+// retains its charge when a capability moves into a shared CNode.
+const CAPS_PER_SPACE: usize = 1024;
+const MAX_CAPABILITIES: usize = 8192;
+
 impl DerivationTree {
     fn install(&mut self, node: Node) -> Result<CapabilityId, ErrorCode> {
+        if self.nodes.len() >= MAX_CAPABILITIES
+            || self.nodes.values().filter(|entry| entry.owner == node.owner).count()
+                >= CAPS_PER_SPACE
+        {
+            return Err(ErrorCode::NoMemory);
+        }
+        self.nodes.reserve()?;
         let id = CapabilityId(self.next);
         let next = self.next.checked_add(1).ok_or(ErrorCode::NoMemory)?;
         if let Some(object) = node.object {
             object::retain(object)?;
         }
-        self.nodes.insert(id, node);
+        // The reservation precedes reference changes. The derivation lock
+        // prevents any other insertion from consuming the reserved slot.
+        self.nodes
+            .insert(id, node)
+            .expect("reserved capability record");
         self.next = next;
         Ok(id)
     }
@@ -182,25 +198,28 @@ impl DerivationTree {
     fn revoke(&mut self, source: CapabilityId) {
         // Remove one immediate child at a time. Removing it reparents its
         // own children, so this visits the entire subtree without recursion.
-        while let Some(id) = self
-            .nodes
-            .iter()
-            .find_map(|(&id, node)| (node.parent == Some(source)).then_some(id))
-        {
+        loop {
+            let child = self
+                .nodes
+                .iter()
+                .find_map(|(&id, node)| (node.parent == Some(source)).then_some(id));
+            let Some(id) = child else {
+                break;
+            };
             self.remove(id);
         }
     }
 
     fn owned_after(&self, owner: u64, previous: CapabilityId) -> Option<CapabilityId> {
         self.nodes
-            .range((Excluded(previous), Unbounded))
-            .find_map(|(&id, node)| (node.owner == owner).then_some(id))
+            .iter()
+            .find_map(|(&id, node)| (id > previous && node.owner == owner).then_some(id))
     }
 }
 
 static DERIVATIONS: Mutex<DerivationTree> = Mutex::new(DerivationTree {
-    nodes: BTreeMap::new(),
-    cnodes: BTreeMap::new(),
+    nodes: MetadataMap::new(),
+    cnodes: MetadataMap::new(),
     next: 1,
     next_space: 1,
 });
@@ -491,6 +510,7 @@ impl CSpace {
         self.vacant(dest, &tree)?;
 
         let cnode_slots = if kind == RetypeKind::CNode {
+            tree.cnodes.reserve()?;
             Some(empty_slots(size_bits)?)
         } else {
             None
@@ -513,7 +533,9 @@ impl CSpace {
         match installed {
             Ok(id) => {
                 if let Some(slots) = cnode_slots {
-                    tree.cnodes.insert(object, slots);
+                    tree.cnodes
+                        .insert(object, slots)
+                        .expect("reserved CNode metadata");
                 }
                 *self.slot_mut(&mut tree, dest) = Some(id);
                 Ok(())
@@ -911,7 +933,8 @@ mod tests {
         DERIVATIONS
             .lock()
             .cnodes
-            .insert(object, empty_slots(u64::from(radix_bits)).unwrap());
+            .insert(object, empty_slots(u64::from(radix_bits)).unwrap())
+            .unwrap();
         space
             .insert(
                 cptr,
@@ -941,6 +964,85 @@ mod tests {
             )
             .unwrap();
         id
+    }
+
+    #[test]
+    fn metadata_limit_preserves_slots_and_ipc_grants_and_reclaims_capacity() {
+        let _state = crate::isolated_kernel_state();
+        let mut owner = CSpace::new(3);
+        let original = endpoint(&mut owner, 0);
+        for index in 1..=4 {
+            cnode(&mut owner, index, 8);
+        }
+        let mut destinations = Vec::new();
+        for table in 1..=4 {
+            for slot in 0..=255 {
+                destinations.push(cptr_path(&[table, slot]).unwrap());
+            }
+        }
+        for &dest in &destinations[..CAPS_PER_SPACE - 6] {
+            owner.mint(0, dest, CapRights::READ, 0).unwrap();
+        }
+        // One slot remains in the owner's quota. A two-cap IPC delivery must
+        // roll back its first insertion when the second exceeds that quota.
+        let grant = owner.prepare_grant(0, CapRights::READ, 0).unwrap();
+        let first = destinations[CAPS_PER_SPACE - 6];
+        let target = owner.receive_cnode(first).unwrap();
+        assert_eq!(
+            owner.accept_grants(first, target, &[Some(grant); 2]),
+            Err(ErrorCode::NoMemory)
+        );
+        assert_eq!(owner.lookup(first), Err(ErrorCode::InvalidCap));
+        owner.mint(0, first, CapRights::READ, 0).unwrap();
+        let next = destinations[CAPS_PER_SPACE - 5];
+        assert_eq!(
+            owner.mint(0, next, CapRights::READ, 0),
+            Err(ErrorCode::NoMemory)
+        );
+        assert_eq!(owner.lookup(next), Err(ErrorCode::InvalidCap));
+        let mut peer = CSpace::new(1);
+        peer.derive(owner.capability_id(0).unwrap(), 0, CapRights::READ, 0)
+            .unwrap();
+        assert_eq!(
+            peer.lookup(0).unwrap().cap_type,
+            CapType::Endpoint(EndpointId(original.0))
+        );
+        owner.delete(first).unwrap();
+        owner.mint(0, next, CapRights::READ, 0).unwrap();
+        owner.revoke(0).unwrap();
+        assert_eq!(peer.lookup(0), Err(ErrorCode::InvalidCap));
+        assert!(object::get(original).is_some());
+    }
+
+    #[test]
+    fn global_metadata_limit_is_recoverable_without_publishing_an_identity() {
+        let mut tree = DerivationTree {
+            nodes: MetadataMap::new(),
+            cnodes: MetadataMap::new(),
+            next: 1,
+            next_space: 1,
+        };
+        let mut node = Node {
+            slot: CapSlot {
+                cap_type: CapType::IoPort { port: 0x3f8 },
+                rights: CapRights::WRITE,
+                badge: 0,
+            },
+            object: None,
+            parent: None,
+            owner: 0,
+        };
+        for index in 0..MAX_CAPABILITIES {
+            node.owner = (index / CAPS_PER_SPACE) as u64;
+            tree.install(node).unwrap();
+        }
+        node.owner += 1;
+        let next = tree.next;
+        assert_eq!(tree.install(node), Err(ErrorCode::NoMemory));
+        assert_eq!(tree.next, next);
+        assert!(!tree.nodes.contains_key(&CapabilityId(next)));
+        tree.remove(CapabilityId(1)).unwrap();
+        assert_eq!(tree.install(node), Ok(CapabilityId(next)));
     }
 
     #[test]
