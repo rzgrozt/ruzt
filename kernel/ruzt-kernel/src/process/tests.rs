@@ -1,6 +1,14 @@
 use super::{HEAP_REGION, STACK_REGION, initial_stack_pointer};
 
 #[test]
+fn boot_program_names_are_bounded_and_cannot_name_paths() {
+    use ruzt_abi::ErrorCode;
+    for name in [&b""[..], b".", b"..", b"../driver", b"/driver", b"a\0b", &[b'a'; 101]] {
+        assert_eq!(super::boot_program(name), Err(ErrorCode::BadMessage));
+    }
+}
+
+#[test]
 fn stack_region_has_exact_phase_2_layout() {
     // Given: the fixed initial user-stack specification.
     // When: its exclusive end and initial stack pointer are derived.

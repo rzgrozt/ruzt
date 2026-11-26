@@ -14,6 +14,8 @@ This milestone prepares x86-64 QEMU for persistent native applications. It follo
 
 The capability metadata foundation is implemented in commit `406cbaa`. All 91 host tests and nine default QEMU fixtures passed. Independent source review found no concrete defects. The two optional CET fixtures were excluded by the default test selection.
 
+The boot-program catalog now issues executable capabilities for named archive entries, with grants derived from the catalog authority. The console resolves its executable through this interface. All 93 host tests and nine default QEMU fixtures passed, including missing names, invalid names and authority, occupied destinations and revocation of issued capabilities. Device discovery and general driver supervision remain to be implemented.
+
 1. Bound kernel capability metadata and make allocation fallible. Exercise minting, IPC batch rollback, deletion, revocation and independent-process access at the limit. Run host and QEMU regressions.
 2. Extend boot program registration, device discovery and driver supervision for independent service executables. Drivers receive only the PCI, IRQ, DMA and endpoint authorities they require. Validate replacement of a failed driver and rejection of obsolete service handles.
 3. Implement Rust VirtIO block I/O and the block service interface, including device geometry, request bounds, completion errors and durable flush. Exercise a disposable data disk across guest reboots. Keep DMA buffers alive through completion and reset.

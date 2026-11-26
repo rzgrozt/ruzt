@@ -822,7 +822,7 @@ fn update(id: KObjectId, f: impl FnOnce(&mut KernelObject)) {
 /// Convert a [`CapType`] into the corresponding [`KernelObject`] variant.
 fn kernel_object_from_cap_type(cap_type: CapType) -> Result<KernelObject, ErrorCode> {
     match cap_type {
-        CapType::Null => Err(ErrorCode::InvalidCap),
+        CapType::Null | CapType::BootPrograms => Err(ErrorCode::InvalidCap),
         CapType::Endpoint(_) => Ok(KernelObject::Endpoint { closed: false }),
         CapType::Notification(_) => Ok(KernelObject::Notification { state: false }),
         CapType::Thread(thread_id) => Ok(KernelObject::Thread {

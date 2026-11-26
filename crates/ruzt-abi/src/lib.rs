@@ -51,6 +51,8 @@ pub const ROOTSRV_UART_IRQ_ENABLE: u64 = 29;
 pub const ROOTSRV_UART_IRQ_IDENTIFY: u64 = 30;
 /// Boot authority to enumerate PCI functions and claim their device resources.
 pub const ROOTSRV_PCI_CONTROL: u64 = 32;
+/// Boot authority to issue executable capabilities from the pinned archive.
+pub const ROOTSRV_BOOT_PROGRAMS: u64 = 63;
 /// Self address-space capability installed at process startup.
 pub const PROCESS_ADDRESS_SPACE: u64 = 15;
 /// Base virtual address of the initial runtime heap.
@@ -352,6 +354,11 @@ pub enum CapOp {
     ClaimMsi = 34,
     /// Claim MSI-X table entry `arg3` in slot `arg2` from a writable PCI device.
     ClaimMsix = 35,
+    /// Issue an executable capability from the boot archive. `arg2` points to
+    /// a name of `arg3` bytes and `arg4` is an empty destination slot. Names
+    /// are 1 to 100 ASCII letters, digits, dots, underscores or hyphens,
+    /// with `.` and `..` reserved. The catalog requires write authority.
+    OpenBootProgram = 36,
 }
 
 /// The interrupt is asserted low. The default is active high.
@@ -744,6 +751,7 @@ mod tests {
         assert_eq!(CapOp::MapMmio as u64, 26);
         assert_eq!(CapOp::UnmapMmio as u64, 27);
         assert_eq!(CapOp::MmioSize as u64, 28);
+        assert_eq!(CapOp::OpenBootProgram as u64, 36);
     }
 
     #[test]

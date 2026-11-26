@@ -256,6 +256,7 @@ fn test_rootsrv_updates_the_framebuffer_from_keyboard_input() {
         &serial,
         &[
             "rootsrv process created, entering user mode...",
+            "rootsrv: boot program catalog issued and revoked executable authority",
             "consoled process created, entering user mode...",
             "Hello from ring 3, rootsrv alive.",
         ],
@@ -593,6 +594,7 @@ fn build_firmware_image(
                 "--target-dir",
             ])
             .arg(&build_dir)
+            .args(["--features", "rootsrv/qemu-boot-programs-test"])
             .current_dir(workspace.join("servers"));
         match services {
             Services::PciInterruptConsole => build.args([

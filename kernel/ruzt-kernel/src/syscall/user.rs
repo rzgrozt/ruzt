@@ -28,6 +28,19 @@ const BADGE_OFFSET: usize = offset_of!(CapTransferSlot, badge);
 
 pub(crate) fn invoke(transaction: &mut Transaction, args: &SyscallArgs) -> Result<(), ErrorCode> {
     let operation = args.arg1;
+    if operation == CapOp::OpenBootProgram as u64 {
+        let length = usize::try_from(args.arg3).map_err(|_| ErrorCode::BadMessage)?;
+        let mut name = [0u8; 100];
+        let name = name.get_mut(..length)
+            .filter(|name| !name.is_empty())
+            .ok_or(ErrorCode::BadMessage)?;
+        let root = sched::with_current_user(|user| user.root()).ok_or(ErrorCode::InvalidCap)?;
+        user_mem::read_user_buffer(root, args.arg2, name)?;
+        return sched::with_current_user(|user| {
+            user.cspace.open_boot_program(args.arg0, args.arg4, name)
+        })
+        .ok_or(ErrorCode::InvalidCap)?;
+    }
     if operation == CapOp::ClaimPciDevice as u64 {
         let address = pci_address(args.arg3)?;
         return sched::with_current_user(|user| {

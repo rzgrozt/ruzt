@@ -553,7 +553,7 @@ impl CSpace {
         destination: u64,
         irq_num: u32,
     ) -> Result<(), ErrorCode> {
-        self.allocate_device_object(control, destination, |cap| {
+        self.allocate_derived_object(control, destination, |cap| {
             if cap != CapType::IrqControl {
                 return Err(ErrorCode::InvalidCap);
             }
@@ -568,6 +568,22 @@ impl CSpace {
         })
     }
 
+    pub(crate) fn open_boot_program(
+        &mut self,
+        source: u64,
+        destination: u64,
+        name: &[u8],
+    ) -> Result<(), ErrorCode> {
+        self.allocate_derived_object(source, destination, |cap| {
+            if cap != CapType::BootPrograms {
+                return Err(ErrorCode::InvalidCap);
+            }
+            let (name, image) = crate::process::boot_program(name)?;
+            let object = object::allocate_program(name, image)?;
+            Ok((object, CapType::Program(object.0)))
+        })
+    }
+
     pub(crate) fn claim_gsi(
         &mut self,
         control: u64,
@@ -575,7 +591,7 @@ impl CSpace {
         gsi: u32,
         flags: u64,
     ) -> Result<(), ErrorCode> {
-        self.allocate_device_object(control, destination, |cap| {
+        self.allocate_derived_object(control, destination, |cap| {
             if cap != CapType::IrqControl {
                 return Err(ErrorCode::InvalidCap);
             }
@@ -590,7 +606,7 @@ impl CSpace {
         destination: u64,
         address: PciAddress,
     ) -> Result<(), ErrorCode> {
-        self.allocate_device_object(control, destination, |cap| {
+        self.allocate_derived_object(control, destination, |cap| {
             if cap != CapType::PciControl {
                 return Err(ErrorCode::InvalidCap);
             }
@@ -605,7 +621,7 @@ impl CSpace {
         destination: u64,
         vector: Option<u16>,
     ) -> Result<(), ErrorCode> {
-        self.allocate_device_object(source, destination, |cap| {
+        self.allocate_derived_object(source, destination, |cap| {
             let CapType::PciDevice(device) = cap else {
                 return Err(ErrorCode::InvalidCap);
             };
@@ -622,7 +638,7 @@ impl CSpace {
         first: u64,
         pages: u64,
     ) -> Result<(), ErrorCode> {
-        self.allocate_device_object(source, destination, |cap| {
+        self.allocate_derived_object(source, destination, |cap| {
             let CapType::PciDevice(device) = cap else {
                 return Err(ErrorCode::InvalidCap);
             };
@@ -631,7 +647,7 @@ impl CSpace {
         })
     }
 
-    fn allocate_device_object(
+    fn allocate_derived_object(
         &mut self,
         cptr: u64,
         destination: u64,
@@ -680,6 +696,7 @@ impl CSpace {
             CapType::AddressSpace(id) => Some(KObjectId(id.0)),
             CapType::CNode { ptr, .. } => Some(KObjectId(ptr)),
             CapType::IrqControl
+            | CapType::BootPrograms
             | CapType::PciControl
             | CapType::IoPort { .. }
             | CapType::Framebuffer => None,
@@ -1058,6 +1075,30 @@ mod tests {
         assert_eq!(b.lookup(0).unwrap().badge, 42);
         drop(b);
         assert!(object::get(object).is_none());
+    }
+
+    #[test]
+    fn boot_program_lookup_requires_catalog_write_authority() {
+        let _state = crate::isolated_kernel_state();
+        let mut space = CSpace::new(2);
+        space
+            .insert(0, CapSlot {
+                cap_type: CapType::BootPrograms,
+                rights: CapRights::READ,
+                badge: 0,
+            })
+            .unwrap();
+        let endpoint = endpoint(&mut space, 1);
+        assert_eq!(
+            space.open_boot_program(0, 2, b"consoled"),
+            Err(ErrorCode::CapRightsViolation)
+        );
+        assert_eq!(
+            space.open_boot_program(1, 2, b"consoled"),
+            Err(ErrorCode::InvalidCap)
+        );
+        assert_eq!(space.lookup(2), Err(ErrorCode::InvalidCap));
+        assert!(object::get(endpoint).is_some());
     }
 
     #[test]

@@ -22,6 +22,12 @@ pub(super) fn root_space(console_image: &'static [u8]) -> CSpace {
     );
     grant(
         &mut rootsrv,
+        ruzt_abi::ROOTSRV_BOOT_PROGRAMS,
+        CapType::BootPrograms,
+        CapRights::WRITE,
+    );
+    grant(
+        &mut rootsrv,
         ROOTSRV_IRQ_CONTROL,
         CapType::IrqControl,
         CapRights::WRITE,

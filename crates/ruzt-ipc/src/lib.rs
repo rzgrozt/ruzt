@@ -273,6 +273,25 @@ pub fn spawn_program(
     ErrorCode::from_u64(status)
 }
 
+/// Issue a launchable program capability from the trusted boot archive.
+/// The catalog needs write authority and `destination` must be empty.
+#[allow(unsafe_code)]
+pub fn open_boot_program(catalog: u64, name: &str, destination: u64) -> Result<(), ErrorCode> {
+    // SAFETY: The borrowed name remains readable for the synchronous call.
+    let status = unsafe {
+        ruzt_runtime::syscall::syscall(
+            SyscallNumber::Invoke,
+            catalog,
+            CapOp::OpenBootProgram as u64,
+            name.as_ptr() as u64,
+            name.len() as u64,
+            destination,
+            0,
+        )
+    };
+    ErrorCode::from_u64(status)
+}
+
 /// Read the terminal status or return `WouldBlock` while the process is live.
 pub fn poll_process(cptr: u64) -> Result<ProcessStatus, ErrorCode> {
     process_status(cptr, true)

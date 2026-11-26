@@ -4,7 +4,11 @@ use ruzt_abi::ErrorCode;
 
 const BLOCK: usize = 512;
 
-pub(super) fn file<'a>(mut archive: &'a [u8], name: &[u8]) -> Result<&'a [u8], ErrorCode> {
+pub(super) fn file<'a>(archive: &'a [u8], name: &[u8]) -> Result<&'a [u8], ErrorCode> {
+    entry(archive, name).map(|(_, data)| data)
+}
+
+pub(super) fn entry<'a>(mut archive: &'a [u8], name: &[u8]) -> Result<(&'a str, &'a [u8]), ErrorCode> {
     let mut found = None;
     loop {
         let (header, rest) = archive
@@ -31,12 +35,13 @@ pub(super) fn file<'a>(mut archive: &'a [u8], name: &[u8]) -> Result<&'a [u8], E
         let (data, tail) = rest.split_at_checked(padded).ok_or(ErrorCode::BadMessage)?;
         archive = tail;
 
-        let filename = &header[..100];
-        if filename.split(|&byte| byte == 0).next() == Some(name) {
+        let filename = header[..100].split(|&byte| byte == 0).next().unwrap();
+        if filename == name {
             if found.is_some() {
                 return Err(ErrorCode::BadMessage);
             }
-            found = Some(&data[..len]);
+            let filename = core::str::from_utf8(filename).map_err(|_| ErrorCode::BadMessage)?;
+            found = Some((filename, &data[..len]));
         }
     }
 }

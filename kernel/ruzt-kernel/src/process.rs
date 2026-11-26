@@ -26,6 +26,7 @@ use ruzt_hal::mem::{MapError, PageFlags, PhysFrame, VirtAddr};
 use ruzt_hal_x86_64::mapper::{self, UserPageFrames, X86_64Mapper};
 
 const PAGE_SIZE: u64 = PhysFrame::SIZE as u64;
+static BOOT_PROGRAMS: spin::Once<&'static [u8]> = spin::Once::new();
 const _: () = assert!(ruzt_abi::FRAME_BYTES == PhysFrame::SIZE);
 
 struct Region {
@@ -138,6 +139,7 @@ impl Drop for UserAddressSpace {
 
 /// Load the root server and give it authority to start the console.
 pub(crate) fn enqueue_initial(archive: &'static [u8], framebuffer: Option<Framebuffer>) {
+    BOOT_PROGRAMS.call_once(|| archive);
     let rootsrv = initrd::file(archive, b"rootsrv").expect("unable to load rootsrv from initrd");
     let consoled = initrd::file(archive, b"consoled").expect("unable to load consoled from initrd");
     let root_space = boot_caps::root_space(consoled);
@@ -146,6 +148,20 @@ pub(crate) fn enqueue_initial(archive: &'static [u8], framebuffer: Option<Frameb
         .expect("rootsrv RAM budget");
     let root = load("rootsrv", rootsrv, root_space, framebuffer, budget).expect("load rootsrv");
     sched::spawn_user(root, enter_user).expect("schedule rootsrv");
+}
+
+pub(crate) fn boot_program(name: &[u8]) -> Result<(&'static str, &'static [u8]), ErrorCode> {
+    if name.is_empty()
+        || name.len() > 100
+        || name.iter().any(|byte| {
+            !byte.is_ascii_alphanumeric() && !matches!(byte, b'-' | b'_' | b'.')
+        })
+        || matches!(name, b"." | b"..")
+    {
+        return Err(ErrorCode::BadMessage);
+    }
+    let archive = BOOT_PROGRAMS.get().ok_or(ErrorCode::NotFound)?;
+    initrd::entry(archive, name)
 }
 
 pub(crate) fn spawn_program(

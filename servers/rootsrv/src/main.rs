@@ -318,7 +318,42 @@ fn confirm_console_ready() -> Result<(), ErrorCode> {
     Ok(())
 }
 
+#[cfg(feature = "qemu-boot-programs-test")]
+fn check_boot_programs() {
+    let catalog = ruzt_abi::ROOTSRV_BOOT_PROGRAMS;
+    let temporary_program = 62;
+    assert_eq!(
+        ruzt_ipc::open_boot_program(u64::MAX, "consoled", temporary_program),
+        Err(ErrorCode::InvalidCap)
+    );
+    assert_eq!(
+        ruzt_ipc::open_boot_program(catalog, "../consoled", temporary_program),
+        Err(ErrorCode::BadMessage)
+    );
+    assert_eq!(
+        ruzt_ipc::open_boot_program(catalog, "missing-program", temporary_program),
+        Err(ErrorCode::NotFound)
+    );
+    assert_eq!(
+        ruzt_ipc::open_boot_program(catalog, "consoled", ROOTSRV_CONSOLE_PROGRAM),
+        Err(ErrorCode::SlotOccupied)
+    );
+    ruzt_ipc::open_boot_program(catalog, "consoled", temporary_program)
+        .expect("open console from boot catalog");
+    ruzt_ipc::revoke(catalog).expect("revoke boot program derivations");
+    assert_eq!(
+        ruzt_ipc::mint(temporary_program, 61, CapRights::WRITE, 0),
+        Err(ErrorCode::InvalidCap)
+    );
+    write_line("rootsrv: boot program catalog issued and revoked executable authority");
+}
+
 fn run_console() -> bool {
+    #[cfg(feature = "qemu-boot-programs-test")]
+    check_boot_programs();
+    ruzt_ipc::delete(ROOTSRV_CONSOLE_PROGRAM).expect("replace bootstrap console program");
+    ruzt_ipc::open_boot_program(ruzt_abi::ROOTSRV_BOOT_PROGRAMS, "consoled", ROOTSRV_CONSOLE_PROGRAM)
+        .expect("resolve launch program from boot archive");
     ruzt_ipc::split_untyped(ROOTSRV_UNTYPED, PROGRAM_BUDGET, PROGRAM_BUDGET_BITS)
         .expect("reserve console address-space memory");
     ruzt_ipc::split_untyped(ROOTSRV_UNTYPED, SESSION_BUDGET, SERVICE_BUDGET_BITS + 1)

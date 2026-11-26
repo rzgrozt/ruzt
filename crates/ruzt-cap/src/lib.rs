@@ -120,6 +120,8 @@ pub enum CapType {
     Mmio(u64),
     /// A contiguous RAM allocation eligible for CPU and isolated DMA mappings.
     DmaBuffer(u64),
+    /// Authority to issue executable capabilities from the trusted boot archive.
+    BootPrograms,
 }
 
 /// A capability as it lives in a CNode slot.
