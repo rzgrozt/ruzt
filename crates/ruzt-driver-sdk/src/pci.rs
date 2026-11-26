@@ -146,6 +146,50 @@ pub struct MmioRegion {
 }
 
 impl MmioRegion {
+    /// Read one byte-sized device register.
+    ///
+    /// # Safety
+    /// The mapping must remain live and the device must support this read.
+    pub unsafe fn read_u8(&self, offset: u64) -> Result<u8, ErrorCode> {
+        let address = self.register(offset, 1)?;
+        // SAFETY: Bounds were checked and the caller guarantees device validity.
+        Ok(unsafe { core::ptr::read_volatile(core::ptr::without_provenance(address)) })
+    }
+
+    /// Write one byte-sized device register.
+    ///
+    /// # Safety
+    /// The mapping must remain live and the caller must permit the side effects.
+    pub unsafe fn write_u8(&self, offset: u64, value: u8) -> Result<(), ErrorCode> {
+        if !self.writable { return Err(ErrorCode::CapRightsViolation); }
+        let address = self.register(offset, 1)?;
+        // SAFETY: Bounds and write access were checked.
+        unsafe { core::ptr::write_volatile(core::ptr::without_provenance_mut(address), value) };
+        Ok(())
+    }
+
+    /// Read one naturally aligned 16-bit device register.
+    ///
+    /// # Safety
+    /// The mapping must remain live and the device must support this read.
+    pub unsafe fn read_u16(&self, offset: u64) -> Result<u16, ErrorCode> {
+        let address = self.register(offset, 2)?;
+        // SAFETY: Bounds and alignment were checked.
+        Ok(unsafe { core::ptr::read_volatile(core::ptr::without_provenance(address)) })
+    }
+
+    /// Write one naturally aligned 16-bit device register.
+    ///
+    /// # Safety
+    /// The mapping must remain live and the caller must permit the side effects.
+    pub unsafe fn write_u16(&self, offset: u64, value: u16) -> Result<(), ErrorCode> {
+        if !self.writable { return Err(ErrorCode::CapRightsViolation); }
+        let address = self.register(offset, 2)?;
+        // SAFETY: Bounds, alignment and write access were checked.
+        unsafe { core::ptr::write_volatile(core::ptr::without_provenance_mut(address), value) };
+        Ok(())
+    }
+
     /// Read one naturally aligned 32-bit device register.
     ///
     /// # Safety

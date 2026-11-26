@@ -72,6 +72,10 @@ When a service exits or takes a user-mode fault, the kernel closes endpoints des
 
 `pcid` runs in a separate user process and discovers directly attached PCI bus-zero functions through read-only configuration access. `rootsrv` queries it when selecting the QEMU EDU fixture and retains device-claim authority. A discovery interrupted by service exit is retried once after reaping the process and replacing its endpoints. The QEMU fixture verifies recovery, reclaimed process memory and rejection of an obsolete endpoint.
 
+`virtioblkd` owns a modern VirtIO block device in a separate Rust process. It receives an exclusive device lease, two IPC endpoints and an allocation budget. It maps bounded BAR windows through the driver SDK and uses one 8 KiB VT-d-isolated DMA arena with MSI-X completions. Its protocol exposes geometry, reads and writes of up to eight 512-byte sectors through a shared frame, and durable flush. Writable devices must advertise flush and platform DMA access. Device and protocol errors are checked before returning data to the client.
+
+The block supervisor replaces a failed service and retries a read once. Interrupted writes return an error so the filesystem can recover its transaction. QEMU exercises flushed data across two writable guests, read-only media, queue wrap, driver exit with a write in flight, full memory reclamation and rejection of obsolete endpoints. RuztFS remains in development.
+
 ## Repository layout
 
 | Path | Contents |
@@ -84,13 +88,15 @@ When a service exits or takes a user-mode fault, the kernel closes endpoints des
 | [`servers/rootsrv`](servers/rootsrv) | First user-space server |
 | [`servers/consoled`](servers/consoled) | User-space COM1 console service |
 | [`servers/pcid`](servers/pcid) | Read-only PCI bus-zero discovery service |
+| [`servers/virtioblkd`](servers/virtioblkd) | Isolated modern VirtIO block service |
+| [`crates/ruzt-virtio`](crates/ruzt-virtio) | Safe Rust PCI capability parsing and bounded block queue state |
 
 ## Local checks
 
 From the repository root, run the host tests for the ABI, capability types, x86_64 HAL, and kernel.
 
 ```sh
-cargo test --locked -p ruzt-abi -p ruzt-cap -p ruzt-hal -p ruzt-hal-x86_64 -p ruzt-kernel --lib
+cargo test --locked -p ruzt-abi -p ruzt-cap -p ruzt-hal -p ruzt-hal-x86_64 -p ruzt-kernel -p ruzt-virtio --lib
 ```
 
 Run the kernel-only and ring-3 QEMU tests with the pinned Rust nightly and components in [`rust-toolchain.toml`](rust-toolchain.toml). Install `qemu-system-x86_64`, SeaBIOS, the 4 MiB OVMF firmware, GNU `tar`, and `timeout`.
@@ -118,12 +124,22 @@ GitHub Actions runs both commands on pushes to `main` and on pull requests.
 Run these commands from the repository root with QEMU's GTK display backend installed.
 
 ```sh
-(cd servers && cargo build --locked --target x86_64-unknown-none -p rootsrv -p consoled -p pcid)
+(cd servers && cargo build --locked --target x86_64-unknown-none -p rootsrv -p consoled -p pcid -p virtioblkd)
 (cd kernel/ruzt-kernel && cargo build --locked)
 cargo run --locked -p boot-x86_64
 ```
 
 QEMU opens a window for the boot screen and streams serial diagnostics to the terminal. With that window focused, press Space to toggle the top-right tile between blue and mint.
+
+To attach a persistent raw data image through the block service, create a disposable image and pass its path. The launcher selects Q35 with VT-d and a modern VirtIO block device. The normal services query the geometry and establish the shared buffer. They do not format the image. Destructive block fixtures are enabled only by the integration test features.
+
+```sh
+ruzt_data=$(mktemp --suffix=.img)
+truncate -s 64M "$ruzt_data"
+cargo run --locked -p boot-x86_64 -- --data-disk "$ruzt_data"
+```
+
+Keep that image path to reuse the disk on later boots. The option can also accompany `--uefi`.
 
 For UEFI with address randomization, build the UEFI kernel and pass the OVMF code and variables template. Set the paths for your distribution.
 

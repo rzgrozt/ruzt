@@ -9,6 +9,7 @@
 #![deny(missing_docs)]
 
 pub mod pci;
+pub mod block;
 
 /// x86_64 `syscall` instruction trap number.
 ///

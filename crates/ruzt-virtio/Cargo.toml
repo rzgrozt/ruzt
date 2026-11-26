@@ -1,0 +1,7 @@
+[package]
+name = "ruzt-virtio"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ruzt-abi = { path = "../ruzt-abi" }

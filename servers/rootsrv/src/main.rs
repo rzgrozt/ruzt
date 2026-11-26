@@ -5,6 +5,7 @@ extern crate alloc;
 
 mod tile;
 mod pci_service;
+mod block_service;
 
 use ruzt_abi::{
     console, CapRights, CapTransferSlot, ErrorCode, IpcMessage, PciAddress, RetypeKind,
@@ -921,6 +922,7 @@ fn main() -> ! {
     check_cspace();
     check_anonymous_memory();
     check_heap_growth();
+    block_service::start().expect("start native block service");
 
     assert_eq!(
         ruzt_driver_sdk::wait_irq(u64::MAX),

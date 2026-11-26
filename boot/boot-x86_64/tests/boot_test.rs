@@ -421,6 +421,57 @@ enum Services {
     CpuBoundConsole,
     FaultingConsole,
     ExitingConsole,
+    BlockConsole,
+}
+
+#[test]
+fn test_virtio_block_persists_flushed_writes_across_guests() {
+    use std::io::{Read, Seek, SeekFrom};
+    let temp = tempfile::tempdir().expect("create block test directory");
+    let boot = build_image(temp.path(), "qemu-rootsrv-test", Services::BlockConsole);
+    let data_path = temp.path().join("disposable-data.img");
+    let mut data = std::fs::File::create(&data_path).expect("create disposable data disk");
+    data.set_len(16 * 1024 * 1024).unwrap();
+    let pattern: Vec<u8> = (0..4096).map(|index| (index as u8).wrapping_mul(31).wrapping_add(17)).collect();
+    data.seek(SeekFrom::Start(16 * 512)).unwrap();
+    data.write_all(&pattern).unwrap();
+    data.sync_all().unwrap();
+    drop(data);
+    let drive = format!("if=none,id=native,format=raw,cache=writeback,file={}", data_path.display());
+    let devices = ["-machine", "q35", "-cpu", "max", "-device", "intel-iommu,caching-mode=on,intremap=on",
+        "-drive", &drive, "-device", "virtio-blk-pci,drive=native,addr=5,disable-legacy=on,iommu_platform=on"];
+    for generation in 0..3 {
+        let read_only_drive = format!("{drive},readonly=on");
+        let mut devices = devices;
+        if generation == 2 { devices[7] = &read_only_drive; }
+        let serial_path = temp.path().join(format!("block-{generation}.log"));
+        {
+            let mut guest = start_guest_with_devices(&boot, &serial_path, &devices);
+            let completion = if generation == 2 {
+                "rootsrv: block driver restart reclaimed DMA and memory and read persisted data"
+            } else { "rootsrv: in-flight block write exit recovered without replaying the write" };
+            let serial = wait_for_serial(&mut guest.child, &serial_path, completion, Instant::now() + BOOT_TIMEOUT);
+            assert_markers(&serial, &[
+                "rootsrv: isolated VirtIO block service ready",
+                "rootsrv: block service restarted with fresh endpoints",
+                "rootsrv: block driver restart reclaimed DMA and memory and read persisted data",
+            ]);
+            if generation == 2 {
+                assert_markers(&serial, &["virtioblkd: modern block queue ready, sectors=32768 read_only=true flush=true",
+                    "rootsrv: read-only block device rejected writes"]);
+            } else {
+                assert_markers(&serial, &["virtioblkd: modern block queue ready, sectors=32768 read_only=false flush=true",
+                    "rootsrv: block read verified seeded persistent data",
+                    "rootsrv: block writes, reads, queue wrap and durable flush verified"]);
+            }
+        }
+        let mut disk = std::fs::File::open(&data_path).unwrap();
+        let mut actual = [0u8; 4096];
+        disk.seek(SeekFrom::Start(16 * 512)).unwrap();
+        disk.read_exact(&mut actual).unwrap();
+        let tag = if generation == 0 { 0xa5 } else { 0 };
+        for (index, byte) in actual.iter().enumerate() { assert_eq!(*byte, pattern[index] ^ tag); }
+    }
 }
 
 #[test]
@@ -578,7 +629,7 @@ fn build_firmware_image(
 
     let programs = match services {
         Services::None => &[][..],
-        _ => &["rootsrv", "consoled", "pcid"][..],
+        _ => &["rootsrv", "consoled", "pcid", "virtioblkd"][..],
     };
     if !programs.is_empty() {
         let mut build = Command::new(env!("CARGO"));
@@ -592,6 +643,8 @@ fn build_firmware_image(
                 "consoled",
                 "-p",
                 "pcid",
+                "-p",
+                "virtioblkd",
                 "--target",
                 "x86_64-unknown-none",
                 "--target-dir",
@@ -609,6 +662,7 @@ fn build_firmware_image(
             }
             Services::FaultingConsole => build.args(["--features", "consoled/qemu-fault-test"]),
             Services::ExitingConsole => build.args(["--features", "consoled/qemu-exit-test"]),
+            Services::BlockConsole => build.args(["--features", "rootsrv/qemu-block-test,virtioblkd/qemu-restart-test"]),
             _ => &mut build,
         };
         let status = build.status().expect("Failed to build boot services");
