@@ -8,6 +8,8 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod pci;
+
 /// x86_64 `syscall` instruction trap number.
 ///
 /// Loaded into `rax` before executing the `syscall` instruction.

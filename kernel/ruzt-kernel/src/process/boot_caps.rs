@@ -10,7 +10,7 @@ use ruzt_cap::{CapSlot, CapType};
 use crate::cap::{cspace::CSpace, object};
 use crate::{keyboard, serial};
 
-const ROOTSRV_UNTYPED_BITS: u8 = 23;
+const ROOTSRV_UNTYPED_BITS: u8 = 25;
 
 pub(super) fn root_space(console_image: &'static [u8]) -> CSpace {
     let mut rootsrv = CSpace::new(6);
@@ -18,7 +18,7 @@ pub(super) fn root_space(console_image: &'static [u8]) -> CSpace {
         &mut rootsrv,
         ROOTSRV_PCI_CONTROL,
         CapType::PciControl,
-        CapRights::READ.union(CapRights::WRITE),
+        CapRights::READ.union(CapRights::WRITE).union(CapRights::GRANT),
     );
     grant(
         &mut rootsrv,

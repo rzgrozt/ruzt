@@ -6,6 +6,7 @@ edition = "2021"
 [features]
 qemu-pci-intx-test = []
 qemu-boot-programs-test = []
+qemu-pcid-test = []
 
 [dependencies]
 ruzt-driver-sdk = { path = "../../crates/ruzt-driver-sdk" }

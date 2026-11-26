@@ -4,6 +4,7 @@
 extern crate alloc;
 
 mod tile;
+mod pci_service;
 
 use ruzt_abi::{
     console, CapRights, CapTransferSlot, ErrorCode, IpcMessage, PciAddress, RetypeKind,
@@ -349,8 +350,6 @@ fn check_boot_programs() {
 }
 
 fn run_console() -> bool {
-    #[cfg(feature = "qemu-boot-programs-test")]
-    check_boot_programs();
     ruzt_ipc::delete(ROOTSRV_CONSOLE_PROGRAM).expect("replace bootstrap console program");
     ruzt_ipc::open_boot_program(ruzt_abi::ROOTSRV_BOOT_PROGRAMS, "consoled", ROOTSRV_CONSOLE_PROGRAM)
         .expect("resolve launch program from boot archive");
@@ -494,15 +493,8 @@ fn check_pci_mmio() -> Result<(), ErrorCode> {
     const BAR: u64 = 34;
     const SPARE: u64 = 35;
     const WINDOW: u64 = 0x5200_0000;
-    let mut found = None;
-    for device in 0..32 {
-        let address = PciAddress::new(0, device, 0).unwrap();
-        if read_pci_config(ROOTSRV_PCI_CONTROL, address, 0)? == EDU_ID {
-            found = Some(address);
-            break;
-        }
-    }
-    let Some(address) = found else { return Ok(()) };
+    let Some(address) = pci_service::find(EDU_ID)? else { return Ok(()) };
+    assert_eq!(read_pci_config(ROOTSRV_PCI_CONTROL, address, 0)?, EDU_ID);
     assert_eq!(
         read_pci_config(ROOTSRV_UNTYPED, address, 0),
         Err(ErrorCode::InvalidCap)
@@ -919,6 +911,9 @@ fn verify_program_budget_reclaimed() {
 }
 
 fn main() -> ! {
+    #[cfg(feature = "qemu-boot-programs-test")]
+    check_boot_programs();
+    pci_service::start().expect("start supervised PCI discovery");
     ruzt_driver_sdk::claim_irq(ROOTSRV_IRQ_CONTROL, ROOTSRV_KEYBOARD_IRQ, 1)
         .expect("claim PS/2 keyboard IRQ");
     ruzt_driver_sdk::bind_irq(ROOTSRV_KEYBOARD_IRQ).expect("bind PS/2 keyboard IRQ");

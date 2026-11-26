@@ -62,13 +62,15 @@ The same PCI lease can delegate individual MSI-X entries. The kernel reserves al
 
 Drivers can reserve a contiguous DMA buffer from Untyped and map it into their address space. Binding requires a writable PCI device capability and buffer access rights that match the requested DMA direction. A directly attached bus-zero endpoint gets one buffer in a private VT-d domain. The kernel publishes the translation before enabling bus mastering. Unbinding, revocation, and driver exit disable bus mastering and drain pending transactions before releasing the domain. If teardown fails, the kernel retains the device lease and memory. The q35 test verifies an EDU round trip across two pages, revokes the delegated buffer, and reallocates the scrubbed memory from the same budget.
 
-The root server receives an 8 MiB Untyped RAM budget at boot. Each process's image, user stack, heap, and private page tables draw from its address-space budget. `rootsrv` reserves 2 MiB for the console address space and delegates a separate 8 KiB region to the service for its scratch buffer. Copies of an Untyped capability draw from the same budget. A reserved region returns to its parent after the region cap and its last live allocation are gone.
+The root server receives a 32 MiB Untyped RAM budget at boot. Each process's image, user stack, heap, and private page tables draw from its address-space budget. `rootsrv` reserves 2 MiB for the console address space and delegates a separate 8 KiB region to the service for its scratch buffer. Copies of an Untyped capability draw from the same budget. A reserved region returns to its parent after the region cap and its last live allocation are gone.
 
 Each process has a self address-space capability for mapping zeroed anonymous pages at a chosen virtual address. These pages draw from its address-space budget and may be read-only or writable. Unmapping returns the pages to the budget. A failed range operation preserves existing mappings.
 
 The runtime starts with a 1 MiB heap. On allocation pressure it can extend the heap inside a reserved 16 MiB virtual range using pages from the same budget. A failed extension leaves the heap intact. The kernel returns the grown heap to its budget when it reaps the process.
 
 When a service exits or takes a user-mode fault, the kernel closes endpoints designated at launch, wakes blocked peers, and reclaims its stack and private address-space memory after switching away. `rootsrv` uses the process status capability to distinguish exit from fault and retries a failed console instance once with fresh endpoints.
+
+`pcid` runs in a separate user process and discovers directly attached PCI bus-zero functions through read-only configuration access. `rootsrv` queries it when selecting the QEMU EDU fixture and retains device-claim authority. A discovery interrupted by service exit is retried once after reaping the process and replacing its endpoints. The QEMU fixture verifies recovery, reclaimed process memory and rejection of an obsolete endpoint.
 
 ## Repository layout
 
@@ -81,6 +83,7 @@ When a service exits or takes a user-mode fault, the kernel closes endpoints des
 | [`crates/ruzt-driver-sdk`](crates/ruzt-driver-sdk) | User-space device access through capabilities |
 | [`servers/rootsrv`](servers/rootsrv) | First user-space server |
 | [`servers/consoled`](servers/consoled) | User-space COM1 console service |
+| [`servers/pcid`](servers/pcid) | Read-only PCI bus-zero discovery service |
 
 ## Local checks
 
@@ -115,7 +118,7 @@ GitHub Actions runs both commands on pushes to `main` and on pull requests.
 Run these commands from the repository root with QEMU's GTK display backend installed.
 
 ```sh
-(cd servers && cargo build --locked --target x86_64-unknown-none -p rootsrv -p consoled)
+(cd servers && cargo build --locked --target x86_64-unknown-none -p rootsrv -p consoled -p pcid)
 (cd kernel/ruzt-kernel && cargo build --locked)
 cargo run --locked -p boot-x86_64
 ```

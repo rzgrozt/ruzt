@@ -337,7 +337,7 @@ pub(crate) fn register_address_space(root: PhysFrame) -> Result<AddressSpaceId, 
 }
 
 const PAGE_BITS: u8 = PhysFrame::SIZE.trailing_zeros() as u8;
-const MAX_UNTYPED_BITS: u8 = PAGE_BITS + 12;
+const MAX_UNTYPED_BITS: u8 = PAGE_BITS + 13;
 
 fn frame_at(base: PhysFrame, index: usize) -> PhysFrame {
     let address = base.base.as_u64() + (index as u64 * PhysFrame::SIZE as u64);

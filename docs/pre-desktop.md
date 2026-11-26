@@ -14,9 +14,11 @@ This milestone prepares x86-64 QEMU for persistent native applications. It follo
 
 The capability metadata foundation is implemented in commit `406cbaa`. All 91 host tests and nine default QEMU fixtures passed. Independent source review found no concrete defects. The two optional CET fixtures were excluded by the default test selection.
 
-The boot-program catalog now issues executable capabilities for named archive entries, with grants derived from the catalog authority. The console resolves its executable through this interface. All 93 host tests and nine default QEMU fixtures passed, including missing names, invalid names and authority, occupied destinations and revocation of issued capabilities. Device discovery and general driver supervision remain to be implemented.
+The boot-program catalog now issues executable capabilities for named archive entries, with grants derived from the catalog authority. The console resolves its executable through this interface. All 93 host tests and nine default QEMU fixtures passed, including missing names, invalid names and authority, occupied destinations and revocation of issued capabilities.
 
 The driver SDK supports configuration reads through a claimed PCI device's read capability. DMA binding still requires write authority. All 93 host tests and nine default QEMU fixtures passed, including an isolated console reading its delegated EDU function and rejecting unaligned reads and wrong capability types.
+
+`pcid` now performs read-only discovery of directly attached bus-zero functions in its own process. The supervisor queries it for the EDU fixture and automatically retries a read interrupted by service exit after reaping and replacing the instance. The fixture checks read-only authority, reclaimed process memory, a fresh response and rejection of the obsolete endpoint. All 95 host tests and nine default QEMU fixtures passed. The normal launcher also booted all three services and processed Space input with an offscreen display backend. The root Untyped budget is now 32 MiB, with matching bounded allocation support. General driver lifecycle and watchdog work remain.
 
 1. Bound kernel capability metadata and make allocation fallible. Exercise minting, IPC batch rollback, deletion, revocation and independent-process access at the limit. Run host and QEMU regressions.
 2. Extend boot program registration, device discovery and driver supervision for independent service executables. Drivers receive only the PCI, IRQ, DMA and endpoint authorities they require. Validate replacement of a failed driver and rejection of obsolete service handles.
@@ -49,6 +51,7 @@ The supervisor reissues authority to restarted services and clients acquire repl
 - [OSTEP crash consistency](https://pages.cs.wisc.edu/~remzi/OSTEP/file-journaling.pdf)
 - [Btrfs design](https://btrfs.readthedocs.io/en/latest/dev/dev-btrfs-design.html)
 - [RedoxFS](https://github.com/redox-os/redoxfs)
+- [Redox PCI discovery and device enablement](https://github.com/redox-os/drivers/blob/master/pcid/src/main.rs)
 - [Rust VirtIO drivers](https://github.com/rcore-os/virtio-drivers)
 - [VirtIO specification](https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html)
 - [Rust xHCI register types](https://github.com/rust-osdev/xhci)

@@ -87,6 +87,19 @@ fn update_word(word: &mut u64, mask: u64, free: bool) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn thirty_two_mib_region_reclaims_both_large_halves() {
+        let mut pages = super::FreePages::new(8192).unwrap();
+        assert_eq!(pages.take(4096), Some(0));
+        assert_eq!(pages.take(4096), Some(4096));
+        assert_eq!(pages.take(1), None);
+        pages.put(0, 4096);
+        assert_eq!(pages.take(4096), Some(0));
+        pages.put(0, 4096);
+        pages.put(4096, 4096);
+        assert!(pages.is_all_free());
+        assert_eq!(pages.take(8192), Some(0));
+    }
     use super::*;
 
     #[test]

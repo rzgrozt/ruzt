@@ -257,6 +257,7 @@ fn test_rootsrv_updates_the_framebuffer_from_keyboard_input() {
         &[
             "rootsrv process created, entering user mode...",
             "rootsrv: boot program catalog issued and revoked executable authority",
+            "rootsrv: PCI discovery restarted with fresh endpoints and reclaimed memory",
             "consoled process created, entering user mode...",
             "Hello from ring 3, rootsrv alive.",
         ],
@@ -577,7 +578,7 @@ fn build_firmware_image(
 
     let programs = match services {
         Services::None => &[][..],
-        _ => &["rootsrv", "consoled"][..],
+        _ => &["rootsrv", "consoled", "pcid"][..],
     };
     if !programs.is_empty() {
         let mut build = Command::new(env!("CARGO"));
@@ -589,12 +590,14 @@ fn build_firmware_image(
                 "rootsrv",
                 "-p",
                 "consoled",
+                "-p",
+                "pcid",
                 "--target",
                 "x86_64-unknown-none",
                 "--target-dir",
             ])
             .arg(&build_dir)
-            .args(["--features", "rootsrv/qemu-boot-programs-test"])
+            .args(["--features", "rootsrv/qemu-boot-programs-test,rootsrv/qemu-pcid-test,pcid/qemu-restart-test"])
             .current_dir(workspace.join("servers"));
         match services {
             Services::PciInterruptConsole => build.args([

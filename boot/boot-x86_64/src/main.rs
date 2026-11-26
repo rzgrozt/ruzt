@@ -29,11 +29,11 @@ fn main() {
         std::process::exit(1);
     }
 
-    const PROGRAMS: &[&str] = &["rootsrv", "consoled"];
+    const PROGRAMS: &[&str] = &["rootsrv", "consoled", "pcid"];
     for program in PROGRAMS {
         if !kernel_binary.with_file_name(program).exists() {
             eprintln!("{program} binary not found. Build the boot services with:");
-            eprintln!("  cd servers && cargo build --locked --target x86_64-unknown-none -p rootsrv -p consoled");
+            eprintln!("  cd servers && cargo build --locked --target x86_64-unknown-none -p rootsrv -p consoled -p pcid");
             std::process::exit(1);
         }
     }

@@ -1,0 +1,19 @@
+[package]
+name = "pcid"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "pcid"
+path = "src/main.rs"
+test = false
+bench = false
+
+[features]
+qemu-restart-test = []
+
+[dependencies]
+ruzt-abi = { path = "../../crates/ruzt-abi" }
+ruzt-driver-sdk = { path = "../../crates/ruzt-driver-sdk" }
+ruzt-ipc = { path = "../../crates/ruzt-ipc" }
+ruzt-runtime = { path = "../../crates/ruzt-runtime" }
