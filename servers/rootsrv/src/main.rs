@@ -812,7 +812,8 @@ fn check_pci_msix() -> Result<(), ErrorCode> {
 
 fn check_pci_dma(device: u64, bar: u64, address: PciAddress) -> Result<(), ErrorCode> {
     use ruzt_driver_sdk::{
-        allocate_dma_buffer, bind_dma, map_dma_buffer, read_pci_config, unmap_dma_buffer, DMA_WRITE,
+        allocate_dma_buffer, bind_dma, map_dma_buffer, read_pci_config, read_device_config,
+        unmap_dma_buffer, DMA_WRITE,
     };
     const BUDGET: u64 = 36;
     const BUFFER: u64 = 37;
@@ -827,6 +828,16 @@ fn check_pci_dma(device: u64, bar: u64, address: PciAddress) -> Result<(), Error
         Err(ErrorCode::BadMessage)
     );
     allocate_dma_buffer(BUDGET, BUFFER, BUFFER_BITS)?;
+    ruzt_ipc::mint(device, SPARE, CapRights::READ, 0)?;
+    assert_eq!(
+        read_device_config(SPARE, 0)?,
+        read_pci_config(ROOTSRV_PCI_CONTROL, address, 0)?
+    );
+    assert_eq!(
+        bind_dma(SPARE, BUFFER, DMA_WRITE),
+        Err(ErrorCode::CapRightsViolation)
+    );
+    ruzt_ipc::delete(SPARE)?;
     assert_eq!(
         ruzt_ipc::retype(BUDGET, SPARE, RetypeKind::Frame),
         Err(ErrorCode::NoMemory)

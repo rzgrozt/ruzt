@@ -48,6 +48,8 @@ An IRQ-control holder can also claim a non-ISA global system interrupt through `
 
 The boot server can enumerate conventional PCI configuration space and claim firmware-programmed memory BARs on endpoint functions with bus mastering disabled. A claim can clear firmware-enabled bus mastering for a directly attached endpoint when VT-d covers the requester and supports draining. QEMU checks that OVMF's firmware-enabled EDU is delegated with VT-d and refused when the guest has no remapper. The boot server can delegate individual page-aligned BAR ranges with read or write rights. Device mappings are uncached and non-executable, and revocation removes their page-table entries. The QEMU EDU guest checks a real PCI register read and write, read-only delegation, rollback on an occupied page, and reclamation after revocation.
 
+A read-capable PCI device lease authorizes configuration reads for that function through the driver SDK. DMA binding requires write authority. The EDU fixture exercises configuration reads inside the console service using its delegated device lease.
+
 On supported x86-64 systems the kernel validates ACPI's DMA remapping table and starts a segment-zero Intel VT-d unit with an empty root table. Covered PCI requesters start without DMA access. The q35 test temporarily enables bus mastering for an isolated EDU fixture and requires a hardware fault that identifies both the unassigned requester and its DMA address.
 
 VT-d units with queued invalidation use a kernel-owned ring for DMA context and IOTLB invalidation. The kernel waits for the hardware completion write before recycling DMA resources. Units with the register interface can still invalidate through it. The BIOS fixture wraps the ring before testing DMA isolation and revocation.

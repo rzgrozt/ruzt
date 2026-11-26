@@ -386,13 +386,17 @@ impl CSpace {
         Ok((path, DmaPin::new(KObjectId(id))?))
     }
 
-    pub(crate) fn pci_device(&self, cptr: u64) -> Result<(CapabilityPath, PciPin), ErrorCode> {
+    pub(crate) fn pci_device(
+        &self,
+        cptr: u64,
+        rights: CapRights,
+    ) -> Result<(CapabilityPath, PciPin), ErrorCode> {
         let tree = DERIVATIONS.lock();
         let (path, cap) = self.lookup_path_locked(&tree, cptr)?;
         let CapType::PciDevice(id) = cap.cap_type else {
             return Err(ErrorCode::InvalidCap);
         };
-        if !cap.rights.contains(CapRights::WRITE) {
+        if !cap.rights.contains(rights) {
             return Err(ErrorCode::CapRightsViolation);
         }
         Ok((path, PciPin::new(KObjectId(id))?))

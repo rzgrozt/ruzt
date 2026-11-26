@@ -1,6 +1,26 @@
 use ruzt_abi::{CapOp, ErrorCode, PciAddress, SyscallNumber};
 use ruzt_runtime::syscall::syscall;
 
+/// Read an aligned configuration dword from the device designated by `device`.
+/// This needs read authority on the device and selects no other PCI function.
+pub fn read_device_config(device: u64, offset: u8) -> Result<u32, ErrorCode> {
+    let mut value = 0u32;
+    // SAFETY: The synchronous call writes exactly this live output word.
+    let status = unsafe {
+        syscall(
+            SyscallNumber::Invoke,
+            device,
+            CapOp::ReadDeviceConfig as u64,
+            u64::from(offset),
+            (&raw mut value) as u64,
+            0,
+            0,
+        )
+    };
+    ErrorCode::from_u64(status)?;
+    Ok(value)
+}
+
 /// Read one aligned dword from the conventional PCI configuration header.
 pub fn read_pci_config(control: u64, address: PciAddress, offset: u8) -> Result<u32, ErrorCode> {
     let mut value = 0u32;

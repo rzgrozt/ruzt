@@ -359,6 +359,9 @@ pub enum CapOp {
     /// are 1 to 100 ASCII letters, digits, dots, underscores or hyphens,
     /// with `.` and `..` reserved. The catalog requires write authority.
     OpenBootProgram = 36,
+    /// Read the invoked PCI device's configuration with read authority.
+    /// `arg2` is an aligned byte offset and `arg3` points to a `u32` output.
+    ReadDeviceConfig = 37,
 }
 
 /// The interrupt is asserted low. The default is active high.
@@ -752,6 +755,7 @@ mod tests {
         assert_eq!(CapOp::UnmapMmio as u64, 27);
         assert_eq!(CapOp::MmioSize as u64, 28);
         assert_eq!(CapOp::OpenBootProgram as u64, 36);
+        assert_eq!(CapOp::ReadDeviceConfig as u64, 37);
     }
 
     #[test]

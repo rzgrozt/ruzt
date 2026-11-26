@@ -18,6 +18,15 @@ const EDU_BUFFER: u64 = 0x40000;
 
 pub(super) fn check(request: &IpcMessage) -> Result<u64, ErrorCode> {
     let [device, buffer, bar, _] = request.caps.map(|cap| cap.cptr);
+    assert_eq!(ruzt_driver_sdk::read_device_config(device, 0)?, 0x11e8_1234);
+    assert_eq!(
+        ruzt_driver_sdk::read_device_config(device, 1),
+        Err(ErrorCode::BadMessage)
+    );
+    assert_eq!(
+        ruzt_driver_sdk::read_device_config(buffer, 0),
+        Err(ErrorCode::InvalidCap)
+    );
     let iova = match bind_dma(device, buffer, DMA_READ) {
         Ok(iova) => iova,
         Err(ErrorCode::NotImplemented) => {

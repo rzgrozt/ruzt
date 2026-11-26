@@ -88,7 +88,7 @@ pub(crate) fn invoke(transaction: &mut Transaction, args: &SyscallArgs) -> Resul
         };
         let (device, buffer) = sched::with_current_user(|user| {
             Ok::<_, ErrorCode>((
-                user.cspace.pci_device(args.arg0)?,
+                user.cspace.pci_device(args.arg0, CapRights::WRITE)?,
                 user.cspace.dma_buffer(args.arg2, rights)?,
             ))
         })
@@ -96,8 +96,10 @@ pub(crate) fn invoke(transaction: &mut Transaction, args: &SyscallArgs) -> Resul
         return iommu::bind(sched::current_thread_id(), device, buffer, permissions);
     }
     if operation == CapOp::UnbindDma as u64 {
-        let (_, device) = sched::with_current_user(|user| user.cspace.pci_device(args.arg0))
-            .ok_or(ErrorCode::InvalidCap)??;
+        let (_, device) = sched::with_current_user(|user| {
+            user.cspace.pci_device(args.arg0, CapRights::WRITE)
+        })
+        .ok_or(ErrorCode::InvalidCap)??;
         return iommu::unbind(sched::current_thread_id(), device.address);
     }
     if operation == CapOp::ClaimIrq as u64 {
@@ -266,6 +268,15 @@ pub(crate) fn invoke(transaction: &mut Transaction, args: &SyscallArgs) -> Resul
             let offset = u8::try_from(args.arg3).map_err(|_| ErrorCode::BadMessage)?;
             let value = crate::pci::read_config(address, offset)?;
             user_mem::write_user_buffer(root, args.arg4, &value.to_ne_bytes())
+        }
+        CapType::PciDevice(_) if operation == CapOp::ReadDeviceConfig as u64 => {
+            let (_, device) = sched::with_current_user(|user| {
+                user.cspace.pci_device(args.arg0, CapRights::READ)
+            })
+            .ok_or(ErrorCode::InvalidCap)??;
+            let offset = u8::try_from(args.arg2).map_err(|_| ErrorCode::BadMessage)?;
+            let value = crate::pci::read_config(device.address, offset)?;
+            user_mem::write_user_buffer(root, args.arg3, &value.to_ne_bytes())
         }
         CapType::Mmio(_) if operation == CapOp::MmioSize as u64 => {
             let bytes = sched::with_current_user(|user| {
