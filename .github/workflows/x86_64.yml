@@ -21,6 +21,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends qemu-system-x86 seabios ovmf
       - name: Run host tests
-        run: cargo test --locked -p ruzt-abi -p ruzt-cap -p ruzt-hal -p ruzt-hal-x86_64 -p ruzt-kernel -p ruzt-virtio --lib
+        run: cargo test --locked -p ruzt-abi -p ruzt-cap -p ruzt-hal -p ruzt-hal-x86_64 -p ruzt-kernel -p ruzt-virtio -p ruzt-fs --lib
       - name: Run QEMU integration tests
         run: cargo test --locked -p boot-x86_64 --test boot_test -- --nocapture

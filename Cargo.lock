@@ -485,6 +485,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruzt-fs"
+version = "0.1.0"
+
+[[package]]
 name = "ruzt-hal"
 version = "0.1.0"
 dependencies = [

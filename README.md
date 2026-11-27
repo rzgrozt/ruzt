@@ -78,6 +78,8 @@ When a service exits or takes a user-mode fault, the kernel closes endpoints des
 
 The block supervisor replaces a failed service and retries a read once. Interrupted writes return an error so the filesystem can recover its transaction. QEMU exercises flushed data across two writable guests, read-only media, queue wrap, driver exit with a write in flight, full memory reclamation and rejection of obsolete endpoints. RuztFS remains in development.
 
+`ruzt-fs` provides the native filesystem operation core and a volatile memory backend. A folder handle scopes lookup and enumeration. File handles preserve identity through rename, and access can be reduced to read-only or write-only. An edit starts against an expected file version and publishes its changes atomically on commit. Conflicting edits return an error. Configurable limits bound objects, edits, file sizes and retained buffer capacities, with fallible allocation. Isolated service integration, the persistent RuztFS format, snapshots and encryption remain ahead.
+
 ## Repository layout
 
 | Path | Contents |
@@ -92,13 +94,14 @@ The block supervisor replaces a failed service and retries a read once. Interrup
 | [`servers/pcid`](servers/pcid) | Read-only PCI bus-zero discovery service |
 | [`servers/virtioblkd`](servers/virtioblkd) | Isolated modern VirtIO block service |
 | [`crates/ruzt-virtio`](crates/ruzt-virtio) | Safe Rust PCI capability parsing and bounded block queue state |
+| [`crates/ruzt-fs`](crates/ruzt-fs) | Native folder/document operations and volatile memory backend |
 
 ## Local checks
 
 From the repository root, run the host tests for the ABI, capability types, x86_64 HAL, and kernel.
 
 ```sh
-cargo test --locked -p ruzt-abi -p ruzt-cap -p ruzt-hal -p ruzt-hal-x86_64 -p ruzt-kernel -p ruzt-virtio --lib
+cargo test --locked -p ruzt-abi -p ruzt-cap -p ruzt-hal -p ruzt-hal-x86_64 -p ruzt-kernel -p ruzt-virtio -p ruzt-fs --lib
 ```
 
 Run the kernel-only and ring-3 QEMU tests with the pinned Rust nightly and components in [`rust-toolchain.toml`](rust-toolchain.toml). Install `qemu-system-x86_64`, SeaBIOS, the 4 MiB OVMF firmware, GNU `tar`, and `timeout`.

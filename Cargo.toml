@@ -12,6 +12,7 @@ members = [
     "crates/ruzt-ipc",
     "crates/ruzt-driver-sdk",
     "crates/ruzt-virtio",
+    "crates/ruzt-fs",
     "servers/rootsrv",
     "servers/consoled",
     "servers/pcid",
