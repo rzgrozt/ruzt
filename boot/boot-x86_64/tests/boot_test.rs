@@ -271,6 +271,7 @@ fn test_rootsrv_updates_the_framebuffer_from_keyboard_input() {
             "rootsrv: delegated UART IRQ delivered, re-armed and reclaimed",
             "rootsrv: PCI BAR mapped, delegated read-only, revoked and reclaimed",
             "rootsrv: moved capability revoked transitively",
+            "rootsrv: IPC authenticated sender badges and rejected forged identity",
             "Hello from ring 3, rootsrv alive.",
             "rootsrv: console write acknowledged over IPC",
             "rootsrv: wait selected both console notification and reply",
@@ -650,7 +651,7 @@ fn build_firmware_image(
                 "--target-dir",
             ])
             .arg(&build_dir)
-            .args(["--features", "rootsrv/qemu-boot-programs-test,rootsrv/qemu-pcid-test,pcid/qemu-restart-test"])
+            .args(["--features", "rootsrv/qemu-boot-programs-test,rootsrv/qemu-pcid-test,rootsrv/qemu-ipc-badge-test,pcid/qemu-restart-test"])
             .current_dir(workspace.join("servers"));
         match services {
             Services::PciInterruptConsole => build.args([

@@ -1063,6 +1063,7 @@ mod tests {
                 rights: ruzt_abi::CapRights::empty(),
                 badge: 0,
             }; 4],
+            sender_badge: 0,
         };
 
         set_thread_message(id, Packet::inline(msg));

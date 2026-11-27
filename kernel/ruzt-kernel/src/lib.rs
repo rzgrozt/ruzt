@@ -273,6 +273,7 @@ fn ipc_test_sender() -> ! {
             rights: ruzt_abi::CapRights::empty(),
             badge: 0,
         }; 4],
+        sender_badge: 0,
     };
     let args = ruzt_abi::SyscallArgs {
         number: ruzt_abi::SyscallNumber::Invoke as u64,

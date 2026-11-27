@@ -42,6 +42,8 @@ fn write_line(text: &str) {
 }
 
 fn greet_via_console() -> Result<(), ErrorCode> {
+    #[cfg(feature = "qemu-ipc-badge-test")]
+    check_ipc_badges()?;
     let ungranted = u64::MAX;
     let mut request = IpcMessage::default();
     let payload_len = (GREETING.len() as u16).to_le_bytes();
@@ -185,6 +187,39 @@ fn create_console_objects() {
     ruzt_ipc::delete(COPY).expect("delete writable budget copy");
 }
 
+#[cfg(feature = "qemu-ipc-badge-test")]
+fn check_ipc_badges() -> Result<(), ErrorCode> {
+    const PARENT: u64 = 5;
+    const COPY: u64 = 6;
+    const MOVED: u64 = 7;
+    let rights = CapRights::WRITE.union(CapRights::GRANT);
+    ruzt_ipc::mint(ROOTSRV_CONSOLE_REQUEST, PARENT, rights, 0x44)?;
+    assert_eq!(ruzt_ipc::mint(PARENT, COPY, CapRights::WRITE, 0x55), Err(ErrorCode::CapRightsViolation));
+    ruzt_ipc::mint(PARENT, COPY, CapRights::WRITE, 0x44)?;
+    ruzt_ipc::move_cap(COPY, MOVED)?;
+    // The server's receive capability has a different badge (0x77). The
+    // caller-controlled field must never substitute for the invoked badge.
+    for (endpoint, expected) in [(ROOTSRV_CONSOLE_REQUEST, 0), (PARENT, 0x44), (MOVED, 0x44)] {
+        let request = IpcMessage {
+            label: console::CHECK_BADGE,
+            sender_badge: u64::MAX,
+            ..IpcMessage::default()
+        };
+        ruzt_ipc::send(endpoint, &request)?;
+        let mut reply = IpcMessage::default();
+        ruzt_ipc::recv(ROOTSRV_CONSOLE_REPLY, &mut reply)?;
+        assert_eq!((reply.label, reply.length, reply.cap_count), (console::BADGE_CHECKED, 8, 0));
+        assert_eq!(u64::from_le_bytes(reply.data[..8].try_into().unwrap()), expected);
+        // The console deliberately supplies a forged field in the reply.
+        assert_eq!(reply.sender_badge, 0);
+    }
+    ruzt_ipc::revoke(PARENT)?;
+    assert_eq!(ruzt_ipc::send(MOVED, &IpcMessage::default()), Err(ErrorCode::InvalidCap));
+    ruzt_ipc::delete(PARENT)?;
+    write_line("rootsrv: IPC authenticated sender badges and rejected forged identity");
+    Ok(())
+}
+
 fn reclaim_console_objects() {
     let budget = LOCAL_BUDGET;
     let frame = ROOTSRV_CONSOLE_FRAME;
@@ -232,7 +267,7 @@ fn start_console() {
             CapTransferSlot {
                 cptr: REQUEST_ENDPOINT,
                 rights: CapRights::READ,
-                badge: 0,
+                badge: if cfg!(feature = "qemu-ipc-badge-test") { 0x77 } else { 0 },
             },
             CapTransferSlot {
                 cptr: REPLY_ENDPOINT,

@@ -47,6 +47,17 @@ fn main() -> ! {
             Err(error) => panic!("console receive failed: {error:?}"),
         };
         let label = match (request.label, request.cap_count) {
+            (console::CHECK_BADGE, 0) if request.length == 0 => {
+                let mut reply = IpcMessage {
+                    label: console::BADGE_CHECKED,
+                    length: 8,
+                    sender_badge: u64::MAX,
+                    ..IpcMessage::default()
+                };
+                reply.data[..8].copy_from_slice(&request.sender_badge.to_le_bytes());
+                ruzt_ipc::send(console::REPLY, &reply).expect("reply with authenticated badge");
+                continue;
+            }
             (console::WRITE, 0) => {
                 uart_write(&request.data[..usize::from(request.length)]);
                 Ok(console::WRITTEN)

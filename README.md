@@ -18,6 +18,8 @@ Capability metadata is limited to 1,024 live records per process and 8,192 syste
 
 The IPC library can block on up to eight endpoints, notifications, driver IRQs, and process status capabilities in one call. The kernel selects the first ready source in list order and consumes its message or signal as part of the wait. Endpoint messages can include capability grants, and a closed endpoint or reaped process wakes the waiter. Revoking a wait source or a CNode capability on its path cancels the wait.
 
+Received messages include the badge of the endpoint capability invoked by the sender. The kernel supplies this field and ignores the sender's proposed value. Services can use badges to identify file or folder authority. A badge identifies a service-defined grant, rather than a process identity. The IPC record is now 176 bytes, so rebuild the kernel and all services together when updating from the earlier layout.
+
 User tasks can read the monotonic clock, supply an absolute deadline to a capability wait, or sleep until a deadline without waiting on any capability. x86-64 wakes these tasks at scheduler safe points using the PIT's roughly 10 ms tick. The PIT uses the I/O APIC when firmware provides usable ACPI interrupt routing.
 
 The x86-64 kernel enables SMEP and SMAP when the CPU advertises them. Syscalls copy through supervisor-only aliases after checking access on every user page. Interrupt and syscall entry clear the live AC and DF flags and preserve the interrupted task's flags for return. A user trap starts on the CPU's guarded entry stack. The common entry stub moves the saved frame onto the thread's kernel stack before dispatch so the thread can block or migrate. The QEMU preemption test exercises this path with both protections enabled.

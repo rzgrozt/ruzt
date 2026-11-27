@@ -206,6 +206,10 @@ pub mod console {
     pub const CHECK_PCI_MSIX: u64 = 19;
     /// Verify the previous MSI-X entries no longer have capabilities.
     pub const CHECK_PCI_MSIX_REVOKED: u64 = 20;
+    /// Echo the kernel-authenticated endpoint badge for the IPC fixture.
+    pub const CHECK_BADGE: u64 = 21;
+    /// The reply payload contains the invoked endpoint badge as a u64.
+    pub const BADGE_CHECKED: u64 = 22;
 }
 
 /// System-call numbers.
@@ -571,6 +575,10 @@ pub struct IpcMessage {
     pub data: [u8; 56],
     /// Capability slots transferred with the message.
     pub caps: [CapTransferSlot; IPC_CAP_SLOTS],
+    /// Badge of the endpoint capability invoked by the sender, set by the
+    /// kernel on receive. The sender's value in this field is ignored.
+    /// This identifies a service-defined authority, not a process identity.
+    pub sender_badge: u64,
 }
 
 impl Default for IpcMessage {
@@ -586,6 +594,7 @@ impl Default for IpcMessage {
                 rights: CapRights::empty(),
                 badge: 0,
             }; IPC_CAP_SLOTS],
+            sender_badge: 0,
         }
     }
 }
@@ -674,10 +683,10 @@ impl ErrorCode {
 
 // Compile-time size checks for ABI stability.
 const _: () = assert!(core::mem::size_of::<CapTransferSlot>() == 24);
-// NOTE: IpcMessage is 168 bytes, exceeding the 128-byte cache-line target.
-// The layout follows the spec exactly; reducing size would require
-// shrinking fields (e.g. cptr/badge from u64 to u32).
-const _: () = assert!(core::mem::size_of::<IpcMessage>() == 168);
+// Keep the existing header/payload/cap offsets and append authenticated context.
+const _: () = assert!(core::mem::size_of::<IpcMessage>() == 176);
+const _: () = assert!(core::mem::offset_of!(IpcMessage, sender_badge) == 168);
+const _: () = assert!(core::mem::size_of::<WaitEvent>() == 192);
 const _: () = assert!(core::mem::size_of::<SyscallArgs>() == 56);
 
 #[cfg(test)]
@@ -845,6 +854,7 @@ mod tests {
                 rights: CapRights::READ,
                 badge: 0xDEAD,
             }; 4],
+            sender_badge: 0,
         };
         assert_eq!(msg.label, 42);
         assert_eq!(msg.caps[0].cptr, 3);

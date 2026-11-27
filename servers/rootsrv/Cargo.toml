@@ -8,6 +8,7 @@ qemu-pci-intx-test = []
 qemu-boot-programs-test = []
 qemu-pcid-test = []
 qemu-block-test = []
+qemu-ipc-badge-test = []
 
 [dependencies]
 ruzt-driver-sdk = { path = "../../crates/ruzt-driver-sdk" }

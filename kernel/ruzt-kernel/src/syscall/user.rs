@@ -190,7 +190,7 @@ pub(crate) fn invoke(transaction: &mut Transaction, args: &SyscallArgs) -> Resul
                 transaction,
                 id,
                 authority,
-                read_packet(root, args.arg2, capability.rights)?,
+                read_packet(root, args.arg2, capability.rights, capability.badge)?,
             )
         }
         CapType::Endpoint(id) if args.arg1 == CapOp::Recv as u64 => {
@@ -222,7 +222,7 @@ pub(crate) fn invoke(transaction: &mut Transaction, args: &SyscallArgs) -> Resul
         }
         CapType::Program(id) if args.arg1 == CapOp::SpawnProgram as u64 => {
             require(capability.rights, CapRights::WRITE)?;
-            let grants = read_packet(root, args.arg3, capability.rights)?;
+            let grants = read_packet(root, args.arg3, capability.rights, 0)?;
             process::spawn_program(
                 crate::cap::object::KObjectId(id),
                 args.arg2,
@@ -454,8 +454,10 @@ fn read_packet(
     root: PhysFrame,
     address: u64,
     invocation_rights: CapRights,
+    sender_badge: u64,
 ) -> Result<ipc::Packet, ErrorCode> {
     let mut message = IpcMessage::default();
+    message.sender_badge = sender_badge;
     // Read the fixed header and inline data without copying C-layout padding.
     let mut bytes = [0; DATA_OFFSET + 56];
     user_mem::read_user_buffer(root, address, &mut bytes)?;
@@ -478,7 +480,7 @@ fn read_packet(
     require(invocation_rights, CapRights::GRANT)?;
     for index in 0..count {
         // The header range proved this is a lower-half address. Offsets in
-        // the 168-byte message cannot overflow, and every read checks its pages.
+        // the message cannot overflow, and every read checks its pages.
         let base = address + cap_offset(index) as u64;
         let cptr = u64::from_le_bytes(read_wire(root, base + CPTR_OFFSET as u64)?);
         let [rights] = read_wire(root, base + RIGHTS_OFFSET as u64)?;
@@ -515,6 +517,8 @@ fn encode_message(message: &IpcMessage) -> [u8; size_of::<IpcMessage>()] {
     bytes[LABEL_OFFSET..][..8].copy_from_slice(&message.label.to_le_bytes());
     bytes[LENGTH_OFFSET..][..2].copy_from_slice(&message.length.to_le_bytes());
     bytes[COUNT_OFFSET] = message.cap_count;
+    bytes[offset_of!(IpcMessage, sender_badge)..][..8]
+        .copy_from_slice(&message.sender_badge.to_le_bytes());
     let len = usize::from(message.length);
     bytes[DATA_OFFSET..][..len].copy_from_slice(&message.data[..len]);
     for (index, cap) in message.caps[..usize::from(message.cap_count)]
